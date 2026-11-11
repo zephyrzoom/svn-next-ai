@@ -1,0 +1,48 @@
+# svn-next 桌面端打包配置。
+#
+# 打包前置：`npm run dist`（内部会先 build 原生模块 + 编译 TS + 复制 proto）。
+# 本阶段**不做代码签名与公证**：产物用于内部试用。正式发布需要开发者证书，
+# 以及 macOS 的 notarize 与 Windows 的代码签名，凭证不应进仓库。
+appId: cn.svnnext.desktop
+productName: svn-next
+copyright: svn-next
+
+directories:
+  output: release
+  buildResources: build
+
+# 只打必要的东西：编译产物、原生模块、契约文件。
+# 源码与 node_modules 的 devDependencies 不进包（Electron 自身由 builder 处理）。
+files:
+  - dist/**/*
+  - proto/repo.proto
+  - native/*.node
+  - package.json
+
+# 原生模块必须解包：asar 内的 .node 无法被 dlopen。
+# 代码里已按 app.asar.unpacked 做路径改写（见 src/main/wc.ts）。
+#
+# 若所在环境无法写 asar（部分受限沙箱会拒绝 createWriteStream 到 asar），
+# 用 `npm run pack:unpacked`（等价于 --config.asar=false）。功能完全一致，
+# 只是启动时少一次 asar 索引，文件散在 Resources/app/ 下。
+asar: true
+asarUnpack:
+  - native/**/*.node
+
+mac:
+  category: public.app-category.developer-tools
+  target:
+    - dmg
+    - zip
+  identity: null
+
+win:
+  target:
+    - nsis
+    - zip
+
+linux:
+  category: Development
+  target:
+    - AppImage
+    - deb

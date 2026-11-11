@@ -1,0 +1,293 @@
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+      - name: 静态检查（零警告）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: 单元与集成测试
+        # protoc 由 protoc-bin-vendored 提供，宿主机无需预装
+        run: cargo test --workspace
+
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: 校验 proto 语法
+        run: protoc -I=proto --descriptor_set_out=/dev/null proto/repo.proto
+      - name: 校验 SQL schema
+        run: |
+          python3 - <<'PY'
+          import sqlite3, pathlib
+          for p in ('schema/server.sql', 'schema/wc.sql'):
+              db = sqlite3.connect(':memory:')
+              db.executescript(pathlib.Path(p).read_text())
+              n = db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','view')").fetchone()[0]
+              print(f'{p}: {n} 个表/视图')
+          print('schemas ok')
+          PY
+
+  cli-smoke:
+    # 真的把 CLI 跑一遍两轮：
+    #   1) M1 只读链路：bootstrap → 建库 → 导入 → 检出 → 状态 → 差异 → 再提交 → 配额拒绝；
+    #   2) M2 写闭环 + 容量闭环：commit / update / 冲突 / revert，estimate / purge / gc。
+    # 只靠单测无法发现「二进制能编译但跑不起来」的问题。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 构建
+        run: cargo build --workspace
+      - name: gRPC 服务端启动自检
+        # 网络层的端到端链路已在 cargo test 里跑过（真起服务、真走 TCP）；
+        # 这里只确认打包出来的二进制能起来、打印监听到的地址。
+        run: |
+          set -euo pipefail
+          BIN="$PWD/target/debug"
+          STORE="$RUNNER_TEMP/grpc-store"
+          mkdir -p "$STORE"
+          out=$(timeout 5 "$BIN/vcs-grpc" --root "$STORE" --listen 127.0.0.1:50077 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q "vcs-grpc 已启动"
+
+      - name: 端到端冒烟
+        run: |
+          set -euo pipefail
+          BIN="$PWD/target/debug"
+          export HOME="$RUNNER_TEMP/home"
+          DEMO="$RUNNER_TEMP/demo"
+          mkdir -p "$HOME" "$DEMO/src/202610"
+
+          echo "月度汇总" > "$DEMO/src/202610/summary.txt"
+
+          "$BIN/vcs" init-admin --store "$DEMO/store" --username alice --name "张爱丽" --password 'Abcdef1!'
+          "$BIN/vcs" login --store "$DEMO/store" --username alice --password 'Abcdef1!'
+          "$BIN/vcs" repo-create --store "$DEMO/store" reports
+          "$BIN/vcs" import --store "$DEMO/store" reports "$DEMO/src" -m "初始导入"
+          "$BIN/vcs" checkout --store "$DEMO/store" reports "$DEMO/wc"
+
+          cd "$DEMO/wc"
+          out=$("$BIN/vcs" status); echo "$out"
+          echo "$out" | grep -q "工作副本干净"
+
+          echo "月度汇总（修订）" > 202610/summary.txt
+          out=$("$BIN/vcs" status); echo "$out"
+          echo "$out" | grep -qE '^M +202610/summary\.txt'
+
+          "$BIN/vcs" diff | grep -q '^+月度汇总（修订）'
+          "$BIN/vcs" import --store "$DEMO/store" reports "$PWD" -m "修订"
+          "$BIN/vcs" log --store "$DEMO/store" reports | grep -q "r2"
+
+          # 重复提交相同内容不应产生新版本
+          "$BIN/vcs" import --store "$DEMO/store" reports "$PWD" -m "空提交" | grep -q "没有变更"
+
+          # 配额：1 KiB 仓库导入 50 KB 必须被拒，且不得在对象池留下孤儿对象
+          "$BIN/vcs" repo-create --store "$DEMO/store" tiny --soft 900 --hard 1024
+          mkdir -p "$DEMO/big" && head -c 50000 /dev/urandom > "$DEMO/big/random.bin"
+          before=$("$BIN/vcs" info --store "$DEMO/store" tiny | grep 对象池)
+          if "$BIN/vcs" import --store "$DEMO/store" tiny "$DEMO/big" -m "超大"; then
+            echo "配额未生效"; exit 1
+          fi
+          after=$("$BIN/vcs" info --store "$DEMO/store" tiny | grep 对象池)
+          echo "拒绝前: $before"; echo "拒绝后: $after"
+          [ "$before" = "$after" ] || { echo "被拒绝的提交写了孤儿对象"; exit 1; }
+
+          # ---------------- M2：写闭环 ----------------
+          "$BIN/vcs" checkout --store "$DEMO/store" reports "$DEMO/wc1"
+          "$BIN/vcs" checkout --store "$DEMO/store" reports "$DEMO/wc2"
+
+          cd "$DEMO/wc1"
+          echo "wc1 版本" > 202610/summary.txt
+          echo "wc1 新增" > 202610/extra.txt
+          out=$("$BIN/vcs" commit -m "wc1 改两处" --store "$DEMO/store"); echo "$out"
+          echo "$out" | grep -q "已提交 r3"
+          out=$("$BIN/vcs" status); echo "$out"
+          echo "$out" | grep -q "工作副本干净"
+
+          cd "$DEMO/wc2"
+          out=$("$BIN/vcs" update --store "$DEMO/store"); echo "$out"
+          echo "$out" | grep -q "已更新到 r3"
+          grep -q "wc1 新增" 202610/extra.txt
+
+          # wc1 再提交一次，把 wc2 顶成过期工作副本
+          cd "$DEMO/wc1"
+          echo "wc1 又改一次" > 202610/summary.txt
+          "$BIN/vcs" commit -m "wc1 再改" --store "$DEMO/store" | grep -q "已提交 r4"
+
+          # wc2 仍停在 r3：直接提交必须被严格拒绝（不做服务端自动合并）
+          cd "$DEMO/wc2"
+          echo "wc2 版本" > 202610/summary.txt
+          if "$BIN/vcs" commit -m "过期的提交" --store "$DEMO/store"; then
+            echo "out-of-date 未生效"; exit 1
+          fi
+
+          # 更新产生内容冲突：本地内容保留、status 显示 C、带冲突提交被拦
+          "$BIN/vcs" update --store "$DEMO/store" | grep -q "内容冲突"
+          out=$("$BIN/vcs" status); echo "$out"
+          echo "$out" | grep -qE '^C +202610/summary\.txt'
+          if "$BIN/vcs" commit -m "带冲突" --store "$DEMO/store"; then
+            echo "冲突未阻止提交"; exit 1
+          fi
+          "$BIN/vcs" revert -d . | grep -q "已回退"
+          "$BIN/vcs" status | grep -q "工作副本干净"
+
+          # ---------------- M2：容量闭环 ----------------
+          cd "$DEMO"
+          "$BIN/vcs" candidates --store "$DEMO/store" reports | grep -q "202610"
+          "$BIN/vcs" estimate --store "$DEMO/store" reports 202610 | grep -q "dry-run"
+          out=$("$BIN/vcs" purge --store "$DEMO/store" reports 202610 --immediate --reason "CI 清理"); echo "$out"
+          echo "$out" | grep -q "实际释放"
+          "$BIN/vcs" gc-status --store "$DEMO/store" reports "$(echo "$out" | sed -n 's/.*GC \(gc_[A-Za-z0-9]*\)：.*/\1/p')" | grep -q "done"
+          # 内容已裁剪：读旧版本必须明确报 ContentPurged，而不是仓库损坏
+          if "$BIN/vcs" cat --store "$DEMO/store" reports 202610/summary.txt -r 1 >/dev/null 2>"$DEMO/err"; then
+            echo "已裁剪内容仍可读取"; exit 1
+          fi
+          grep -q "ContentPurged" "$DEMO/err"
+
+          # 回收站：记录可查；内容已回收后撤销必须诚实地失败
+          "$BIN/vcs" purged --store "$DEMO/store" reports | grep -q "已生效"
+          purge_id=$(echo "$out" | sed -n 's/.*（清理标记 \(pg_[A-Za-z0-9]*\)）.*/\1/p')
+          if "$BIN/vcs" unpurge --store "$DEMO/store" reports "$purge_id"; then
+            echo "内容已被回收却撤销成功"; exit 1
+          fi
+
+          # ---------------- M3：用户体系闭环 ----------------
+          cd "$DEMO"
+          # 自助注册：不收密码，只提交用户名/姓名/理由
+          "$BIN/vcs" register --store "$DEMO/store" --username bob --name "李波" --reason "归档月度报表"
+          if "$BIN/vcs" login --store "$DEMO/store" --username bob --password 'Abcdef1!'; then
+            echo "未审批账号竟然能登录"; exit 1
+          fi
+          "$BIN/vcs" register-list --store "$DEMO/store" --state pending | grep -q bob
+          approve=$("$BIN/vcs" register-approve --store "$DEMO/store" "$("$BIN/vcs" register-list --store "$DEMO/store" --state pending | awk '/bob/{print $1}')" --role writer)
+          echo "$approve"
+          setup=$(echo "$approve" | grep -o 'vcs_setup_[A-Za-z0-9_-]*' | head -1)
+          # 弱密码必须被服务端拒绝
+          if "$BIN/vcs" set-password --store "$DEMO/store" --token "$setup" --password weak; then
+            echo "弱密码未被拒绝"; exit 1
+          fi
+          "$BIN/vcs" set-password --store "$DEMO/store" --token "$setup" --password 'Bobpass1!' 
+          if "$BIN/vcs" set-password --store "$DEMO/store" --token "$setup" --password 'Other1!x'; then
+            echo "一次性 token 被重复使用"; exit 1
+          fi
+          "$BIN/vcs" login --store "$DEMO/store" --username bob --password 'Bobpass1!'
+
+          # 仓库申请 → 审批前不可用 → 审批后 owner 可用
+          "$BIN/vcs" repo-request --store "$DEMO/store" bob-repo --reason "个人归档"
+          if "$BIN/vcs" import --store "$DEMO/store" bob-repo "$DEMO/src" -m "抢跑"; then
+            echo "未审批仓库竟然可用"; exit 1
+          fi
+          req=$("$BIN/vcs" repo-request-list --store "$DEMO/store" --state pending | awk '/bob-repo/{print $1}')
+          "$BIN/vcs" login --store "$DEMO/store" --username alice --password 'Abcdef1!'
+          "$BIN/vcs" repo-approve --store "$DEMO/store" "$req" --hard 1073741824 --note "同意"
+          # 管理员使用他人仓库仍需成员资格
+          if "$BIN/vcs" info --store "$DEMO/store" bob-repo; then
+            echo "非成员竟然能读取仓库"; exit 1
+          fi
+
+          cd "$HOME"
+          "$BIN/vcs" login --store "$DEMO/store" --username bob --password 'Bobpass1!'
+          "$BIN/vcs" import --store "$DEMO/store" bob-repo "$DEMO/src" -m "owner 首次导入" | grep -q "已提交 r1"
+
+          # PAT：只读令牌能读不能写，撤销后立即失效
+          pat_out=$("$BIN/vcs" pat-create --store "$DEMO/store" --name ci-read --scopes read --days 30)
+          echo "$pat_out"
+          pat=$(echo "$pat_out" | grep -o 'vcs_pat_[A-Za-z0-9_-]*' | head -1)
+          pat_id=$(echo "$pat_out" | grep -o 'pat_[A-Za-z0-9]*' | head -1)
+          "$BIN/vcs" login --store "$DEMO/store" --username bob --pat "$pat" | grep -q "scope read"
+          "$BIN/vcs" log --store "$DEMO/store" bob-repo | grep -q "r1"
+          if "$BIN/vcs" import --store "$DEMO/store" bob-repo "$DEMO/src" -m "越权提交"; then
+            echo "只读令牌竟然能提交"; exit 1
+          fi
+          "$BIN/vcs" pat-revoke --store "$DEMO/store" "$pat_id" | grep -q "已撤销"
+          if "$BIN/vcs" login --store "$DEMO/store" --username bob --pat "$pat"; then
+            echo "已撤销令牌仍可用"; exit 1
+          fi
+
+          # ---------------- M3：成员 / 配额 / 仓库状态 ----------------
+          # 上一步撤销了 PAT，缓存里的凭证已失效，重新用密码登录 bob（bob-repo 的 owner）
+          "$BIN/vcs" login --store "$DEMO/store" --username bob --password 'Bobpass1!' >/dev/null
+          "$BIN/vcs" repo-list --store "$DEMO/store" | grep -q "bob-repo"
+          "$BIN/vcs" member-add --store "$DEMO/store" bob-repo --username alice --role reader
+          "$BIN/vcs" member-set-role --store "$DEMO/store" bob-repo --username alice --role writer \
+            | grep -q "已把 alice 的角色改为 writer"
+          "$BIN/vcs" member-remove --store "$DEMO/store" bob-repo --username alice \
+            | grep -q "已把 alice 移出"
+
+          # 管理员核定 1 MiB 硬上限，再恢复继承
+          "$BIN/vcs" login --store "$DEMO/store" --username alice --password 'Abcdef1!'
+          "$BIN/vcs" repo-quota --store "$DEMO/store" bob-repo --hard 1048576 | grep -q "单仓库覆盖"
+          "$BIN/vcs" repo-quota --store "$DEMO/store" bob-repo --inherit | grep -q "系统兜底"
+
+          # 禁用后读写全拒，恢复后立即可用
+          "$BIN/vcs" repo-status --store "$DEMO/store" bob-repo --status disabled | grep -q "disabled"
+          if "$BIN/vcs" log --store "$DEMO/store" bob-repo; then
+            echo "禁用仓库仍可读"; exit 1
+          fi
+          "$BIN/vcs" repo-status --store "$DEMO/store" bob-repo --status active | grep -q "active"
+
+          # ---------------- 保留策略 ----------------
+          "$BIN/vcs" repo-create --store "$DEMO/store" monthly
+          mkdir -p "$DEMO/monthly/202609" "$DEMO/monthly/202610" "$DEMO/monthly/202611"
+          for m in 202609 202610 202611; do echo "$m 的报告" > "$DEMO/monthly/$m/report.txt"; done
+          "$BIN/vcs" import --store "$DEMO/store" monthly "$DEMO/monthly" -m "三个月归档"
+          "$BIN/vcs" retention-set --store "$DEMO/store" monthly --pattern '^20\d{4}$' --keep-months 2
+          "$BIN/vcs" retention-list --store "$DEMO/store" monthly | grep -q "仅预览"
+          "$BIN/vcs" retention-apply --store "$DEMO/store" monthly --dry-run | grep -q "202609"
+          # 仅预览的策略即使要求执行也必须被拒
+          if "$BIN/vcs" retention-apply --store "$DEMO/store" monthly; then
+            echo "仅预览的策略竟然被执行"; exit 1
+          fi
+
+          # 切成可执行 → 后台维护应真的按策略清理（系统身份，无需人工触发）
+          policy_id=$("$BIN/vcs" retention-list --store "$DEMO/store" monthly | sed -n 's/^\(rt_[A-Za-z0-9]*\).*/\1/p' | head -1)
+          "$BIN/vcs" retention-set --store "$DEMO/store" monthly --pattern '^20\d{4}$' --keep-months 2 --id "$policy_id" --execute
+          # 后台维护：保留策略 + 转正到期清理 + 全库 GC（vcs-grpc 的定时任务调的就是这个入口）
+          out=$("$BIN/vcs" maintenance --store "$DEMO/store"); echo "$out"
+          echo "$out" | grep -q "保留策略清理 1 个仓库"
+          "$BIN/vcs" purged --store "$DEMO/store" monthly | grep -q "202609"
+
+          echo "CLI 冒烟通过"
+
+  desktop:
+    # 类型检查之外，还要真跑一遍「单人提交闭环」：起真实的 vcs-grpc、真连网、真写文件。
+    # 只 typecheck 无法证明 gRPC 流式调用与 proto-loader 的字段映射是对的。
+    runs-on: ubuntu-latest
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: 构建 Rust 二进制（冒烟要用 vcs 与 vcs-grpc）
+        run: cargo build -p vcs-cli -p vcs-grpc
+      - working-directory: desktop
+        run: npm install --no-audit --no-fund
+      - working-directory: desktop
+        run: npm run typecheck
+      - working-directory: desktop
+        name: 单人提交闭环冒烟
+        run: npm run smoke

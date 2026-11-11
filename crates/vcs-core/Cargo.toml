@@ -1,0 +1,19 @@
+[package]
+name = "vcs-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "svn-next 共享版本控制核心：领域模型、对象存储契约、CAS 实现、工作副本与认证"
+
+[dependencies]
+blake3 = "1"
+zstd = "0.13"
+rusqlite = { version = "0.32", features = ["bundled"] }
+argon2 = "0.5"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+getrandom = "0.2"

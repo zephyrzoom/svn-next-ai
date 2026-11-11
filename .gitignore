@@ -1,0 +1,22 @@
+/target
+**/target
+node_modules/
+desktop/dist/
+# napi 构建产物（由 npm run build:native 生成）
+desktop/native/*.node
+# 打包产物与暂存的契约副本
+desktop/release/
+desktop/proto/
+.DS_Store
+*.log
+*.sqlite
+*.sqlite-journal
+
+# 本地服务端存储目录与工作副本元数据，不入库
+/.vcs-server/
+.vcs/
+# 工作副本元数据目录（桌面端早期版本用过 .vcs-desktop，保留忽略以免误提交）
+.vcs-desktop/
+
+# Agent 工具状态（本地记忆与任务数据），不入库
+.workbuddy/

@@ -1,0 +1,16 @@
+[package]
+name = "vcs-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "svn-next 服务端：本地共享 CAS + SQLite 元数据的存储与业务层"
+
+[dependencies]
+# 保留策略的 path_pattern 是正则（设计 9.7），用成熟实现而不是自造匹配器。
+regex = "1"
+vcs-core.workspace = true
+vcs-proto.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,24 @@
+[package]
+name = "vcs-napi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "svn-next 的 Node 原生模块：把 vcs-core 的工作副本语义交给 Electron 复用"
+
+[lib]
+crate-type = ["cdylib"]
+# 这个 crate 只是薄薄一层 FFI 适配，逻辑全在 vcs-core；它的单元测试没意义，
+# 而且 cdylib 链接 napi 符号时跑不了 test harness，所以关掉测试目标。
+test = false
+doctest = false
+
+[dependencies]
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+vcs-core.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+napi-build = "2"

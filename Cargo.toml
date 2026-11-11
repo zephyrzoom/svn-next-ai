@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/vcs-core", "crates/vcs-proto", "crates/vcs-server", "crates/vcs-grpc", "crates/vcs-napi", "crates/vcs-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+vcs-core = { path = "crates/vcs-core" }
+vcs-proto = { path = "crates/vcs-proto" }
+vcs-server = { path = "crates/vcs-server" }
+vcs-grpc = { path = "crates/vcs-grpc" }
+vcs-napi = { path = "crates/vcs-napi" }

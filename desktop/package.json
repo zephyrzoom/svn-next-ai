@@ -1,0 +1,30 @@
+{
+  "name": "svn-next-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "svn-next Electron 客户端（M4 第一步：单人提交闭环）",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "npm run build:native && npm run build && electron .",
+    "smoke": "npm run build:native && npm run build && node scripts/smoke-single-user.cjs",
+    "build:native": "node scripts/build-native.cjs",
+    "build:native:release": "node scripts/build-native.cjs --release",
+    "stage": "npm run build:native && node scripts/stage-assets.cjs",
+    "pack": "npm run stage && npm run build && electron-builder --dir",
+    "dist": "npm run stage && npm run build && electron-builder",
+    "pack:unpacked": "npm run stage && npm run build && electron-builder --dir --config.asar=false",
+    "dist:unpacked": "npm run stage && npm run build && electron-builder --config.asar=false"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "electron": "^35.0.0",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.7",
+    "@grpc/proto-loader": "^0.7.15"
+  }
+}

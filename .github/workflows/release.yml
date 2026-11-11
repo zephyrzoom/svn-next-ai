@@ -1,0 +1,117 @@
+name: release-desktop
+
+# 只在「打 tag」或手动触发时跑：日常提交不消耗三平台打包时间。
+on:
+  push:
+    tags:
+      - "v*"
+  # 手动触发：只构建并上传 artifact，不创建 Release。
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: 打包（${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 三平台各出一个未签名的包。macOS runner 目前是 arm64，
+        # 因此 mac 产物是 arm64；要出 x64 需要另加 target，见 docs §32。
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    env:
+      # 不签名：显式关掉 macOS 的证书自动发现，避免构建时卡在钥匙串交互。
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      # electron-builder 自己会下载 Electron 运行时，node_modules 里那份不必再拉一遍。
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: 安装依赖
+        working-directory: desktop
+        run: npm ci --no-audit --no-fund
+
+      # Windows 的 MSVC 链接需要 node.lib。node-gyp 的缓存里就有，
+      # 但不在 LIB 搜索路径上，因此这里显式把它交给链接器。
+      # （napi-build 只处理 windows-gnu，MSVC 这条路必须自己补。）
+      - name: 准备 node.lib（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: desktop
+        run: |
+          npx --yes node-gyp install
+          # 目录布局随 node-gyp 版本变过，直接递归找，不赌具体路径。
+          $root = Join-Path $env:LOCALAPPDATA "node-gyp\Cache"
+          $found = Get-ChildItem -Path $root -Recurse -Filter node.lib -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $found) { throw "node-gyp 缓存里找不到 node.lib" }
+          Write-Host "node.lib: $($found.FullName)"
+          "RUSTFLAGS=-C link-arg=$($found.FullName)" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ubuntu-24.04 默认没有 libfuse2，AppImage 打包工具会报找不到 libfuse.so.2。
+      - name: 安装 Linux 打包依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse2t64 || sudo apt-get install -y libfuse2
+
+      - name: 构建原生模块 + 编译 TS + 暂存契约
+        working-directory: desktop
+        run: npm run stage && npm run build
+
+      - name: 打包（未签名）
+        working-directory: desktop
+        # --publish never：产物只留在 runner 上，由下面的步骤上传/发版。
+        # Linux 只出 AppImage：deb 需要额外系统工具，收益不大。
+        run: npx electron-builder --publish never ${{ runner.os == 'Linux' && '--linux AppImage' || '' }}
+
+      - name: 收集产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: svn-next-${{ matrix.os }}
+          if-no-files-found: error
+          path: |
+            desktop/release/*.dmg
+            desktop/release/*.zip
+            desktop/release/*.exe
+            desktop/release/*.AppImage
+            desktop/release/*.blockmap
+
+  release:
+    name: 发布（仅 tag）
+    needs: package
+    # 只有打 tag 才发布；手动触发只留 artifact。
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: 汇总产物
+        run: find artifacts -type f | sort
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          fail_on_unmatched_files: false
+          # 未签名的包会被 Gatekeeper / SmartScreen 拦，说明写清楚，
+          # 免得用户以为下载坏了。
+          body: |
+            未签名的构建产物（内部试用）。
+
+            - macOS：首次打开需「右键 → 打开」，或 `xattr -dr com.apple.quarantine <app>`。
+            - Windows：SmartScreen 可能提示「未知发布者」，选择「仍要运行」。
+            - Linux：`chmod +x *.AppImage` 后直接运行。
