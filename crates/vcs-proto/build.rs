@@ -20,6 +20,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
+        // 注意：不要用 server_mod_attribute / client_mod_attribute 注入
+        // `#[allow(clippy::result_large_err)]`：tonic 生成的模块自带内部
+        // `#![allow(...)]`，内外属性混用反而会触发 clippy::mixed_attributes_style。
+        // 该 lint 的豁免统一放在 src/lib.rs 的 include_proto! 边界。
         .compile_protos(&[proto_file], &[proto_dir])?;
 
     Ok(())

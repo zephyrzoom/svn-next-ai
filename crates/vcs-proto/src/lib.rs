@@ -10,6 +10,12 @@
 pub mod vcs {
     pub mod repo {
         pub mod v1 {
+            // tonic 0.12 生成的 trait / client 方法都返回 `Result<_, tonic::Status>`，
+            // 而 `Status` 有 176 字节；clippy 1.98+ 会穿透 include_proto! 对生成代码
+            // 报 result_large_err。签名由 tonic 决定、无法装箱，因此只在生成代码
+            // 的边界放行，不放宽手写代码的 lint。
+            #![allow(clippy::result_large_err)]
+
             tonic::include_proto!("vcs.repo.v1");
         }
     }
