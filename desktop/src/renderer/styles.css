@@ -527,18 +527,6 @@ button.ghost {
   min-width: 150px;
 }
 
-.notes {
-  margin: 0;
-  padding: 0 0 0 18px;
-  line-height: 1.9;
-  font-size: 12px;
-}
-
-.notes .em {
-  color: var(--accent);
-  font-weight: 600;
-}
-
 /* ---------- 列表与选中态 ---------- */
 .list {
   list-style: none;

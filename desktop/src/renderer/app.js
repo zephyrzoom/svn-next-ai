@@ -179,13 +179,6 @@ function formatDate(seconds) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
-/** 会话说明：0 表示本次会话有效，没有勾选 30 天免登录。 */
-function sessionText(expiresAt) {
-  return expiresAt > 0
-    ? `30 天内免登录，至 ${formatDate(expiresAt)}`
-    : '仅本次会话有效，关闭应用后需重新登录';
-}
-
 /** 登录页里「登录 / 申请注册」两个表单的切换，纯界面操作。 */
 function setAuthMode(mode) {
   state.authMode = mode;
@@ -258,9 +251,6 @@ async function applySession(session, { target = '', resumed = false } = {}) {
   state.target = usedTarget;
   state.sessionExpiresAt = Number(expiresAt || 0);
   el('who').textContent = `${user.displayName || user.username} · ${roleLabel(user.role)}`;
-  el('account-name').textContent = `${user.displayName || user.username}（${user.username}）`;
-  el('account-role').textContent = roleLabel(user.role);
-  el('session-until').textContent = sessionText(state.sessionExpiresAt);
   el('session-hint').textContent = state.sessionExpiresAt > 0
     ? `免登录至 ${formatDate(state.sessionExpiresAt)}`
     : '本次会话';
@@ -683,7 +673,6 @@ el('delete-file').addEventListener('click', () =>
 el('do-request').addEventListener('click', () => void guard('提交建库申请', requestRepo));
 el('do-expand').addEventListener('click', () => void guard('提交扩容申请', requestExpansion));
 el('disconnect').addEventListener('click', () => void guard('退出登录', disconnect));
-el('account-disconnect').addEventListener('click', () => void guard('退出登录', disconnect));
 el('pick-dir').addEventListener('click', () => void guard('选择目录', pickDir));
 el('checkout').addEventListener('click', () => void guard('检出', checkout));
 el('refresh-status').addEventListener('click', () => void guard('扫描', refreshStatus));
@@ -711,8 +700,8 @@ async function bootstrap() {
     if (!saved.canPersistToken) {
       el('remember').checked = false;
       el('remember').disabled = true;
-      el('repo-hint').textContent =
-        '当前系统不支持加密存储凭证，重启后需要重新登录（连接信息仍会保留）。';
+      el('remember-label').textContent =
+        '当前系统不支持加密存储凭证，重启后需重新登录（连接信息仍会保留）';
     }
   }
   setSource('LOCAL');

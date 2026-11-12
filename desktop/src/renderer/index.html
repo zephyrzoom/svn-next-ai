@@ -54,7 +54,7 @@
         <form id="login-form" class="auth-form">
           <label>用户名<input id="username" placeholder="用户名" autocomplete="username" spellcheck="false" /></label>
           <label>密码<input id="password" type="password" placeholder="密码" autocomplete="current-password" /></label>
-          <label class="check"><input id="remember" type="checkbox" checked /> <span>30 天内免登录（本机加密保存）</span></label>
+          <label class="check"><input id="remember" type="checkbox" checked /> <span id="remember-label">30 天内免登录（本机加密保存）</span></label>
           <button id="connect" class="primary block" type="submit">登录</button>
         </form>
 
@@ -92,7 +92,6 @@
           <div class="nav-title">导航</div>
           <button class="nav-item active" data-view="workcopy">工作副本</button>
           <button class="nav-item" data-view="repos">仓库</button>
-          <button class="nav-item" data-view="account">账号</button>
           <div class="nav-foot">
             桌面端用于日常仓库使用。<br />管理与审批请访问服务端 Web 管理端。
           </div>
@@ -214,32 +213,6 @@
             </div>
           </section>
 
-          <!-- 视图：账号 -->
-          <section class="view hidden" id="view-account" data-view="account">
-            <div class="view-head">
-              <h1>账号</h1>
-              <p class="view-sub">当前登录身份与会话信息。</p>
-            </div>
-
-            <div class="card">
-              <div class="card-head"><h2>当前账号</h2></div>
-              <ul class="notes">
-                <li>用户：<span id="account-name" class="em">—</span>（角色 <span id="account-role">—</span>）</li>
-                <li>会话：<span id="session-until">—</span></li>
-              </ul>
-              <button id="account-disconnect" class="ghost">退出登录</button>
-            </div>
-
-            <div class="card">
-              <div class="card-head"><h2>使用说明</h2></div>
-              <ul class="notes">
-                <li>在「仓库」里查看可用仓库与容量、提交建库申请，在「工作副本」里检出与提交。</li>
-                <li>还没有账号？退出登录后可在登录页点「申请注册」。</li>
-                <li class="em">管理与审批请访问服务端 Web 管理端；桌面端只用于日常仓库使用。</li>
-              </ul>
-              <p class="hint" id="repo-hint">连接信息会保存在本地；系统支持时凭证会加密存储。</p>
-            </div>
-          </section>
         </main>
       </div>
     </div>
