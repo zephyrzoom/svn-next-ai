@@ -359,7 +359,7 @@ fn member_json(m: &MemberInfo) -> Value {
 
 fn quota_json(q: &EffectiveQuota) -> Value {
     json!({
-        "soft_bytes": q.soft_bytes, "hard_bytes": q.hard_bytes,
+        "bytes": q.bytes,
         "source": format!("{:?}", q.source),
     })
 }
@@ -589,11 +589,8 @@ async fn approve_registration(
     let role = parse_role(&s(&body, "role"));
     run(&state, move |store| {
         let out = store.approve_registration(&session, &id, role)?;
-        Ok(json!({
-            "user_id": out.user_id,
-            "setup_token": out.setup_token,
-            "setup_token_expires_at": out.setup_token_expires_at,
-        }))
+        // 申请人在注册时已经设好密码，审批只要放行；这里不再返回任何凭证。
+        Ok(json!({ "user_id": out.user_id }))
     })
     .await
 }
@@ -643,11 +640,10 @@ async fn approve_repo_request(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let soft = u(&body, "soft_bytes");
-    let hard = u(&body, "hard_bytes");
+    let quota_bytes = u(&body, "quota_bytes");
     let note = s(&body, "note");
     run(&state, move |store| {
-        let repo = store.approve_repo_request(&session, &id, soft, hard, &note)?;
+        let repo = store.approve_repo_request(&session, &id, quota_bytes, &note)?;
         Ok(json!({ "repo": repo_json(&repo) }))
     })
     .await
@@ -785,10 +781,9 @@ async fn create_repo(
         Err(resp) => return resp,
     };
     let name = s(&body, "name");
-    let soft = u(&body, "soft_bytes");
-    let hard = u(&body, "hard_bytes");
+    let quota_bytes = u(&body, "quota_bytes");
     run(&state, move |store| {
-        Ok(json!({ "repo": repo_json(&store.create_repo_direct(&session, &name, soft, hard)?) }))
+        Ok(json!({ "repo": repo_json(&store.create_repo_direct(&session, &name, quota_bytes)?) }))
     })
     .await
 }
@@ -890,13 +885,13 @@ async fn repo_quota(
     };
     run(&state, move |store| {
         store.require_admin_action(&session, "查看仓库配额")?;
-        let (soft, hard) = store.repo_quota_override(&id)?;
-        let (default_soft, default_hard) = store.quota_defaults()?;
+        let quota_bytes = store.repo_quota_override(&id)?;
+        let default_bytes = store.quota_defaults()?;
         Ok(json!({
-            "soft_bytes": soft, "hard_bytes": hard,
+            "quota_bytes": quota_bytes,
             "effective": quota_json(&store.effective_quota(&id)?),
             "usage": usage_json(&store.usage(&id)?),
-            "defaults": { "soft_bytes": default_soft, "hard_bytes": default_hard },
+            "defaults": { "bytes": default_bytes },
         }))
     })
     .await
@@ -912,11 +907,10 @@ async fn set_repo_quota(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let soft = u(&body, "soft_bytes");
-    let hard = u(&body, "hard_bytes");
+    let quota_bytes = u(&body, "quota_bytes");
     let inherit = b(&body, "inherit");
     run(&state, move |store| {
-        let effective = store.set_repo_quota(&elevated(&session), &id, soft, hard, inherit)?;
+        let effective = store.set_repo_quota(&elevated(&session), &id, quota_bytes, inherit)?;
         Ok(json!({ "effective": quota_json(&effective) }))
     })
     .await
@@ -929,8 +923,8 @@ async fn quota_defaults(State(state): State<AdminState>, headers: HeaderMap) -> 
     };
     run(&state, move |store| {
         store.require_admin_action(&session, "查看全局配额")?;
-        let (soft, hard) = store.quota_defaults()?;
-        Ok(json!({ "soft_bytes": soft, "hard_bytes": hard }))
+        let bytes = store.quota_defaults()?;
+        Ok(json!({ "bytes": bytes }))
     })
     .await
 }
@@ -944,10 +938,9 @@ async fn set_quota_defaults(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let soft = u(&body, "soft_bytes");
-    let hard = u(&body, "hard_bytes");
+    let quota_bytes = u(&body, "quota_bytes");
     run(&state, move |store| {
-        let effective = store.set_default_quota(&session, soft, hard)?;
+        let effective = store.set_default_quota(&session, quota_bytes)?;
         Ok(json!({ "effective": quota_json(&effective) }))
     })
     .await

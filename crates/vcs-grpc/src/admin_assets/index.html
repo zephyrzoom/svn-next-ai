@@ -67,11 +67,6 @@
               <h3>建库申请</h3>
               <div id="req-list" class="list"></div>
             </div>
-            <div id="token-box" class="card hidden">
-              <h3>一次性设置密码 token</h3>
-              <p class="muted">请立即转交申请人，服务端不会再次显示。</p>
-              <code id="token-text" class="token"></code>
-            </div>
           </section>
 
           <section class="view hidden" id="view-users">
@@ -98,11 +93,10 @@
               <h3>直通新建</h3>
               <form id="create-repo-form" class="form-grid">
                 <label>仓库名<input name="name" placeholder="小写字母/数字/-" required /></label>
-                <label>软上限（字节）<input name="soft_bytes" type="number" min="0" value="0" /></label>
-                <label>硬上限（字节）<input name="hard_bytes" type="number" min="0" value="0" /></label>
+                <label>配额上限（字节）<input name="quota_bytes" type="number" min="0" value="0" /></label>
                 <button class="primary" type="submit">创建</button>
               </form>
-              <p class="hint">配额填 0 表示继承全局默认。</p>
+              <p class="hint">配额上限只有一条线：超过即拒绝提交。填 0 表示继承全局默认。</p>
             </div>
             <div class="card">
               <h3>全部仓库</h3>
@@ -124,8 +118,7 @@
                   <h4>配额</h4>
                   <p id="repo-usage" class="muted"></p>
                   <form id="repo-quota-form" class="form-grid compact-grid">
-                    <label>软上限（字节）<input name="soft_bytes" type="number" min="0" value="0" /></label>
-                    <label>硬上限（字节）<input name="hard_bytes" type="number" min="0" value="0" /></label>
+                    <label>配额上限（字节）<input name="quota_bytes" type="number" min="0" value="0" /></label>
                     <button class="primary" type="submit">保存</button>
                     <button id="inherit-quota" class="ghost" type="button">恢复继承</button>
                   </form>
@@ -145,8 +138,7 @@
               <h3>新仓库默认配额</h3>
               <p class="muted">单仓库可在「仓库」页单独覆盖；0 表示未配置，由内置兜底接管。</p>
               <form id="defaults-form" class="form-grid">
-                <label>软上限（字节）<input name="soft_bytes" type="number" min="0" value="0" /></label>
-                <label>硬上限（字节）<input name="hard_bytes" type="number" min="0" value="0" /></label>
+                <label>配额上限（字节）<input name="quota_bytes" type="number" min="0" value="0" /></label>
                 <button class="primary" type="submit">保存</button>
               </form>
               <p id="defaults-note" class="hint"></p>

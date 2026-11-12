@@ -17,8 +17,7 @@ CREATE TABLE IF NOT EXISTS repos (
                         CHECK (status IN ('active', 'disabled', 'archived')),
   owner_user_id         TEXT NOT NULL,  -- 审批通过的申请人，或直通创建的管理员
   created_from_request  TEXT,           -- 关联的 repo_creation_requests.request_id
-  quota_soft_bytes      BIGINT NOT NULL DEFAULT 0,  -- 0 表示继承全局默认配额
-  quota_hard_bytes      BIGINT NOT NULL DEFAULT 0,  -- 0 表示继承全局默认配额
+  quota_bytes           BIGINT NOT NULL DEFAULT 0,  -- 配额上限（唯一一条线）；0 表示继承全局默认配额
   grace_days            INTEGER NOT NULL DEFAULT 7, -- 回收站宽限期
   created_at            BIGINT NOT NULL,
   updated_at            BIGINT NOT NULL
@@ -36,11 +35,10 @@ CREATE TABLE IF NOT EXISTS system_settings (
   updated_by  TEXT NOT NULL
 );
 
--- 预置键：default_quota_soft_bytes / default_quota_hard_bytes，值为 0 表示尚未配置。
--- 两级都未配置时由 vcs-core 内置兜底常量兜底，保证始终存在硬上限。
+-- 预置键：default_quota_bytes，值为 0 表示尚未配置。
+-- 两级都未配置时由 vcs-core 内置兜底常量兜底，保证始终存在上限。
 INSERT OR IGNORE INTO system_settings (key, value, updated_at, updated_by)
-VALUES ('default_quota_soft_bytes', '0', 0, 'bootstrap'),
-       ('default_quota_hard_bytes', '0', 0, 'bootstrap');
+VALUES ('default_quota_bytes', '0', 0, 'bootstrap');
 
 -- ---------------- 仓库创建申请 ----------------
 
@@ -286,7 +284,7 @@ CREATE INDEX IF NOT EXISTS idx_users_status ON users (status, source);
 CREATE INDEX IF NOT EXISTS idx_users_ldap_dn ON users (ldap_dn);
 
 -- 自助注册申请：pending → approved / rejected / expired，审批记录写入 decided_*。
--- 注册表单不收集密码；审批通过后发放一次性设置密码 token，库里只存其哈希。
+-- 密码在注册时即由本人在 users.password_hash 设好；审批只负责放行，不再发放激活链接。
 CREATE TABLE IF NOT EXISTS registration_requests (
   request_id          TEXT PRIMARY KEY,
   username            TEXT NOT NULL,
@@ -298,10 +296,7 @@ CREATE TABLE IF NOT EXISTS registration_requests (
   decided_at          BIGINT,
   decided_by          TEXT,
   decision_note       TEXT,
-  expires_at          BIGINT NOT NULL,
-  setup_token_hash    TEXT,
-  setup_token_expires BIGINT,
-  setup_used_at       BIGINT
+  expires_at          BIGINT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_reg_pending ON registration_requests (status, submitted_at);

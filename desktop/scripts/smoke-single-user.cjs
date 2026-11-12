@@ -258,32 +258,29 @@ async function main() {
     const after = wc.status(WC);
     if (after.length !== 0) fail(`更新后仍有变更：${JSON.stringify(after)}`);
 
-    step('注册 → 审批 → 设密码：非管理员也能自己开通');
-    const registered = await client.register('bob', '李波', '一起维护月度报表');
+    step('注册（自带密码）→ 审批：非管理员也能自己开通');
+    const registered = await client.register('bob', '李波', 'Bobpass1!', '一起维护月度报表');
     console.log(`  已提交注册申请 ${registered.requestId}`);
     // 这个库启动时已用 init-admin 建过管理员，所以 bob 不是首位用户，必须走审批。
     if (registered.autoApproved) fail('已有管理员时注册不应被自动批准');
-    if (registered.passwordSetupToken) fail('非首位注册不应返回一次性设置密码 token');
     const pending = await client.listRegistrations(1);
     if (!pending.some((item) => item.username === 'bob')) fail('审批台里看不到 bob 的申请');
-    const approved = await client.approveRegistration(registered.requestId, 2);
-    if (!approved.setupToken.startsWith('vcs_setup_')) fail('没有拿到一次性设置密码 token');
-    await client.setPassword(approved.setupToken, 'Bobpass1!');
-    let reused = false;
-    try {
-      await client.setPassword(approved.setupToken, 'Other1!x');
-    } catch (err) {
-      reused = true;
-      if (!String(err.message).includes('已使用')) fail(`一次性 token 复用应报已使用：${err.message}`);
-    }
-    if (!reused) fail('一次性 token 竟然可以复用');
-
     const bobClient = new VcsClient(TARGET);
+    // 未审批前密码无效：不能登录，且错误该是「待审批」而不是「密码错」。
+    let pendingBlocked = false;
     try {
-      const bob = await bobClient.login('bob', 'Bobpass1!');
-      console.log(`  bob 已能登录（role=${bob.role}），一次性 token 不可复用`);
+      await bobClient.login('bob', 'Bobpass1!');
+    } catch (err) {
+      pendingBlocked = true;
+      if (!String(err.message).includes('待审批')) fail(`未审批登录应提示待审批：${err.message}`);
+    }
+    if (!pendingBlocked) fail('未审批的账号竟然可以登录');
 
-      step('建库申请 → 管理员审批 → 申请人是 owner');
+    await client.approveRegistration(registered.requestId, 2);
+    const bob = await bobClient.login('bob', 'Bobpass1!');
+    console.log(`  bob 已能登录（role=${bob.role}），用的是注册时设置的密码`);
+
+    try {
       const request = await bobClient.requestRepo('bob-repo', '个人归档');
       const bobReposBefore = await bobClient.listRepos();
       if (bobReposBefore.some((item) => item.name === 'bob-repo')) {
@@ -431,22 +428,22 @@ async function main() {
     // 包一层块作用域：main() 是个大函数，前面的段落已经用过 quotaBefore 之类的名字。
     {
     const quotaBefore = await client.getQuotaDefaults();
-    const quotaSaved = await client.updateQuotaDefaults(0, 2 * 1024 * 1024);
-    if (quotaSaved.hardBytes !== 2 * 1024 * 1024) {
+    const quotaSaved = await client.updateQuotaDefaults(2 * 1024 * 1024);
+    if (quotaSaved.bytes !== 2 * 1024 * 1024) {
       fail(`全局默认没有被保存：${JSON.stringify(quotaSaved)}`);
     }
     const inheritedQuota = await client.getRepoQuota(repo.repoId);
     if (inheritedQuota.source !== 2) {
       fail(`未核定仓库应继承全局默认(2)，实际 ${inheritedQuota.source}`);
     }
-    const overrideQuota = await client.setRepoQuota(repo.repoId, 0, 1024 * 1024, false);
-    if (overrideQuota.source !== 1 || overrideQuota.effectiveHard !== 1024 * 1024) {
+    const overrideQuota = await client.setRepoQuota(repo.repoId, 1024 * 1024, false);
+    if (overrideQuota.source !== 1 || overrideQuota.effectiveBytes !== 1024 * 1024) {
       fail(`单仓库覆盖没生效：${JSON.stringify(overrideQuota)}`);
     }
-    const backToInherit = await client.setRepoQuota(repo.repoId, 0, 0, true);
+    const backToInherit = await client.setRepoQuota(repo.repoId, 0, true);
     if (backToInherit.source === 1) fail('恢复继承后来源不该还是单仓库覆盖');
     console.log(
-      `  全局默认 ${quotaBefore.hardBytes} → ${quotaSaved.hardBytes} 字节；` +
+      `  全局默认 ${quotaBefore.bytes} → ${quotaSaved.bytes} 字节；` +
         `单仓库覆盖生效后恢复继承（来源 ${inheritedQuota.source} → 1 → ${backToInherit.source}）`,
     );
     }

@@ -160,23 +160,17 @@
 
           <div class="card">
             <div class="card-head"><h2>自助开通</h2></div>
-            <p class="hint">还没有账号可以申请注册；拿到一次性链接后在这里设置密码。</p>
+            <p class="hint">还没有账号可以申请注册；提交申请时自己设置登录密码，审批通过后即可直接登录。</p>
             <div class="row">
               <button id="toggle-register" class="ghost">申请注册</button>
-              <button id="toggle-setpw" class="ghost">用一次性链接设置密码</button>
             </div>
 
             <div id="register-form" class="inline-form hidden">
               <input id="reg-username" placeholder="用户名（小写字母/数字/_- .）" spellcheck="false" />
               <input id="reg-name" placeholder="姓名" spellcheck="false" />
+              <input id="reg-password" type="password" placeholder="密码（≥8 位，含大小写/数字/特殊字符）" />
               <input id="reg-reason" placeholder="申请理由（可选）" spellcheck="false" />
               <button id="do-register" class="primary">提交申请</button>
-            </div>
-
-            <div id="setpw-form" class="inline-form hidden">
-              <input id="setpw-token" placeholder="一次性 token（vcs_setup_…）" spellcheck="false" />
-              <input id="setpw-password" type="password" placeholder="新密码（≥8 位，含大小写/数字/特殊字符）" />
-              <button id="do-setpw" class="primary">设置密码</button>
             </div>
           </div>
 

@@ -171,8 +171,7 @@ async fn full_commit_round_trip_over_the_wire() {
             Request::new(pb::CreateRepoDirectRequest {
                 repo_name: "reports".into(),
                 repo_id_hint: String::new(),
-                quota_soft_bytes: 10 * 1024 * 1024,
-                quota_hard_bytes: 20 * 1024 * 1024,
+                quota_bytes: 20 * 1024 * 1024,
             }),
             &token,
         ))
@@ -368,8 +367,7 @@ async fn out_of_date_and_membership_are_reported_in_status() {
             Request::new(pb::CreateRepoDirectRequest {
                 repo_name: "guard".into(),
                 repo_id_hint: String::new(),
-                quota_soft_bytes: 0,
-                quota_hard_bytes: 0,
+                quota_bytes: 0,
             }),
             &token,
         ))
@@ -503,7 +501,7 @@ async fn admin_approval_and_purge_over_grpc() {
     let h = Harness::start("admin").await;
     let token = login(&h, "alice", PASSWORD).await;
 
-    // 注册 → 审批 → 设密码，全走网络接口
+    // 注册（自带密码）→ 审批 → 直接登录，全走网络接口
     let reg = h
         .auth()
         .await
@@ -511,11 +509,46 @@ async fn admin_approval_and_purge_over_grpc() {
             username: "carol".into(),
             display_name: "王佳".into(),
             reason: "归档".into(),
+            password: PASSWORD.into(),
         }))
         .await
         .unwrap()
         .into_inner();
     assert_eq!(reg.status.unwrap().code, pb::ErrorCode::Ok as i32);
+    // 未审批前密码不管用。
+    let early = h
+        .auth()
+        .await
+        .login(Request::new(pb::LoginRequest {
+            username: "carol".into(),
+            password: PASSWORD.into(),
+            source: pb::AuthSource::Local as i32,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        early.status.unwrap().code,
+        pb::ErrorCode::AccountPending as i32
+    );
+
+    // 弱密码必须在注册这一步就被服务端拒绝。
+    let weak = h
+        .auth()
+        .await
+        .register(Request::new(pb::RegisterRequest {
+            username: "carol2".into(),
+            display_name: "王佳2".into(),
+            reason: "归档".into(),
+            password: "short".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        weak.status.unwrap().code,
+        pb::ErrorCode::PasswordPolicyViolation as i32
+    );
 
     let approved = h
         .auth()
@@ -531,37 +564,9 @@ async fn admin_approval_and_purge_over_grpc() {
         .unwrap()
         .into_inner();
     assert_eq!(approved.status.unwrap().code, pb::ErrorCode::Ok as i32);
-    assert!(approved.password_setup_token.starts_with("vcs_setup_"));
-
-    let set = h
-        .auth()
-        .await
-        .set_password(Request::new(pb::SetPasswordRequest {
-            setup_token: approved.password_setup_token.clone(),
-            new_password: PASSWORD.into(),
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(set.status.unwrap().code, pb::ErrorCode::Ok as i32);
-    // 弱密码必须被服务端拒绝
-    let weak = h
-        .auth()
-        .await
-        .set_password(Request::new(pb::SetPasswordRequest {
-            setup_token: approved.password_setup_token,
-            new_password: "short".into(),
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-    // 一次性 token 已用过，先撞上 SETUP_TOKEN_INVALID；无论哪个都属于业务拒绝而非成功。
-    let weak_code = weak.status.unwrap().code;
-    assert!(
-        weak_code == pb::ErrorCode::SetupTokenInvalid as i32
-            || weak_code == pb::ErrorCode::PasswordPolicyViolation as i32,
-        "弱密码或重复使用必须被拒，实际 code={weak_code}"
-    );
+    assert!(!approved.user_id.is_empty());
+    // 审批后直接能用注册时的密码登录，服务端不再下发任何凭证。
+    let _carol = login(&h, "carol", PASSWORD).await;
 
     // 仓库申请 → 审批 → 清理闭环
     let req = h
@@ -585,8 +590,7 @@ async fn admin_approval_and_purge_over_grpc() {
         .approve_repo_creation(bearer(
             Request::new(pb::ApproveRepoCreationRequest {
                 request_id: req.request_id,
-                quota_soft_bytes: 0,
-                quota_hard_bytes: 0,
+                quota_bytes: 0,
                 decision_note: "同意".into(),
             }),
             &token,
@@ -647,6 +651,7 @@ async fn member_and_repo_admin_rpcs_work_over_the_wire() {
             username: "dave".into(),
             display_name: "赵大".into(),
             reason: "协作".into(),
+            password: PASSWORD.into(),
         }))
         .await
         .unwrap()
@@ -664,14 +669,7 @@ async fn member_and_repo_admin_rpcs_work_over_the_wire() {
         .await
         .unwrap()
         .into_inner();
-    h.auth()
-        .await
-        .set_password(Request::new(pb::SetPasswordRequest {
-            setup_token: approved.password_setup_token,
-            new_password: PASSWORD.into(),
-        }))
-        .await
-        .unwrap();
+    assert_eq!(approved.status.unwrap().code, pb::ErrorCode::Ok as i32);
     let dave = login(&h, "dave", PASSWORD).await;
 
     let repo = h
@@ -681,8 +679,7 @@ async fn member_and_repo_admin_rpcs_work_over_the_wire() {
             Request::new(pb::CreateRepoDirectRequest {
                 repo_name: "team".into(),
                 repo_id_hint: String::new(),
-                quota_soft_bytes: 0,
-                quota_hard_bytes: 0,
+                quota_bytes: 0,
             }),
             &alice,
         ))
@@ -787,8 +784,7 @@ async fn member_and_repo_admin_rpcs_work_over_the_wire() {
         .set_repo_quota(bearer(
             Request::new(pb::SetRepoQuotaRequest {
                 repo_id: repo_id.clone(),
-                soft_bytes: 0,
-                hard_bytes: 1024 * 1024,
+                bytes: 1024 * 1024,
                 inherit: false,
             }),
             &alice,
@@ -813,7 +809,7 @@ async fn member_and_repo_admin_rpcs_work_over_the_wire() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(read_back.repo_hard_bytes, 1024 * 1024);
+    assert_eq!(read_back.repo_bytes, 1024 * 1024);
 
     // 禁用仓库：读写立即被拒
     let disabled = h
@@ -891,7 +887,7 @@ async fn first_registration_over_grpc_auto_approves_the_admin() {
     );
     assert!(unconfigured.access_token.is_empty());
 
-    // 空库第一个注册：自动批准为 admin，token 直接回给本人。
+    // 空库第一个注册：自动批准为 admin，注册时设置的密码立即可用。
     let reg = h
         .auth()
         .await
@@ -899,6 +895,7 @@ async fn first_registration_over_grpc_auto_approves_the_admin() {
             username: "alice".into(),
             display_name: "张爱丽".into(),
             reason: "首位用户".into(),
+            password: PASSWORD.into(),
         }))
         .await
         .unwrap()
@@ -907,20 +904,6 @@ async fn first_registration_over_grpc_auto_approves_the_admin() {
     assert!(reg.auto_approved);
     assert_eq!(reg.state, pb::RegistrationStatus::Approved as i32);
     assert_eq!(reg.granted_role, pb::Role::Admin as i32);
-    assert!(reg.password_setup_token.starts_with("vcs_setup_"));
-    assert!(reg.setup_token_expires_at > 0);
-
-    let pw = h
-        .auth()
-        .await
-        .set_password(Request::new(pb::SetPasswordRequest {
-            setup_token: reg.password_setup_token.clone(),
-            new_password: PASSWORD.into(),
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(pw.status.unwrap().code, pb::ErrorCode::Ok as i32);
 
     let logged = h
         .auth()
@@ -936,7 +919,7 @@ async fn first_registration_over_grpc_auto_approves_the_admin() {
     assert_eq!(logged.status.unwrap().code, pb::ErrorCode::Ok as i32);
     assert_eq!(logged.user.unwrap().role, pb::Role::Admin as i32);
 
-    // 第二个人仍是普通待审批申请，拿不到任何 token。
+    // 第二个人仍是普通待审批申请，审批后才可用同一份密码登录。
     let second = h
         .auth()
         .await
@@ -944,6 +927,7 @@ async fn first_registration_over_grpc_auto_approves_the_admin() {
             username: "bob".into(),
             display_name: "李波".into(),
             reason: "申请".into(),
+            password: PASSWORD.into(),
         }))
         .await
         .unwrap()
@@ -951,5 +935,4 @@ async fn first_registration_over_grpc_auto_approves_the_admin() {
     assert_eq!(second.status.unwrap().code, pb::ErrorCode::Ok as i32);
     assert!(!second.auto_approved);
     assert_eq!(second.state, pb::RegistrationStatus::Pending as i32);
-    assert!(second.password_setup_token.is_empty());
 }

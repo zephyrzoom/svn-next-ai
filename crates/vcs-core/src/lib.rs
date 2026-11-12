@@ -6,7 +6,7 @@
 //!   - [`hash`]：blake3 地址与 `objects/ab/cdef…` 分片路径；
 //!   - [`tree`]：树对象的规范编码、自底向上组装、扁平化；
 //!   - [`store`]：本地文件系统 CAS（tmp → 原子 rename、zstd、幂等写入）；
-//!   - [`auth`]：Argon2id 口令、HS256 JWT、一次性 token；
+//!   - [`auth`]：Argon2id 口令、HS256 JWT、PAT 令牌；
 //!   - [`wc`]：工作副本（检出、离线 status / diff、pristine 基线缓存）。
 //!
 //! 客户端经 napi-rs 复用本 crate，服务端 `vcs-server` 也直接依赖它，
@@ -124,9 +124,11 @@ pub struct Revision {
 /// 不提供 PARTITIONED 分区隔离；释放空间一律走 purged_paths 路径裁剪 + GC。
 pub const CAS_LAYOUT: &str = "SHARED_CAS";
 
-/// 两级配额都未配置时的内置兜底，保证始终存在硬上限。
-pub const FALLBACK_QUOTA_SOFT_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GiB
-pub const FALLBACK_QUOTA_HARD_BYTES: u64 = 100 * 1024 * 1024 * 1024; // 100 GiB
+/// 两级配额都未配置时的内置兜底，保证任何情况下都存在一条上限。
+///
+/// 配额只有一条线（超过即拒绝写入），不再区分软 / 硬阈值：
+/// 软阈值从未参与过任何判定，多一个输入框只会让审批人猜。
+pub const FALLBACK_QUOTA_BYTES: u64 = 100 * 1024 * 1024 * 1024; // 100 GiB
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaSource {
@@ -137,59 +139,30 @@ pub enum QuotaSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EffectiveQuota {
-    pub soft_bytes: u64,
-    pub hard_bytes: u64,
+    /// 生效的配额上限（字节）。
+    pub bytes: u64,
     pub source: QuotaSource,
 }
 
-/// 配额配置合法性：hard > 0 且 0 <= soft <= hard。
-pub fn validate_quota(soft_bytes: u64, hard_bytes: u64) -> bool {
-    hard_bytes > 0 && soft_bytes <= hard_bytes
-}
-
 /// 解析生效配额：单仓库显式值 > 全局默认 > 内置兜底。
-/// repo_hard / default_hard 为 0 分别表示该级未配置；软阈值未配置时按硬阈值 85% 推导。
-pub fn resolve_effective_quota(
-    repo_soft: u64,
-    repo_hard: u64,
-    default_soft: u64,
-    default_hard: u64,
-) -> EffectiveQuota {
-    if repo_hard > 0 {
-        let soft = if repo_soft == 0 {
-            (repo_hard as u128 * 85 / 100) as u64
-        } else {
-            repo_soft.min(repo_hard)
-        };
+/// `repo_bytes` / `default_bytes` 为 0 表示该级未配置。
+pub fn resolve_effective_quota(repo_bytes: u64, default_bytes: u64) -> EffectiveQuota {
+    if repo_bytes > 0 {
         return EffectiveQuota {
-            soft_bytes: soft,
-            hard_bytes: repo_hard,
+            bytes: repo_bytes,
             source: QuotaSource::RepoOverride,
         };
     }
-    if default_hard > 0 {
-        let soft = if default_soft == 0 {
-            (default_hard as u128 * 85 / 100) as u64
-        } else {
-            default_soft.min(default_hard)
-        };
+    if default_bytes > 0 {
         return EffectiveQuota {
-            soft_bytes: soft,
-            hard_bytes: default_hard,
+            bytes: default_bytes,
             source: QuotaSource::GlobalDefault,
         };
     }
     EffectiveQuota {
-        soft_bytes: FALLBACK_QUOTA_SOFT_BYTES,
-        hard_bytes: FALLBACK_QUOTA_HARD_BYTES,
+        bytes: FALLBACK_QUOTA_BYTES,
         source: QuotaSource::Fallback,
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QuotaConfig {
-    pub soft_bytes: u64,
-    pub hard_bytes: u64,
 }
 
 /// dry-run 结果：reclaimable_bytes 才是删除后真正能释放的空间，
@@ -691,23 +664,17 @@ mod tests {
 
     #[test]
     fn quota_resolution_precedence() {
-        let fallback = resolve_effective_quota(0, 0, 0, 0);
+        let fallback = resolve_effective_quota(0, 0);
         assert_eq!(fallback.source, QuotaSource::Fallback);
-        assert_eq!(fallback.hard_bytes, FALLBACK_QUOTA_HARD_BYTES);
+        assert_eq!(fallback.bytes, FALLBACK_QUOTA_BYTES);
 
-        let global = resolve_effective_quota(0, 0, 0, 200);
+        let global = resolve_effective_quota(0, 200);
         assert_eq!(global.source, QuotaSource::GlobalDefault);
-        assert_eq!(global.hard_bytes, 200);
-        assert_eq!(global.soft_bytes, 170);
+        assert_eq!(global.bytes, 200);
 
-        let repo = resolve_effective_quota(0, 300, 10, 200);
+        // 单仓库显式值优先于全局默认，且不做任何比例推导。
+        let repo = resolve_effective_quota(300, 200);
         assert_eq!(repo.source, QuotaSource::RepoOverride);
-        assert_eq!(repo.hard_bytes, 300);
-        assert_eq!(repo.soft_bytes, 255);
-
-        assert!(validate_quota(0, 100));
-        assert!(validate_quota(85, 100));
-        assert!(!validate_quota(0, 0));
-        assert!(!validate_quota(101, 100));
+        assert_eq!(repo.bytes, 300);
     }
 }

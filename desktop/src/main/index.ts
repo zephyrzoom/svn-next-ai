@@ -13,7 +13,7 @@ import type { ConflictChoice } from './wc';
  * 也拿不到文件系统与 token。
  *
  * 桌面端定位：只做「仓库使用」的客户端 —— 连接、仓库列表/选择、工作副本的
- * 检出/状态/差异/冲突/提交/更新/还原/历史，以及账号自助注册、设置密码、提交
+ * 检出/状态/差异/冲突/提交/更新/还原/历史，以及账号自助注册（注册即设密码）、提交
  * 建库申请。管理与审批（成员、配额、空间治理、目录配置、审批台等）统一由服务端
  * vcs serve 内置的 Web 管理端承载，桌面端不再暴露这些通道。
  */
@@ -202,7 +202,7 @@ ipcMain.handle('vcs:log', (_event, repoId: string, limit = 20) =>
 
 // ---------------- 账号自助与建库申请 ----------------
 
-/** 免认证接口（注册、设置密码）用一个临时连接，不污染当前登录态。 */
+/** 免认证接口（注册）用一个临时连接，不污染当前登录态。 */
 async function withTemp<T>(target: string, run: (client: VcsClient) => Promise<T>): Promise<T> {
   const temp = new VcsClient(target);
   try {
@@ -214,14 +214,17 @@ async function withTemp<T>(target: string, run: (client: VcsClient) => Promise<T
 
 ipcMain.handle(
   'vcs:register',
-  (_event, target: string, username: string, displayName: string, reason: string) =>
-    wrap(async () => withTemp(target, (client) => client.register(username, displayName, reason))),
-);
-
-ipcMain.handle(
-  'vcs:setPassword',
-  (_event, target: string, token: string, password: string) =>
-    wrap(async () => withTemp(target, (client) => client.setPassword(token, password))),
+  (
+    _event,
+    target: string,
+    username: string,
+    displayName: string,
+    password: string,
+    reason: string,
+  ) =>
+    wrap(async () =>
+      withTemp(target, (client) => client.register(username, displayName, password, reason)),
+    ),
 );
 
 ipcMain.handle('vcs:requestRepo', (_event, name: string, reason: string, quota = 0) =>

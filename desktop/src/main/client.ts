@@ -184,8 +184,8 @@ export interface RepoRequestRow {
 
 export interface QuotaRow {
   usedBytes: number;
-  softLimit: number;
-  hardLimit: number;
+  /** 生效的配额上限（字节）。 */
+  limitBytes: number;
   /** 1=单仓库覆盖 2=全局默认 3=系统兜底（与 proto 的 QuotaSource 一致）。 */
   source: number;
 }
@@ -210,17 +210,14 @@ export interface PurgeResultRow {
 }
 
 export interface QuotaDefaultsRow {
-  softBytes: number;
-  hardBytes: number;
+  bytes: number;
   updatedAt: number;
   updatedBy: string;
 }
 
 export interface RepoQuotaRow {
-  repoSoftBytes: number;
-  repoHardBytes: number;
-  effectiveSoft: number;
-  effectiveHard: number;
+  repoBytes: number;
+  effectiveBytes: number;
   /** 1=单仓库覆盖 2=全局默认 3=系统兜底 */
   source: number;
 }
@@ -436,8 +433,7 @@ export class VcsClient {
     const effective = resp.effective ?? {};
     return {
       usedBytes: resp.usedBytes as number,
-      softLimit: (effective.softBytes ?? resp.softLimit) as number,
-      hardLimit: (effective.hardBytes ?? resp.hardLimit) as number,
+      limitBytes: (effective.bytes ?? resp.limitBytes) as number,
       source: (effective.source ?? 0) as number,
     };
   }
@@ -521,23 +517,18 @@ export class VcsClient {
     assertOk(resp.status);
     const row = resp.defaults ?? {};
     return {
-      softBytes: (row.softBytes ?? 0) as number,
-      hardBytes: (row.hardBytes ?? 0) as number,
+      bytes: (row.bytes ?? 0) as number,
       updatedAt: (row.updatedAt ?? 0) as number,
       updatedBy: (row.updatedBy ?? '') as string,
     };
   }
 
-  async updateQuotaDefaults(softBytes: number, hardBytes: number): Promise<QuotaDefaultsRow> {
-    const resp = await this.invoke<any>(this.admin, 'updateQuotaDefaults', {
-      softBytes,
-      hardBytes,
-    });
+  async updateQuotaDefaults(bytes: number): Promise<QuotaDefaultsRow> {
+    const resp = await this.invoke<any>(this.admin, 'updateQuotaDefaults', { bytes });
     assertOk(resp.status);
     const row = resp.defaults ?? {};
     return {
-      softBytes: (row.softBytes ?? 0) as number,
-      hardBytes: (row.hardBytes ?? 0) as number,
+      bytes: (row.bytes ?? 0) as number,
       updatedAt: (row.updatedAt ?? 0) as number,
       updatedBy: (row.updatedBy ?? '') as string,
     };
@@ -549,34 +540,24 @@ export class VcsClient {
     assertOk(resp.status);
     const effective = resp.effective ?? {};
     return {
-      repoSoftBytes: (resp.repoSoftBytes ?? 0) as number,
-      repoHardBytes: (resp.repoHardBytes ?? 0) as number,
-      effectiveSoft: (effective.softBytes ?? 0) as number,
-      effectiveHard: (effective.hardBytes ?? 0) as number,
+      repoBytes: (resp.repoBytes ?? 0) as number,
+      effectiveBytes: (effective.bytes ?? 0) as number,
       source: (effective.source ?? 0) as number,
     };
   }
 
   /** `inherit=true` 时清零并回到继承全局默认。 */
-  async setRepoQuota(
-    repoId: string,
-    softBytes: number,
-    hardBytes: number,
-    inherit: boolean,
-  ): Promise<RepoQuotaRow> {
+  async setRepoQuota(repoId: string, bytes: number, inherit: boolean): Promise<RepoQuotaRow> {
     const resp = await this.invoke<any>(this.admin, 'setRepoQuota', {
       repoId,
-      softBytes,
-      hardBytes,
+      bytes,
       inherit,
     });
     assertOk(resp.status);
     const effective = resp.effective ?? {};
     return {
-      repoSoftBytes: inherit ? 0 : softBytes,
-      repoHardBytes: inherit ? 0 : hardBytes,
-      effectiveSoft: (effective.softBytes ?? 0) as number,
-      effectiveHard: (effective.hardBytes ?? 0) as number,
+      repoBytes: inherit ? 0 : bytes,
+      effectiveBytes: (effective.bytes ?? 0) as number,
       source: (effective.source ?? 0) as number,
     };
   }
@@ -717,24 +698,26 @@ export class VcsClient {
   /**
    * 自助注册（免认证）。
    *
-   * 空库第一个账号会被自动批准为管理员，`autoApproved` 为 true，
-   * `passwordSetupToken` 是**只返回这一次**的一次性设置密码凭证。
+   * 密码在申请时就设置并交给服务端哈希保存：审批通过后本人直接用它登录，
+   * 不再需要一次性链接。
+   *
+   * 空库第一个账号会被自动批准为管理员，`autoApproved` 为 true，注册完即可登录。
    */
   async register(
     username: string,
     displayName: string,
+    password: string,
     reason: string,
   ): Promise<{
     requestId: string;
     state: number;
     autoApproved: boolean;
-    passwordSetupToken: string;
-    setupTokenExpiresAt: number;
     grantedRole: number;
   }> {
     const resp = await this.invoke<any>(this.auth, 'register', {
       username,
       displayName,
+      password,
       reason,
     });
     assertOk(resp.status);
@@ -742,8 +725,6 @@ export class VcsClient {
       requestId: resp.requestId as string,
       state: resp.state as number,
       autoApproved: Boolean(resp.autoApproved),
-      passwordSetupToken: (resp.passwordSetupToken as string) ?? '',
-      setupTokenExpiresAt: Number(resp.setupTokenExpiresAt ?? 0),
       grantedRole: Number(resp.grantedRole ?? 0),
     };
   }
@@ -786,15 +767,6 @@ export class VcsClient {
     };
   }
 
-  /** 用审批发放的一次性 token 设置初始密码（免认证）。 */
-  async setPassword(setupToken: string, newPassword: string): Promise<void> {
-    const resp = await this.invoke<any>(this.auth, 'setPassword', {
-      setupToken,
-      newPassword,
-    });
-    assertOk(resp.status);
-  }
-
   /** 待审批注册申请。`state` 传 0 表示全部。 */
   async listRegistrations(state = 0): Promise<RegistrationRow[]> {
     const resp = await this.invoke<any>(this.auth, 'listRegistrations', {
@@ -815,23 +787,15 @@ export class VcsClient {
   /**
    * 审批通过注册。
    *
-   * 返回值里的 `setupToken` 是**一次性**的设置密码凭证，明文只出现这一次——
-   * 界面上必须立刻展示给管理员转交，关掉就没了。
+   * 审批只做放行：申请人注册时设好的密码就是登录口令，服务端不再回传任何凭证。
    */
-  async approveRegistration(
-    requestId: string,
-    role: number,
-  ): Promise<{ userId: string; setupToken: string; expiresAt: number }> {
+  async approveRegistration(requestId: string, role: number): Promise<{ userId: string }> {
     const resp = await this.invoke<any>(this.auth, 'approveRegistration', {
       requestId,
       role,
     });
     assertOk(resp.status);
-    return {
-      userId: resp.userId as string,
-      setupToken: resp.passwordSetupToken as string,
-      expiresAt: resp.setupTokenExpiresAt as number,
-    };
+    return { userId: resp.userId as string };
   }
 
   async rejectRegistration(requestId: string, reason: string): Promise<void> {

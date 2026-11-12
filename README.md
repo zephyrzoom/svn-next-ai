@@ -81,10 +81,10 @@ npm run dist           # 出安装包，输出到 desktop/release/
 
 **空库不必预先建管理员**：全库第一个提交注册申请的人，或第一个用 LDAP 登录成功的人，会自动成为管理员（`admin`），无需任何人审批。两条入口共用同一个名额，谁先在写事务里落到用户表谁拿走；之后所有人都走正常流程（注册待审批 / LDAP 按组映射初始角色）。
 
-- **首位注册者**：申请单直接 `approved`，一次性设置密码 token 随注册响应返回给本人（CLI 打印、桌面端自动填入「设置密码」），设完密码即可登录。
+- **首位注册者**：申请单直接 `approved`，注册时自己填的密码立即可用，提交后就能连接，不需要再设置密码。
 - **首位 LDAP 用户**：目录 bind 成功后即时创建 `ACTIVE` 映射并签发 JWT，无需设置本地密码。
 
-如果希望在部署阶段就固定管理员，或首位用户丢失了设置密码 token 需要救援，仍可在服务器本机执行：
+如果希望在部署阶段就固定管理员，或首位账号没有可用口令需要救援，仍可在服务器本机执行：
 
 ```bash
 sudo mkdir -p /srv/vcs
@@ -96,7 +96,7 @@ vcs init-admin --store /srv/vcs \
 vcs --store /srv/vcs server info      # 核对：users 应显示「已初始化」
 ```
 
-- `init-admin` 只在**没有可登录管理员**时可用；已有管理员时执行会被拒绝。若同名本地账号存在但从未设置密码（首位注册者丢 token），它会重置口令并提权，作为救援通道。
+- `init-admin` 只在**没有可登录管理员**时可用；已有管理员时执行会被拒绝。若同名本地账号存在但没有可用口令（例如旧流程遗留的未激活账号），它会重置口令并提权，作为救援通道。
 - 密码参数留空则交互输入、不回显。
 - `schema/server.sql` 由程序自动执行，**不需要手工建表**；首次打开目录会自动建好：
 
@@ -188,7 +188,7 @@ vcs ldap-show     # 回显配置，不显示密码
 | 菜单 | 能做什么 |
 | --- | --- |
 | 概览 | 账号 / 仓库 / 待审批 / 对象池 / 回收站统计 |
-| 审批台 | 注册申请通过（返回一次性设置密码 token）与拒绝、建库申请通过（可指定配额）与拒绝 |
+| 审批台 | 注册申请通过（申请人注册时已设密码，审批只放行、不发放任何凭证）与拒绝、建库申请通过（可填一个配额上限，0=继承全局默认）与拒绝 |
 | 用户 | 全库账号列表、直接建号、停用 / 启用、调整全局角色 |
 | 仓库 | 全库仓库列表、直通新建、启停 / 归档、成员增删与角色、单仓库配额覆盖、状态管理 |
 | 配额 | 全局默认配额（新仓库继承值） |
@@ -218,22 +218,22 @@ vcs ldap-show     # 回显配置，不显示密码
 
 管理员不必为每个人手工建号，桌面端（用户侧）与 Web 管理端（管理员侧）已接好完整闭环：
 
-> 例外：**空库的第一个注册用户**不走这套流程——在桌面端「账号 → 申请注册」提交后自动批准为管理员，界面直接显示一次性 token 并替你填入「设置密码」框。下面是之后所有普通账号的流程。
+> 例外：**空库的第一个注册用户**不走这套流程——在桌面端「账号 → 申请注册」提交后自动批准为管理员，注册时填的密码直接可用。下面是之后所有普通账号的流程。
 
-1. 用户在桌面端「账号」视图点「申请注册」，填用户名 / 姓名 / 申请理由（**不收集密码**）。
-2. 管理员在 **Web 管理端「审批台 → 注册申请」**通过，页面返回一个一次性 token（`vcs_setup_…`），只显示这一次。
-3. 用户在桌面端「账号」视图点「用一次性链接设置密码」，用该 token 设置初始密码（服务端会校验强度，token 只能用一次）。
+1. 用户在桌面端「账号」视图点「申请注册」，填用户名 / 姓名 / **登录密码** / 申请理由（密码策略由服务端复核，未通过审批前不能登录）。
+2. 管理员在 **Web 管理端「审批台 → 注册申请」**通过（可选角色），审批只做放行，不再发放任何一次性链接。
+3. 用户回到桌面端顶栏，用**注册时设置的密码**直接连接即可。
 4. 登录后若需要自己的仓库，在「仓库」视图点「提交建库申请」；管理员在 **Web 管理端「审批台 → 建库申请」**批准，申请人自动成为该仓库 owner。管理员也可在「仓库」页「直通新建」。
 
 等价的 CLI 操作（管理员在服务器本机执行）：
 
 ```bash
 export VCS_STORE=/srv/vcs
+vcs register --username bob --name "李波"            # 交互式输入登录密码，注册即生效
 vcs register-list --state pending
-vcs register-approve <request_id> --role writer      # 输出 vcs_setup_… token
-vcs set-password --token vcs_setup_... --password 'Bobpass1!'
+vcs register-approve <request_id> --role writer
 vcs repo-request-list --state pending
-vcs repo-approve <request_id> --hard 1073741824 --note "同意"
+vcs repo-approve <request_id> --quota 1073741824 --note "同意"
 ```
 
 ### 4.3 日常操作
@@ -280,7 +280,7 @@ vcs info reports                                # 用量与生效配额
 
 | 分组 | 命令 |
 | --- | --- |
-| 账号 / 会话 | `init-admin`、`login`（`--password` / `--pat` / `--ldap`）、`logout`、`user-create`、`register*`、`set-password`、`ldap-config` / `ldap-show` / `ldap-test` |
+| 账号 / 会话 | `init-admin`、`login`（`--password` / `--pat` / `--ldap`）、`logout`、`user-create`、`register*`、`ldap-config` / `ldap-show` / `ldap-test` |
 | 仓库 | `repo-create`、`repo-request*`、`repo-approve` / `repo-reject`、`repo-list`、`repo-quota`、`repo-status` |
 | 成员 | `member-add` / `member-list` / `member-remove` / `member-set-role` |
 | 读写 | `import`、`checkout`（`-r` 指定历史版本）、`status`、`diff`、`commit`、`update`、`revert`、`log`、`cat` |
@@ -335,7 +335,7 @@ npm run smoke:ui                       # 可选：真启动 Electron，验证页
 | 启动报找不到 `vcs-napi.node` | 执行 `npm run build:native`（需要本机有 Cargo），确认 `desktop/native/` 下有产物 |
 | 桌面端窗口白屏 | 先 `npm run check:assets` 定位（页面 / preload / html 引用 / 源码一致性）；通常是没跑过 `npm run build` 或 `dist/` 被清过，重新执行 `npm run start` 即可。加载失败现在也会弹错误框说明原因 |
 | CLI 报未登录 / 权限不足 | `vcs login` 重新登录；注意 `--store` 与登录时用的是同一个目录（凭证按目录绝对路径缓存） |
-| `init-admin` 提示已存在管理员 | 它只在没有可登录管理员时可用；普通账号请走注册审批或 `vcs user-create`。若首位注册者丢了设置密码 token，用**同名** `init-admin` 在服务器本机重置口令即可救援 |
+| `init-admin` 提示已存在管理员 | 它只在没有可登录管理员时可用；普通账号请走注册审批或 `vcs user-create`。若首位账号没有可用口令（旧流程遗留），用**同名** `init-admin` 在服务器本机重置口令即可救援 |
 | macOS 提示「已损坏，无法打开」 | 未签名包被 Gatekeeper 拦截，执行 `xattr -dr com.apple.quarantine <app>` |
 | Linux AppImage 打包失败 | 安装 `libfuse2t64`（或 `libfuse2`） |
 | Windows 原生模块链接失败 | MSVC 需要 `node.lib`，参考 release 工作流里通过 `node-gyp install` + `RUSTFLAGS=-C link-arg=…` 的处理 |

@@ -166,16 +166,16 @@ function quotaSourceLabel(source) {
 }
 
 function renderQuota(quota) {
-  const ratio = quota.hardLimit > 0 ? quota.usedBytes / quota.hardLimit : 0;
+  const ratio = quota.limitBytes > 0 ? quota.usedBytes / quota.limitBytes : 0;
   const fill = el('quota-fill');
   fill.style.width = `${Math.min(100, Math.round(ratio * 100))}%`;
   fill.className = ratio >= 0.95 ? 'danger' : ratio >= 0.85 ? 'warn' : '';
   el('quota-text').textContent =
-    `已用 ${humanBytes(quota.usedBytes)} / 硬上限 ${humanBytes(quota.hardLimit)}` +
-    `（软上限 ${humanBytes(quota.softLimit)}，来源：${quotaSourceLabel(quota.source)}）`;
+    `已用 ${humanBytes(quota.usedBytes)} / 配额上限 ${humanBytes(quota.limitBytes)}` +
+    `（来源：${quotaSourceLabel(quota.source)}）`;
 }
 
-// ---------------- 注册与激活 ----------------
+// ---------------- 注册 ----------------
 
 function toggle(id) {
   el(id).classList.toggle('hidden');
@@ -185,47 +185,32 @@ async function doRegister() {
   const target = el('target').value.trim();
   const username = el('reg-username').value.trim();
   const displayName = el('reg-name').value.trim();
+  const password = el('reg-password').value;
   const reason = el('reg-reason').value.trim();
-  if (!target || !username || !displayName) {
-    banner('请填写服务端地址、用户名与姓名', 'error');
+  if (!target || !username || !displayName || !password) {
+    banner('请填写服务端地址、用户名、姓名与密码', 'error');
     return;
   }
   const result = unwrap(
-    await api.register(target, username, displayName, reason),
+    await api.register(target, username, displayName, password, reason),
     '提交注册申请',
   );
   el('register-form').classList.add('hidden');
-  if (result.autoApproved && result.passwordSetupToken) {
-    // 空库第一个用户：服务端已自动批准为管理员，token 直接交到本人手上。
-    el('setpw-token').value = result.passwordSetupToken;
-    el('setpw-form').classList.remove('hidden');
-    el('setpw-password').focus();
+  el('reg-password').value = '';
+  if (result.autoApproved) {
+    // 空库第一个用户：服务端已自动批准为管理员，注册时设置的密码立即可用。
+    el('username').value = username;
     banner(
       `你是全库第一个用户，已自动成为管理员（申请号 ${result.requestId}）。\n` +
-        `一次性设置密码 token：${result.passwordSetupToken}\n` +
-        '已替你填入下方输入框，请设置密码后登录；token 只返回这一次。',
+        '用户名已填到右上角，输入刚才设置的密码点「连接」即可登录。',
     );
+    el('password').focus();
     return;
   }
   banner(
     `注册申请已提交（${result.requestId}）。账号处于「待审批」，管理员在服务端 Web 管理端\n` +
-      '通过后会给你一次性链接，用它设置密码后才能登录。',
+      '通过后，直接用你刚才设置的密码登录即可。',
   );
-}
-
-async function doSetPassword() {
-  const target = el('target').value.trim();
-  const token = el('setpw-token').value.trim();
-  const password = el('setpw-password').value;
-  if (!target || !token || !password) {
-    banner('请填写服务端地址、一次性 token 与新密码', 'error');
-    return;
-  }
-  unwrap(await api.setPassword(target, token, password), '设置密码');
-  el('setpw-form').classList.add('hidden');
-  el('setpw-token').value = '';
-  el('setpw-password').value = '';
-  banner('密码已设置，可以登录了。同一条链接只能使用一次。');
 }
 
 // ---------------- 建库申请 ----------------
@@ -501,9 +486,7 @@ el('delete-file').addEventListener('click', () =>
   void guard('删除文件', () => resolveConflict('delete')),
 );
 el('toggle-register').addEventListener('click', () => toggle('register-form'));
-el('toggle-setpw').addEventListener('click', () => toggle('setpw-form'));
 el('do-register').addEventListener('click', () => void guard('提交注册申请', doRegister));
-el('do-setpw').addEventListener('click', () => void guard('设置密码', doSetPassword));
 el('do-request').addEventListener('click', () => void guard('提交建库申请', requestRepo));
 el('disconnect').addEventListener('click', () => void guard('断开连接', disconnect));
 el('pick-dir').addEventListener('click', () => void guard('选择目录', pickDir));

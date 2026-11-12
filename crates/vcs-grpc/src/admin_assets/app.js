@@ -205,8 +205,7 @@ async function loadApprovals() {
         <div class="meta">申请人 ${esc(r.requester_user_id)} · 申请配额 ${esc(humanBytes(r.requested_quota_bytes))} · ${esc(fmtTime(r.submitted_at))}<br />理由：${esc(r.reason || '—')}</div>
       </div>
       <div class="actions">
-        <input data-field="soft" type="number" min="0" value="0" placeholder="软上限" title="软上限（0=继承）" />
-        <input data-field="hard" type="number" min="0" value="0" placeholder="硬上限" title="硬上限（0=继承）" />
+        <input data-field="quota" type="number" min="0" placeholder="配额上限（字节）" title="配额上限（字节，0 或留空=继承全局默认）" />
         <input data-field="note" placeholder="审批意见" />
         <button class="mini primary" data-action="approve-req">通过</button>
         <button class="mini danger" data-action="reject-req">拒绝</button>
@@ -226,10 +225,8 @@ $('reg-list').addEventListener('click', (event) => {
   const id = row.dataset.id;
   void act(async () => {
     if (button.dataset.action === 'approve-reg') {
-      const data = await post(`/registrations/${encodeURIComponent(id)}/approve`, { role: field(row, 'role') });
-      $('token-text').textContent = data.setup_token;
-      $('token-box').classList.remove('hidden');
-      toast('已通过，请把一次性 token 转交申请人');
+      await post(`/registrations/${encodeURIComponent(id)}/approve`, { role: field(row, 'role') });
+      toast('已通过，申请人可直接用注册时设置的密码登录');
     } else {
       const reason = window.prompt('拒绝原因（必填）', '');
       if (!reason) return;
@@ -248,8 +245,7 @@ $('req-list').addEventListener('click', (event) => {
   void act(async () => {
     if (button.dataset.action === 'approve-req') {
       await post(`/repo-requests/${encodeURIComponent(id)}/approve`, {
-        soft_bytes: Number(field(row, 'soft')) || 0,
-        hard_bytes: Number(field(row, 'hard')) || 0,
+        quota_bytes: Number(field(row, 'quota')) || 0,
         note: field(row, 'note'),
       });
       toast('建库申请已通过，仓库已创建');
@@ -382,10 +378,9 @@ async function loadRepoDetail() {
         <button class="mini danger" data-action="member-remove">移除</button>
       </div>
     </div>`).join('') : empty('还没有成员');
-  $('repo-usage').textContent = `已用 ${humanBytes(quota.usage.used_bytes)} / 上限 ${humanBytes(quota.effective.hard_bytes)}（${esc(quota.effective.source)}）`;
+  $('repo-usage').textContent = `已用 ${humanBytes(quota.usage.used_bytes)} / 上限 ${humanBytes(quota.effective.bytes)}（${esc(quota.effective.source)}）`;
   const form = $('repo-quota-form');
-  form.soft_bytes.value = quota.soft_bytes;
-  form.hard_bytes.value = quota.hard_bytes;
+  form.quota_bytes.value = quota.quota_bytes;
 }
 
 $('repo-members').addEventListener('click', (event) => {
@@ -426,8 +421,7 @@ $('repo-quota-form').addEventListener('submit', (event) => {
   const id = $('repo-detail').dataset.repo;
   void act(async () => {
     await put(`/repos/${encodeURIComponent(id)}/quota`, {
-      soft_bytes: Number(form.soft_bytes.value) || 0,
-      hard_bytes: Number(form.hard_bytes.value) || 0,
+      quota_bytes: Number(form.quota_bytes.value) || 0,
       inherit: false,
     });
     toast('仓库配额已保存');
@@ -438,7 +432,7 @@ $('repo-quota-form').addEventListener('submit', (event) => {
 $('inherit-quota').addEventListener('click', () => {
   const id = $('repo-detail').dataset.repo;
   void act(async () => {
-    await put(`/repos/${encodeURIComponent(id)}/quota`, { soft_bytes: 0, hard_bytes: 0, inherit: true });
+    await put(`/repos/${encodeURIComponent(id)}/quota`, { quota_bytes: 0, inherit: true });
     toast('已恢复继承全局默认');
     await loadRepoDetail();
   });
@@ -459,8 +453,7 @@ $('create-repo-form').addEventListener('submit', (event) => {
   void act(async () => {
     await post('/repos', {
       name: form.name.value.trim(),
-      soft_bytes: Number(form.soft_bytes.value) || 0,
-      hard_bytes: Number(form.hard_bytes.value) || 0,
+      quota_bytes: Number(form.quota_bytes.value) || 0,
     });
     form.reset();
     toast('仓库已创建');
@@ -475,9 +468,8 @@ $('refresh-repos').addEventListener('click', () => void act(loadRepos));
 async function loadQuota() {
   const data = await get('/quota-defaults');
   const form = $('defaults-form');
-  form.soft_bytes.value = data.soft_bytes;
-  form.hard_bytes.value = data.hard_bytes;
-  $('defaults-note').textContent = `当前默认：软 ${humanBytes(data.soft_bytes)} / 硬 ${humanBytes(data.hard_bytes)}`;
+  form.quota_bytes.value = data.bytes;
+  $('defaults-note').textContent = `当前默认：${humanBytes(data.bytes)}（0 表示未配置，按内置兜底 100 GiB）`;
 }
 
 $('defaults-form').addEventListener('submit', (event) => {
@@ -485,8 +477,7 @@ $('defaults-form').addEventListener('submit', (event) => {
   const form = event.target;
   void act(async () => {
     await put('/quota-defaults', {
-      soft_bytes: Number(form.soft_bytes.value) || 0,
-      hard_bytes: Number(form.hard_bytes.value) || 0,
+      quota_bytes: Number(form.quota_bytes.value) || 0,
     });
     toast('全局默认配额已保存');
     await loadQuota();

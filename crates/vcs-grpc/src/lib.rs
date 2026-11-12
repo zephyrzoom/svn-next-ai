@@ -315,8 +315,7 @@ fn repo_to_pb(repo: &vcs_server::RepoInfo) -> pb::RepoInfo {
         status: repo_status_to_pb(repo.status),
         owner_user_id: repo.owner_user_id.clone(),
         head_rev: repo.head_rev,
-        quota_soft_bytes: 0,
-        quota_hard_bytes: 0,
+        quota_bytes: 0,
         created_at: 0,
     }
 }
@@ -616,28 +615,21 @@ impl AuthService for AuthApi {
         request: Request<pb::RegisterRequest>,
     ) -> Result<Response<pb::RegisterResponse>, Status> {
         let req = request.into_inner();
-        match self
-            .api
-            .store()
-            .register(&req.username, &req.display_name, &req.reason)
-        {
+        match self.api.store().register(
+            &req.username,
+            &req.display_name,
+            &req.password,
+            &req.reason,
+        ) {
             Ok(outcome) => {
-                // 首位用户：自动批准为管理员，token 只在这一次响应里出现。
+                // 首位用户：自动批准为管理员，注册时设置的密码立即可用。
                 let first = outcome.first_user;
                 Ok(Response::new(pb::RegisterResponse {
                     status: Some(status_ok()),
                     request_id: outcome.info.request_id,
                     state: reg_status_to_pb(outcome.info.state),
-                    password_setup_token: first
-                        .as_ref()
-                        .map(|f| f.setup_token.clone())
-                        .unwrap_or_default(),
-                    setup_token_expires_at: first
-                        .as_ref()
-                        .map(|f| f.setup_token_expires_at)
-                        .unwrap_or_default(),
-                    auto_approved: first.is_some(),
-                    granted_role: if first.is_some() {
+                    auto_approved: first,
+                    granted_role: if first {
                         pb::Role::Admin as i32
                     } else {
                         pb::Role::Unspecified as i32
@@ -724,8 +716,6 @@ impl AuthService for AuthApi {
             Ok(approved) => Ok(Response::new(pb::ApproveRegistrationResponse {
                 status: Some(status_ok()),
                 user_id: approved.user_id,
-                password_setup_token: approved.setup_token,
-                setup_token_expires_at: approved.setup_token_expires_at,
             })),
             Err(err) => Ok(Response::new(pb::ApproveRegistrationResponse {
                 status: Some(status_err(&err)),
@@ -749,25 +739,6 @@ impl AuthService for AuthApi {
                 status: Some(status_ok()),
             })),
             Err(err) => Ok(Response::new(pb::RejectRegistrationResponse {
-                status: Some(status_err(&err)),
-            })),
-        }
-    }
-
-    async fn set_password(
-        &self,
-        request: Request<pb::SetPasswordRequest>,
-    ) -> Result<Response<pb::SetPasswordResponse>, Status> {
-        let req = request.into_inner();
-        match self
-            .api
-            .store()
-            .set_password(&req.setup_token, &req.new_password)
-        {
-            Ok(()) => Ok(Response::new(pb::SetPasswordResponse {
-                status: Some(status_ok()),
-            })),
-            Err(err) => Ok(Response::new(pb::SetPasswordResponse {
                 status: Some(status_err(&err)),
             })),
         }
@@ -1524,14 +1495,12 @@ impl RepoService for RepoApi {
             Ok(usage) => Ok(Response::new(pb::GetQuotaResponse {
                 status: Some(status_ok()),
                 used_bytes: usage.used_bytes,
-                soft_limit: usage.quota.soft_bytes,
-                hard_limit: usage.quota.hard_bytes,
+                limit_bytes: usage.quota.bytes,
                 // 精确的可回收量要走 EstimatePurge（要遍历全库引用），这里不假装知道。
                 reclaimable_bytes: 0,
                 by_path: Vec::new(),
                 effective: Some(pb::QuotaEffective {
-                    soft_bytes: usage.quota.soft_bytes,
-                    hard_bytes: usage.quota.hard_bytes,
+                    bytes: usage.quota.bytes,
                     source: quota_source_to_pb(usage.quota.source),
                 }),
             })),
@@ -1937,8 +1906,7 @@ impl RepoAdminService for AdminApi {
         match self.api.store().approve_repo_request(
             &session,
             &req.request_id,
-            req.quota_soft_bytes,
-            req.quota_hard_bytes,
+            req.quota_bytes,
             &req.decision_note,
         ) {
             Ok(repo) => Ok(Response::new(pb::ApproveRepoCreationResponse {
@@ -1978,12 +1946,11 @@ impl RepoAdminService for AdminApi {
     ) -> Result<Response<pb::CreateRepoDirectResponse>, Status> {
         let session = self.api.session(&request)?;
         let req = request.into_inner();
-        match self.api.store().create_repo_direct(
-            &session,
-            &req.repo_name,
-            req.quota_soft_bytes,
-            req.quota_hard_bytes,
-        ) {
+        match self
+            .api
+            .store()
+            .create_repo_direct(&session, &req.repo_name, req.quota_bytes)
+        {
             Ok(repo) => Ok(Response::new(pb::CreateRepoDirectResponse {
                 status: Some(status_ok()),
                 repo: Some(repo_to_pb(&repo)),
@@ -2235,19 +2202,17 @@ impl RepoAdminService for AdminApi {
         let store = self.api.store();
         // 全局默认对所有已登录用户可见（仓库设置页要展示「继承自全局」），只有管理员能改。
         let _ = session;
-        let fallback = vcs_core::resolve_effective_quota(0, 0, 0, 0);
+        let fallback = vcs_core::resolve_effective_quota(0, 0);
         match store.quota_defaults() {
-            Ok((soft, hard)) => Ok(Response::new(pb::GetQuotaDefaultsResponse {
+            Ok(bytes) => Ok(Response::new(pb::GetQuotaDefaultsResponse {
                 status: Some(status_ok()),
                 defaults: Some(pb::QuotaDefaults {
-                    soft_bytes: soft,
-                    hard_bytes: hard,
+                    bytes,
                     updated_at: 0,
                     updated_by: String::new(),
                 }),
                 fallback: Some(pb::QuotaEffective {
-                    soft_bytes: fallback.soft_bytes,
-                    hard_bytes: fallback.hard_bytes,
+                    bytes: fallback.bytes,
                     source: quota_source_to_pb(fallback.source),
                 }),
             })),
@@ -2265,16 +2230,11 @@ impl RepoAdminService for AdminApi {
     ) -> Result<Response<pb::UpdateQuotaDefaultsResponse>, Status> {
         let session = self.api.session(&request)?;
         let req = request.into_inner();
-        match self
-            .api
-            .store()
-            .set_default_quota(&session, req.soft_bytes, req.hard_bytes)
-        {
+        match self.api.store().set_default_quota(&session, req.bytes) {
             Ok(effective) => Ok(Response::new(pb::UpdateQuotaDefaultsResponse {
                 status: Some(status_ok()),
                 defaults: Some(pb::QuotaDefaults {
-                    soft_bytes: effective.soft_bytes,
-                    hard_bytes: effective.hard_bytes,
+                    bytes: effective.bytes,
                     updated_at: now_secs(),
                     updated_by: session.username.clone(),
                 }),
@@ -2308,8 +2268,17 @@ impl RepoAdminService for AdminApi {
                 ..Default::default()
             }));
         }
-        let (soft, hard) = match store.repo_quota_override(&repo.repo_id) {
-            Ok(pair) => pair,
+        let repo_bytes = match store.repo_quota_override(&repo.repo_id) {
+            Ok(quota) => quota,
+            Err(err) => {
+                return Ok(Response::new(pb::GetRepoQuotaResponse {
+                    status: Some(status_err(&err)),
+                    ..Default::default()
+                }))
+            }
+        };
+        let default_bytes = match store.quota_defaults() {
+            Ok(bytes) => bytes,
             Err(err) => {
                 return Ok(Response::new(pb::GetRepoQuotaResponse {
                     status: Some(status_err(&err)),
@@ -2320,17 +2289,14 @@ impl RepoAdminService for AdminApi {
         match store.effective_quota(&repo.repo_id) {
             Ok(effective) => Ok(Response::new(pb::GetRepoQuotaResponse {
                 status: Some(status_ok()),
-                repo_soft_bytes: soft,
-                repo_hard_bytes: hard,
+                repo_bytes,
                 defaults: Some(pb::QuotaDefaults {
-                    soft_bytes: 0,
-                    hard_bytes: 0,
+                    bytes: default_bytes,
                     updated_at: 0,
                     updated_by: String::new(),
                 }),
                 effective: Some(pb::QuotaEffective {
-                    soft_bytes: effective.soft_bytes,
-                    hard_bytes: effective.hard_bytes,
+                    bytes: effective.bytes,
                     source: quota_source_to_pb(effective.source),
                 }),
             })),
@@ -2349,20 +2315,13 @@ impl RepoAdminService for AdminApi {
         let req = request.into_inner();
         let result = {
             let store = self.api.store();
-            store.set_repo_quota(
-                &session,
-                &req.repo_id,
-                req.soft_bytes,
-                req.hard_bytes,
-                req.inherit,
-            )
+            store.set_repo_quota(&session, &req.repo_id, req.bytes, req.inherit)
         };
         match result {
             Ok(effective) => Ok(Response::new(pb::SetRepoQuotaResponse {
                 status: Some(status_ok()),
                 effective: Some(pb::QuotaEffective {
-                    soft_bytes: effective.soft_bytes,
-                    hard_bytes: effective.hard_bytes,
+                    bytes: effective.bytes,
                     source: quota_source_to_pb(effective.source),
                 }),
             })),

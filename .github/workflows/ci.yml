@@ -102,7 +102,7 @@ jobs:
           "$BIN/vcs" import --store "$DEMO/store" reports "$PWD" -m "空提交" | grep -q "没有变更"
 
           # 配额：1 KiB 仓库导入 50 KB 必须被拒，且不得在对象池留下孤儿对象
-          "$BIN/vcs" repo-create --store "$DEMO/store" tiny --soft 900 --hard 1024
+          "$BIN/vcs" repo-create --store "$DEMO/store" tiny --quota 1024
           mkdir -p "$DEMO/big" && head -c 50000 /dev/urandom > "$DEMO/big/random.bin"
           before=$("$BIN/vcs" info --store "$DEMO/store" tiny | grep 对象池)
           if "$BIN/vcs" import --store "$DEMO/store" tiny "$DEMO/big" -m "超大"; then
@@ -173,22 +173,23 @@ jobs:
 
           # ---------------- M3：用户体系闭环 ----------------
           cd "$DEMO"
-          # 自助注册：不收密码，只提交用户名/姓名/理由
-          "$BIN/vcs" register --store "$DEMO/store" --username bob --name "李波" --reason "归档月度报表"
-          if "$BIN/vcs" login --store "$DEMO/store" --username bob --password 'Abcdef1!'; then
+          # 弱密码在注册这一步就被拒：服务端是安全边界
+          if "$BIN/vcs" register --store "$DEMO/store" --username bob --name "李波" \
+              --password weak --reason "归档月度报表"; then
+            echo "弱密码未被拒绝"; exit 1
+          fi
+          # 自助注册：注册时自己设置密码，未审批不能登录
+          "$BIN/vcs" register --store "$DEMO/store" --username bob --name "李波" \
+            --password 'Bobpass1!' --reason "归档月度报表"
+          if "$BIN/vcs" login --store "$DEMO/store" --username bob --password 'Bobpass1!'; then
             echo "未审批账号竟然能登录"; exit 1
           fi
           "$BIN/vcs" register-list --store "$DEMO/store" --state pending | grep -q bob
           approve=$("$BIN/vcs" register-approve --store "$DEMO/store" "$("$BIN/vcs" register-list --store "$DEMO/store" --state pending | awk '/bob/{print $1}')" --role writer)
           echo "$approve"
-          setup=$(echo "$approve" | grep -o 'vcs_setup_[A-Za-z0-9_-]*' | head -1)
-          # 弱密码必须被服务端拒绝
-          if "$BIN/vcs" set-password --store "$DEMO/store" --token "$setup" --password weak; then
-            echo "弱密码未被拒绝"; exit 1
-          fi
-          "$BIN/vcs" set-password --store "$DEMO/store" --token "$setup" --password 'Bobpass1!' 
-          if "$BIN/vcs" set-password --store "$DEMO/store" --token "$setup" --password 'Other1!x'; then
-            echo "一次性 token 被重复使用"; exit 1
+          # 审批只放行：申请人用注册时设的密码登录，服务端不再下发任何凭证
+          if echo "$approve" | grep -q 'vcs_setup_'; then
+            echo "审批仍在发放一次性 token"; exit 1
           fi
           "$BIN/vcs" login --store "$DEMO/store" --username bob --password 'Bobpass1!'
 
@@ -199,7 +200,7 @@ jobs:
           fi
           req=$("$BIN/vcs" repo-request-list --store "$DEMO/store" --state pending | awk '/bob-repo/{print $1}')
           "$BIN/vcs" login --store "$DEMO/store" --username alice --password 'Abcdef1!'
-          "$BIN/vcs" repo-approve --store "$DEMO/store" "$req" --hard 1073741824 --note "同意"
+          "$BIN/vcs" repo-approve --store "$DEMO/store" "$req" --quota 1073741824 --note "同意"
           # 管理员使用他人仓库仍需成员资格
           if "$BIN/vcs" info --store "$DEMO/store" bob-repo; then
             echo "非成员竟然能读取仓库"; exit 1
@@ -234,9 +235,9 @@ jobs:
           "$BIN/vcs" member-remove --store "$DEMO/store" bob-repo --username alice \
             | grep -q "已把 alice 移出"
 
-          # 管理员核定 1 MiB 硬上限，再恢复继承
+          # 管理员核定 1 MiB 上限，再恢复继承
           "$BIN/vcs" login --store "$DEMO/store" --username alice --password 'Abcdef1!'
-          "$BIN/vcs" repo-quota --store "$DEMO/store" bob-repo --hard 1048576 | grep -q "单仓库覆盖"
+          "$BIN/vcs" repo-quota --store "$DEMO/store" bob-repo --quota 1048576 | grep -q "单仓库覆盖"
           "$BIN/vcs" repo-quota --store "$DEMO/store" bob-repo --inherit | grep -q "系统兜底"
 
           # 禁用后读写全拒，恢复后立即可用

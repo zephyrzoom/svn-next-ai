@@ -132,15 +132,15 @@ async function main() {
 
     step('直通建库与仓库治理');
     res = await api(base, '/api/repos', {
-      method: 'POST', token, body: { name: 'reports', soft_bytes: 0, hard_bytes: 0 },
+      method: 'POST', token, body: { name: 'reports', quota_bytes: 0 },
     });
     check(res.status === 200 && res.data.ok, '直通新建失败');
     const repoId = res.data.data.repo.repo_id;
     const repo = `/api/repos/${encodeURIComponent(repoId)}`;
     res = await api(base, `${repo}/members`, { token });
     check(res.status === 200 && res.data.data.items.length === 1, '管理端应能查看任意仓库成员');
-    res = await api(base, `${repo}/quota`, { method: 'PUT', token, body: { soft_bytes: 0, hard_bytes: 2097152, inherit: false } });
-    check(res.status === 200 && res.data.data.effective.hard_bytes === 2097152, '单仓库配额覆盖失败');
+    res = await api(base, `${repo}/quota`, { method: 'PUT', token, body: { quota_bytes: 2097152, inherit: false } });
+    check(res.status === 200 && res.data.data.effective.bytes === 2097152, '单仓库配额覆盖失败');
     res = await api(base, `${repo}/candidates`, { token });
     check(res.status === 200 && res.data.ok, '空间治理接口不可达');
     res = await api(base, `${repo}/status`, { method: 'POST', token, body: { status: 'Disabled' } });
@@ -155,7 +155,7 @@ async function main() {
     const bob = res.data.data.user.user_id;
     res = await api(base, `/api/users/${encodeURIComponent(bob)}/status`, { method: 'POST', token, body: { active: false } });
     check(res.status === 200 && res.data.ok, '停用账号失败');
-    res = await api(base, '/api/quota-defaults', { method: 'PUT', token, body: { soft_bytes: 0, hard_bytes: 4194304 } });
+    res = await api(base, '/api/quota-defaults', { method: 'PUT', token, body: { quota_bytes: 4194304 } });
     check(res.status === 200 && res.data.ok, '全局默认配额保存失败');
     res = await api(base, '/api/session', { token: 'bogus-token' });
     check(res.status === 401, '无效 token 应被拒');

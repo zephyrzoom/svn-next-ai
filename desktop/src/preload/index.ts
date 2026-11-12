@@ -24,17 +24,15 @@ export interface LoginDto {
 export interface RegisterDto {
   username: string;
   displayName: string;
+  password: string;
   reason?: string;
 }
 
 export interface RegisterResultDto {
   requestId: string;
   state: number;
-  /** 全库第一个账号：已自动批准为管理员，无需等待审批。 */
+  /** 全库第一个账号：已自动批准为管理员，注册时的密码立即可用。 */
   autoApproved: boolean;
-  /** 一次性设置密码 token，明文只出现这一次。 */
-  passwordSetupToken: string;
-  setupTokenExpiresAt: number;
   grantedRole: number;
 }
 
@@ -114,8 +112,8 @@ export interface PrefsDto {
 
 export interface QuotaDto {
   usedBytes: number;
-  softLimit: number;
-  hardLimit: number;
+  /** 生效的配额上限（字节）。 */
+  limitBytes: number;
   /** 1=单仓库覆盖 2=全局默认 3=系统兜底 */
   source: number;
 }
@@ -168,9 +166,9 @@ export interface VcsApi {
     target: string,
     username: string,
     displayName: string,
+    password: string,
     reason: string,
   ): Promise<Envelope<RegisterResultDto>>;
-  setPassword(target: string, token: string, password: string): Promise<Envelope<null>>;
   requestRepo(
     name: string,
     reason: string,
@@ -206,10 +204,8 @@ const api: VcsApi = {
     ipcRenderer.invoke('vcs:resolveConflict', dir, path, choice, content),
   log: (repoId, limit) => ipcRenderer.invoke('vcs:log', repoId, limit),
 
-  register: (target, username, displayName, reason) =>
-    ipcRenderer.invoke('vcs:register', target, username, displayName, reason),
-  setPassword: (target, token, password) =>
-    ipcRenderer.invoke('vcs:setPassword', target, token, password),
+  register: (target, username, displayName, password, reason) =>
+    ipcRenderer.invoke('vcs:register', target, username, displayName, password, reason),
   requestRepo: (name, reason, quota) =>
     ipcRenderer.invoke('vcs:requestRepo', name, reason, quota),
 

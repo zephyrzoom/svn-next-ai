@@ -158,7 +158,7 @@ count                 u32 LE
 | 提交 | `BeginCommit`、`PushObjects`、`FinalizeCommit`、`AbortCommit` |
 | 锁 | `Lock`、`Unlock` |
 | 容量治理 | `GetQuota`、`ListPurgeCandidates`、`EstimatePurge`、`Purge`、`GetGcStatus` |
-| 用户体系 | 独立 `AuthService`：`Login`、`Register`、`List/Approve/RejectRegistration`、`SetPassword`、`RefreshToken`/`Logout`、`WhoAmI`、PAT 管理、LDAP 配置与连通性测试、用户启停与角色 |
+| 用户体系 | 独立 `AuthService`：`Login`、`Register`、`List/Approve/RejectRegistration`、`RefreshToken`/`Logout`、`WhoAmI`、PAT 管理、LDAP 配置与连通性测试、用户启停与角色 |
 | 仓库管理 | 独立 `RepoAdminService`：`RequestRepo`、`List/Approve/RejectRepoCreation`、`CreateRepoDirect`（管理员直通）、`ListRepos`/`GetRepo`、`SetRepoStatus`；成员管理 `ListMembers`/`AddMember`/`RemoveMember`/`SetMemberRole`/`SearchUsers`（owner 自助） |
 | 配额配置 | `Get/UpdateQuotaDefaults`（全局默认，仅 admin）、`Get/SetRepoQuota`（单仓库覆盖，仅 admin；owner 只读查看生效值） |
 
@@ -175,7 +175,7 @@ FinalizeCommit(session_id)
 
 统一错误码：`OUT_OF_DATE`、`PATH_CONFLICT`、`TREE_CONFLICT`、`PERMISSION_DENIED`、`QUOTA_EXCEEDED`、`CONTENT_PURGED`、`LOCKED`、`OBJECT_MISSING`、`INVALID_SESSION`。`QUOTA_EXCEEDED` 的响应中直接携带可清理目录清单，供客户端渲染一键入口。
 
-用户体系另有 `UNAUTHENTICATED`、`INVALID_CREDENTIALS`、`ACCOUNT_PENDING`、`ACCOUNT_DISABLED`、`REGISTRATION_EXISTS`、`SETUP_TOKEN_INVALID`、`LDAP_UNAVAILABLE`、`TOKEN_EXPIRED`、`PASSWORD_POLICY_VIOLATION` 等错误码；成员门另有 `REPO_NOT_MEMBER`、`REPO_MEMBER_FORBIDDEN`、`REPO_OWNER_PROTECTED`、`USER_NOT_FOUND` 等，配额配置另有 `QUOTA_CONFIG_INVALID`。`Register` 与 `SetPassword` 是仅有的两个免认证接口，其余 RPC 均校验 JWT / PAT 与成员资格。
+用户体系另有 `UNAUTHENTICATED`、`INVALID_CREDENTIALS`、`ACCOUNT_PENDING`、`ACCOUNT_DISABLED`、`REGISTRATION_EXISTS`、`SETUP_TOKEN_INVALID`、`LDAP_UNAVAILABLE`、`TOKEN_EXPIRED`、`PASSWORD_POLICY_VIOLATION` 等错误码；成员门另有 `REPO_NOT_MEMBER`、`REPO_MEMBER_FORBIDDEN`、`REPO_OWNER_PROTECTED`、`USER_NOT_FOUND` 等，配额配置另有 `QUOTA_CONFIG_INVALID`。`Register` 是唯一的免认证写接口（`Login` 也算免认证入口），其余 RPC 均校验 JWT / PAT 与成员资格；`SETUP_TOKEN_INVALID` 编号保留但已不再使用。
 
 ## 6. 核心流程
 
@@ -200,33 +200,33 @@ FinalizeCommit(session_id)
 | 来源 | 凭证 | 开通方式 |
 | --- | --- | --- |
 | LDAP / AD | 企业目录，服务端不存用户密码 | 首次登录成功自动创建本地映射（JIT），组映射为角色 |
-| 本地账号 | Argon2id 哈希 + 每用户随机 salt | **用户自助注册 → 管理员审批 → 设置密码 → 可登录** |
+| 本地账号 | Argon2id 哈希 + 每用户随机 salt | **用户自助注册（当场设密码）→ 管理员审批 → 直接可登录** |
 
 **用户字段固定为三项**：`username`（用户名，全局唯一）、`password`（仅本地账号，只存 Argon2id 哈希）、`display_name`（姓名）。不收集邮箱、手机号、头像等任何其它资料；LDAP 侧也只映射用户名与姓名。密码强度规则见 8.4。
 
 ### 8.1 状态机
 
 ```
-自助注册 → PENDING ──管理员 approve──→ ACTIVE ──禁用──→ DISABLED
-              │                          ↑
-              ├─ reject ──→ REJECTED      └─ 一次性 token 设置初始密码
+自助注册（自带密码）→ PENDING ──管理员 approve──→ ACTIVE ──禁用──→ DISABLED
+              │
+              ├─ reject ──→ REJECTED
               └─ 超期 ────→ EXPIRED
-空库首个注册 ──自动批准为 admin────────→ ACTIVE（token 随注册响应返回本人）
+空库首个注册 ──自动批准为 admin────────→ ACTIVE（注册时的密码立即可用）
 LDAP 首次登录成功 ─────────────────────→ ACTIVE（免审批；首个目录用户自动 admin）
 ```
 
 - `PENDING` / `REJECTED` / `EXPIRED` / `DISABLED` 一律不可登录，返回 `ERROR_CODE_ACCOUNT_PENDING` 等明确错误码，客户端给友好提示而不是反复报「密码错误」。
-- 审批通过时分配角色（默认只读，管理员可指定），并生成一次性 `password_setup_token`；**注册表单不收集密码**，避免未激活账号持有可用凭证。
+- 审批通过时分配角色（默认只读，管理员可指定）。**密码在注册时就由本人设置并写库**：审批只是放行，不再有「先开通、后激活」两段式，也就没有一次性链接需要转交。
 - **首位用户引导（本轮定稿）**：全库第一个账号自动成为 `admin`，无需审批、无需预置 bootstrap 管理员。注册与 LDAP 首次登录共用 `first_user_slot()`：在 `BEGIN IMMEDIATE` 写事务内判定「用户表为空且没有引导审计记录」，谁先提交谁拿走名额，跨 CLI / gRPC 进程互斥。引导记录落 `audit_log`（`user.first_admin.register` / `user.first_admin.ldap`），即便删掉首用户也不会让第二个人再抢注。
-- 首位注册者仍然**不收集密码**：申请单直接 `approved`，`password_setup_token` 随 `RegisterResponse` 一次性返回（CLI 打印、桌面端自动填入设置密码框）；`SetPassword` 复核密码策略后账号才能真正登录。
-- `init-admin` 降级为「可选的预置管理员 + 首位账号救援」：只在没有可登录管理员时可用；同名本地账号尚未激活时重置口令并提权，避免一次性 token 丢失导致全库锁死。
+- 首位注册者同样在提交时设好密码：申请单直接 `approved`，注册完即可登录，不需要任何激活步骤。
+- `init-admin` 降级为「可选的预置管理员 + 首位账号救援」：只在没有可登录管理员时可用；同名本地账号没有可用口令（旧流程遗留）时重置口令并提权，避免全库锁死。
 
 ### 8.2 自助注册与审批
 
-- `Register` 为**免认证**接口，只提交 `username`、`display_name`（姓名）与申请理由；校验用户名唯一性，与已有 LDAP 账号重名时返回明确冲突错误。不收集邮箱等其它资料。
-- **空库首个 `Register` 自动批准为 `admin`**，响应里多带 `auto_approved` / `password_setup_token` / `setup_token_expires_at` / `granted_role`；第二个起仍回到 PENDING 审批链路。判定与 LDAP JIT 共用同一个事务名额（见 8.1）。
+- `Register` 为**免认证**接口，提交 `username`、`display_name`（姓名）、`password` 与申请理由；用户名唯一性、姓名长度、密码策略（8.4）都在服务端复核一次，不合规的申请直接拒绝且不落任何数据。不收集邮箱等其它资料。
+- **空库首个 `Register` 自动批准为 `admin`**，响应里带 `auto_approved` / `granted_role`；第二个起仍回到 PENDING 审批链路。判定与 LDAP JIT 共用同一个事务名额（见 8.1）。
 - 管理员用 `ListRegistrations` / `ApproveRegistration` / `RejectRegistration` 处理，拒绝必须填写原因；全部写入 `audit_log`。
-- 审批通过后由管理员转交一次性设置密码链接，客户端调用 `SetPassword` 完成激活；「我的申请」页可查状态。
+- 审批通过后申请人直接用注册时的密码登录；未审批前密码不生效，登录返回 `ACCOUNT_PENDING` 而不是「密码错误」。旧流程遗留的无口令申请在审批时会被拒绝，提示对方重新申请。
 - 防刷：按 IP / 用户名限流，可选验证码；申请默认 7 天有效，超期自动 `EXPIRED`。
 
 ### 8.3 LDAP 登录（已接入）
@@ -248,7 +248,7 @@ LDAP 首次登录成功 ──────────────────�
 - 登录成功签发短时 JWT（15～30 分钟，RS256/EdDSA）放 gRPC metadata；refresh token 轮换 + 可吊销。
 - `users.token_version`：管理员禁用账号或改角色时递增，JWT 携带该版本号，校验时比对，实现**即时失效**，不必等 token 自然过期。
 - PAT 供 CLI/CI：创建时明文只返回一次，库里只存哈希；支持 scopes、过期时间与随时撤销。
-- 存储：Argon2id + 每用户随机 salt；登录失败计数与临时锁定；设置密码 token 一次性、有时效、只存哈希。
+- 存储：Argon2id + 每用户随机 salt；登录失败计数与临时锁定。注册时算好的哈希直接写 `users.password_hash`，服务端不保存任何明文口令。
 - 客户端 token 存系统钥匙串（Electron `safeStorage`），不落明文文件。
 
 **本地账号密码强度规则（硬约束）**：
@@ -262,7 +262,7 @@ LDAP 首次登录成功 ──────────────────�
 | 特殊字符 | 至少 1 个 ASCII 标点字符（对应 Rust `char::is_ascii_punctuation()`）；空格、字母、数字与非 ASCII 字符均不计入 |
 
 - 校验实现放在 `vcs-core` 的 `validate_password()`（返回全部未满足项）与 `password_is_valid()`，服务端、CLI 与 Electron 主进程（经 napi-rs）复用同一份逻辑，不出现「前端宽松、后端严格」或反之。
-- **服务端在 `SetPassword` 及任何后续改密接口必须强制再校验一次**；客户端校验只用于实时提示，不作为安全边界。不满足返回 `ERROR_CODE_PASSWORD_POLICY_VIOLATION`，`Status.message` 列出具体缺失项。
+- **服务端在 `Register` 及任何后续改密接口必须强制再校验一次**；客户端校验只用于实时提示，不作为安全边界。不满足返回 `ERROR_CODE_PASSWORD_POLICY_VIOLATION`，`Status.message` 列出具体缺失项。
 - 该规则只约束本地账号；LDAP 用户的密码由目录服务管理，不在此校验。
 
 ### 8.5 权限分层
@@ -287,7 +287,7 @@ LDAP 首次登录成功 ──────────────────�
 
 ### 8.7 客户端交互
 
-登录窗口提供「本地 / LDAP」切换、自助注册入口与申请状态查询；管理员另有审批台（用户注册与仓库申请）、用户管理、PAT 管理与 LDAP 配置页。待审批账号与待审批仓库在客户端直接显示审批进度。注册表单只有用户名、姓名、申请理由三项；设置密码页按 8.4 逐项实时提示缺失的字符类别，提交仍以服务端校验为准。仓库设置页由 owner 直接管理成员（按用户名搜索、增删、改角色）；仓库列表只显示自己作为成员的仓库。
+登录窗口提供「本地 / LDAP」切换、自助注册入口与申请状态查询；管理员另有审批台（用户注册与仓库申请）、用户管理、PAT 管理与 LDAP 配置页。待审批账号与待审批仓库在客户端直接显示审批进度。注册表单只有用户名、姓名、密码、申请理由四项，密码按 8.4 逐项实时提示缺失的字符类别，提交仍以服务端校验为准。仓库设置页由 owner 直接管理成员（按用户名搜索、增删、改角色）；仓库列表只显示自己作为成员的仓库。
 
 ### 8.8 仓库创建与审批
 
@@ -301,7 +301,7 @@ LDAP 首次登录成功 ──────────────────�
 ```
 
 - **申请单** `repo_creation_requests`：申请人、仓库名、期望 `repo_id`、用途说明、申请配额、状态、审批人与决定、有效期。仓库名与 `repo_id` 全局唯一，命名限定小写字母 / 数字 / 连字符。
-- **审批动作**：`ApproveRepoCreation` 时管理员可核定 `quota_soft_bytes` / `quota_hard_bytes`（可驳回申请值），也可**留空继承全局默认**；通过后在**单事务**内插入 `repos`（状态 `active`、记录 `owner_user_id` 与来源申请）、写入 `repo_members` 的 owner 行、更新申请状态与审计日志。
+- **审批动作**：`ApproveRepoCreation` 时管理员可核定 `quota_bytes`（可驳回申请值），也可**留空继承全局默认**；通过后在**单事务**内插入 `repos`（状态 `active`、记录 `owner_user_id` 与来源申请）、写入 `repo_members` 的 owner 行、更新申请状态与审计日志。
 - **初始化顺序**：先幂等创建 `repo/objects/` 目录（残留的孤儿目录由 GC 清理），再提交数据库事务；目录创建失败则事务不提交，申请保持 `PENDING` 可重试。绝不允许出现「有 `repos` 行但无目录」或「有目录但无 `repos` 行」的可使用状态。
 - **owner 权限**：申请人自动成为该仓库 owner（`repo_members` 中 `role=owner`），可自行增删成员、调整成员角色与管理配额内空间；**其他用户默认无权限，必须被 owner 加入成员才能使用仓库**（见 8.9）。
 - **管理员直通**：全局 `admin` 可用 `CreateRepoDirect` 直接创建已激活仓库，供首次部署、迁移与自动化测试使用，同样写审计日志；该入口按推荐默认保留（见第 15 章收口说明）。
@@ -380,25 +380,25 @@ CAS 去重下，「目录有多大」与「删掉它能释放多少」是两回�
 
 ### 9.6 配额层级、配置与提交前预检
 
-管理员可配置**全局默认配额**（对所有仓库生效）与**单仓库配额**（覆盖全局默认）。两级共用同一套软 / 硬阈值语义。
+管理员可配置**全局默认配额**（对所有仓库生效）与**单仓库配额**（覆盖全局默认）。配额只有**一条线**：超过即拒绝提交，不分软 / 硬。
 
 | 优先级 | 来源 | 说明 |
 | --- | --- | --- |
-| 1 | 单仓库显式值 `repos.quota_soft_bytes` / `quota_hard_bytes` | 非 0 时优先；审批时核定，或用 `SetRepoQuota` 事后调整 |
-| 2 | 全局默认值 `system_settings` 的 `default_quota_soft_bytes` / `default_quota_hard_bytes` | 仓库值为 0 时继承；管理员用 `Get/UpdateQuotaDefaults` 配置 |
-| 3 | 系统内置兜底 | 两者都未配置时启用，保证任何情况下都有硬上限，避免空间无限膨胀 |
+| 1 | 单仓库显式值 `repos.quota_bytes` | 非 0 时优先；审批时核定，或用 `SetRepoQuota` 事后调整 |
+| 2 | 全局默认值 `system_settings` 的 `default_quota_bytes` | 仓库值为 0 时继承；管理员用 `Get/UpdateQuotaDefaults` 配置 |
+| 3 | 系统内置兜底 `FALLBACK_QUOTA_BYTES`（100 GiB） | 两者都未配置时启用，保证任何情况下都有上限，避免空间无限膨胀 |
 
-- **继承语义**：`repos.quota_* = 0` 表示「继承全局默认」；`SetRepoQuota(inherit=true)` 可清零恢复继承。改全局默认后，所有继承默认值的仓库**立即**按新阈值预检；改单仓库值只影响该仓库。
-- **合法性校验**：`hard > 0` 且 `0 <= soft <= hard`，否则返回 `QUOTA_CONFIG_INVALID`。软阈值用于提前告警，硬阈值用于拒绝提交；软阈值未配置时按硬阈值的 85% 推导。
+- **继承语义**：`repos.quota_bytes = 0` 表示「继承全局默认」；`SetRepoQuota(inherit=true)` 可清零恢复继承。改全局默认后，所有继承默认值的仓库**立即**按新阈值预检；改单仓库值只影响该仓库。
+- **合法性**：只有「0（继承）」与「> 0（显式上限）」两种取值，不再存在软硬比例约束，审批人只需填一个数字。
 - **只读可见**：owner 与成员可查看本仓库的生效配额及其来源（`QuotaSource`），但只有全局 `admin` 能修改；审批时也可选择「不核定」，留空即继承全局默认。
 - **审计**：全局默认与单仓库配额的每次变更写入 `audit_log`，记录改前 / 改后值、执行者与仓库。
 
 **提交前预检**：把容量检查前移到 `BeginCommit`：
 
-- 请求携带 `estimated_new_bytes`，服务端用**生效后的** `hard_limit` 计算 `used + new > hard_limit` 时返回 `QUOTA_EXCEEDED`。
+- 请求携带 `estimated_new_bytes`，服务端用**生效后的** `limit_bytes` 计算 `used + new > limit_bytes` 时返回 `QUOTA_EXCEEDED`。
 - 错误响应附带 `ListPurgeCandidates` 结果（最老月份 + 各自 `reclaimable_bytes`）以及当前生效配额与来源，避免用户不知道该找谁调额度。
 - 客户端直接渲染「清理 202610 可释放 12.4 GB → [一键清理] → [重试提交]」。
-- 软阈值在客户端提前告警。
+- 用量条按上限百分比变色（85% 起黄、95% 起红），只提示不拦截。
 
 好处是避免「写到一半磁盘满、留下一堆孤儿对象」的脏状态。
 
@@ -473,7 +473,7 @@ svn-next-ai/
 │   │   ├── hash.rs              blake3 地址、hex、objects/ab/cdef… 分片路径
 │   │   ├── tree.rs              树对象规范编码、自底向上组装、扁平化、全树遍历
 │   │   ├── store.rs             FileObjectStore：tmp→原子 rename、zstd、幂等写入
-│   │   ├── auth.rs              Argon2id、HS256 JWT、一次性 token、CSPRNG
+│   │   ├── auth.rs              Argon2id、HS256 JWT、PAT/CSPRNG
 │   │   ├── wc.rs                工作副本：检出、离线 status / diff、pristine 缓存
 │   │   └── lib.rs               领域类型、ObjectStore 契约、错误码、配额解析
 │   ├── vcs-proto/               build.rs 用 tonic-build + protoc-bin-vendored 生成 gRPC
@@ -561,13 +561,12 @@ vcs --store /srv/vcs import reports ./src -m "初始导入"  # 本地直连的�
 | `vcs retention-apply` | `ApplyRetention` | **M4**：评估并清理；`--dry-run` 只报告 |
 | `vcs maintenance` | 无（系统任务，无 RPC） | **M4**：手工触发「转正到期清理 + 全库 GC」，与 `vcs serve` 定时任务同一入口 |
 | `vcs candidates` | `ListPurgeCandidates` | **M2**：按独占大小排序的可清理目录 |
-| `vcs register` | `Register` | **M3**：免登录自助注册（只收用户名/姓名/理由，不收密码）；**空库首个账号自动批准为 admin 并返回一次性 token** |
+| `vcs register` | `Register` | **M3**：免登录自助注册（用户名/姓名/密码/理由，密码留空则交互输入）；**空库首个账号自动批准为 admin，注册完即可登录** |
 | `vcs ldap-config` / `ldap-show` / `ldap-test` | 本机运维（无 RPC） | 加密保存目录配置 / 回显（不含密码）/ 测试服务账号 bind |
 | `get` / `update` / `test` LDAP 配置 RPC | `GetLdapConfig` / `UpdateLdapConfig` / `TestLdapConnection` | 仅管理员；桌面端「目录设置」走这三个接口 |
 | `vcs register-list` | `ListRegistrations` | **M3**：管理员查看申请（可按状态过滤） |
-| `vcs register-approve` | `ApproveRegistration` | **M3**：通过审批并输出一次性设密码 token |
+| `vcs register-approve` | `ApproveRegistration` | **M3**：通过审批并激活账号（密码由申请人注册时设置） |
 | `vcs register-reject` | `RejectRegistration` | **M3**：驳回，必须写原因 |
-| `vcs set-password` | `SetPassword` | **M3**：用一次性 token 设置初始密码（服务端二次校验强度） |
 | `vcs repo-request` / `repo-request-list` | `RequestRepo` / `ListRepoCreations` | **M3**：任何 ACTIVE 用户可申请建库；普通用户只看自己的申请 |
 | `vcs repo-approve` / `repo-reject` | `ApproveRepoCreation` / `RejectRepoCreation` | **M3**：管理员审批，单事务建库 + owner + r0 |
 | `vcs pat-create` / `pat-list` / `pat-revoke` | `CreatePat` / `ListPats` / `RevokePat` | **M3**：明文只返回一次，撤销即时生效 |
@@ -596,7 +595,7 @@ CLI 先行、GUI 后置，目的是先用最低成本验证版本语义是否正
 - Rust 单元测试；`proptest` 覆盖分块与三方合并。
 - 内存服务端集成测试，覆盖 `OUT_OF_DATE`、并发提交、中断续传。
 - `cargo-fuzz` 打协议解析与路径规范化。
-- 审批状态机单测：状态转换、仅 `ACTIVE` 可登录、设置密码 token 一次性且有时效。
+- 审批状态机单测：状态转换、仅 `ACTIVE` 可登录、审批前后密码是否可用。
 - 密码策略单测：长度边界（7 / 8 位）、四类字符各自缺失、特殊字符集合（ASCII 标点计入，空格与非 ASCII 不计入）、客户端与服务端共用同一份校验函数。
 - 仓库审批集成测试：`PENDING` 申请无 `repo_id` 且任何 `RepoService` 调用返回 `REPO_NOT_FOUND`；审批事务原子性（`repos` + owner 成员记录 + 申请状态 + 审计同时成功或同时回滚）；重复审批幂等；`DISABLED` / `ARCHIVED` 仓库拒绝读写。
 - 成员门集成测试：非成员调用 `RepoService` 一律 `REPO_NOT_MEMBER`；`reader` 提交被拒；owner 不可移除或降级；`maintainer` 不能增删 `maintainer`；成员被移除后未完成的 `BeginCommit` 在 `FinalizeCommit` 被拒；`ListRepos` 不列出非成员仓库。
@@ -624,7 +623,7 @@ CLI 先行、GUI 后置，目的是先用最低成本验证版本语义是否正
 | 自助注册被刷 / 审批积压 | 注册接口按 IP 与用户名限流、可选验证码；申请 7 天过期；管理员审批台与待办提醒；首位账号自动批准后即由本人承担审批 |
 | 仓库审批积压导致无法开通 | 申请 7 天过期 + 管理员待办提醒；全局 `admin` 可用 `CreateRepoDirect` 应急直通并写审计；审批台按提交时间排序 |
 | 审批与目录创建不一致 | 先幂等创建 `objects/` 再提交事务，失败保持 `PENDING` 可重试；孤儿目录由 GC 清理；启动时扫描并修复不一致状态 |
-| 弱密码 / 客户端校验被绕过 | 密码策略在 `vcs-core` 单一实现；服务端 `SetPassword` 强制再校验并返回 `PASSWORD_POLICY_VIOLATION`；客户端校验仅作实时提示 |
+| 弱密码 / 客户端校验被绕过 | 密码策略在 `vcs-core` 单一实现；服务端 `Register` 强制再校验并返回 `PASSWORD_POLICY_VIOLATION`；客户端校验仅作实时提示 |
 | 成员被移除后仍完成提交 | 成员资格在 `BeginCommit` 与 `FinalizeCommit` 两次校验；移除时将其未完成的 `upload_sessions` 标记为 `aborted` |
 | owner 误操作导致仓库无人可管 | owner 行不可移除、不可降级、不可被 maintainer 改动；MVP 不做所有权转让；变更全部写审计日志 |
 | 配额继承被误解 / 两级配置冲突 | 生效优先级由 `vcs-core::resolve_effective_quota()` 单一真源决定；`GetRepoQuota` 同时返回显式值、全局默认与生效来源；`hard > 0` 且 `soft <= hard` 强校验；每次变更写审计日志 |
@@ -650,12 +649,12 @@ CLI 先行、GUI 后置，目的是先用最低成本验证版本语义是否正
 | **客户端绑定方式** | **napi-rs 原生模块**，不采用 sidecar 进程 |
 | **分支与标签** | **不提供**。无 `branch` / `tag` / `ref`，也不用目录约定模拟；单一线性主干，版本定位只用 `rN` |
 | **认证方式** | **内建 `AuthService`**：LDAP（LDAPS / StartTLS）+ 本地账号，不以外部 OIDC 为主入口 |
-| **自助注册** | **除全库首位用户外需管理员审批**：`PENDING → ACTIVE`（或 `REJECTED` / `EXPIRED`），审批通过后用一次性 token 设置初始密码 |
+| **自助注册** | **除全库首位用户外需管理员审批**：`PENDING → ACTIVE`（或 `REJECTED` / `EXPIRED`），注册时自设的密码在审批通过后立即可用 |
 | **首位管理员** | **第一个注册或第一个 LDAP 登录成功的用户自动成为 `admin`**，免审批，两条入口共用同一事务名额且只发一次；`init-admin` 降级为可选预置 / 救援通道 |
 | **仓库创建** | **用户申请 + 管理员审批**：`PENDING → APPROVED` 后才分配 `repo_id`、创建 CAS 目录并置为 `ACTIVE`；未审批不可检出或提交 |
 | **用户字段** | **仅用户名、密码、姓名三项**；不收集邮箱、手机号等其它资料 |
-| **密码策略** | **≥ 8 位且同时含数字 / 大写 / 小写 / 特殊字符**；`vcs-core` 单一实现，服务端 `SetPassword` 强制校验，LDAP 账号豁免 |
-| **初始密码交付** | 用户字段不含邮箱，仅由管理员转交一次性设置密码 token / 链接；不做邮件通知 |
+| **密码策略** | **≥ 8 位且同时含数字 / 大写 / 小写 / 特殊字符**；`vcs-core` 单一实现，服务端 `Register` 强制校验，LDAP 账号豁免 |
+| **初始密码交付** | 用户在注册表单里自己设置密码，服务端不生成、不转交任何初始口令；不做邮件通知 |
 | **仓库成员** | **创建者（owner）自行管理成员，只有成员能使用仓库**；`repo_members` 是准入第一道门，ACL 是可选的路径级细粒度层 |
 | **全局管理员边界** | `RepoAdminService` 的审批/状态/审计不受成员门限制，但检出、提交等使用操作仍需被加为成员 |
 | **配额层级** | **管理员配置全局默认 + 单仓库覆盖**；优先级 单仓库显式值 > 全局默认 > 内置兜底；owner 与成员只读查看生效值及来源 |
@@ -710,7 +709,6 @@ CLI 先行、GUI 后置，目的是先用最低成本验证版本语义是否正
 | 新增错误码 `INVALID_ARGUMENT = 36` | 「驳回必须写原因」「scope 不在白名单」「过期时间早于现在」都是入参问题。复用 `INVALID_SESSION` 会让客户端误判成登录态失效并跳去重新登录，把用户带进死循环。 |
 | 注册与账号在同一事务里创建 | `users(status='pending')` + `registration_requests(pending)` 必须一起出现，否则会出现「有申请无账号」或「有账号无申请」，审批时无从下手。 |
 | 用户名冲突分三种提示 | 已被本地账号占用 / 属于 LDAP 账号 / 已有待审批申请。笼统的「已存在」会让用户反复重试或以为系统坏了。 |
-| 一次性设密码 token 用 3 天，比注册申请（7 天）短 | 审批通过意味着「现在就开通」，链接长期有效只是额外的攻击面。token 只存 blake3 摘要，明文只出现在审批返回里一次。 |
 | 审批通过时也递增 `token_version` | 与禁用账号同一机制：即便此前有人拿到过该账号的任何凭证，审批动作本身就把它们全部作废。 |
 | `PasswordPolicyError` 实现 `Display` | 服务端要把「缺哪几类字符」一次性告诉用户，否则用户会一次改一条、来回试四遍。这条文案也是 Electron 端实时提示的同一份来源。 |
 | 仓库申请审批复用一个 `insert_new_repo` | 直通建库与审批建库必须产出完全一致的仓库（repos 行 + owner 成员行 + r0 空版本），两处各写一遍必然漂移。 |
@@ -777,8 +775,7 @@ CLI 先行、GUI 后置，目的是先用最低成本验证版本语义是否正
 
 | 决策 | 结论与理由 |
 | --- | --- |
-| 免认证接口用「临时连接」而不是全局 client | 注册与设置密码发生在登录之前。给它们单独开一个 `VcsClient`（用完即关），避免把「未登录」状态混进已登录会话，也不会污染当前 token。 |
-| 审批通过后把一次性 token 直接展示在界面上 | 设计上 token 明文只出现一次，服务端不存明文、不可找回。界面上必须立刻可见可复制，否则这个账号就只能重新申请——这比"显示在日志里"安全得多。 |
+| 免认证接口用「临时连接」而不是全局 client | 注册发生在登录之前。给它们单独开一个 `VcsClient`（用完即关），避免把「未登录」状态混进已登录会话，也不会污染当前 token。 |
 | 拒绝必须填原因（界面与后端双约束） | 后端已经强制（`INVALID_ARGUMENT`）；界面上把原因输入框放在每次操作旁边，而不是弹一个全局对话框——审批是逐条进行的，全局输入框很容易填错行。 |
 | 角色只影响入口显隐，权限判定仍在服务端 | 管理员看到「直通新建」与审批台，普通用户看到「提交建库申请」。这只决定"看不看得见"，每个 RPC 都会独立校验角色与成员资格。 |
 | 审批建库默认不核定配额（继承全局） | 审批时强行让管理员填一个数字，结果多半是随手填。留空即继承全局默认，需要限额时再到仓库设置里调——这也是设计 9.6 的优先级顺序。 |
@@ -931,7 +928,7 @@ init-admin（bootstrap，仅空库一次） → login（Argon2id → HS256 JWT�
 | 重复 `import` 无改动 | `没有变更：r2 之后工作内容一致，未生成新版本` |
 | 非成员读取仓库 | `RepoNotMember: 不是该仓库成员，无权访问` |
 | reader 提交 | `RepoMemberForbidden: 当前成员角色为只读，不能提交` |
-| 1 KiB 硬上限仓库导入 50 KB 随机文件 | `QuotaExceeded`，且**对象池前后均为 13 字节**（只有建库时的空树），无孤儿对象 |
+| 1 KiB 上限仓库导入 50 KB 随机文件 | `QuotaExceeded`，且**对象池前后均为 13 字节**（只有建库时的空树），无孤儿对象 |
 | 单仓库 8 MiB 覆盖全局 1 KiB 默认 | 导入成功，`生效配额` 显示「来源：单仓库覆盖」 |
 | 检出历史版本 `-r 1` | 得到旧内容；`cat -r 1` 同样正确 |
 | 未登录调用 | `尚未登录，请先执行：vcs login --username <用户名>` |
@@ -1021,12 +1018,11 @@ candidates → 202610 / 202611 各自的逻辑大小与独占大小
 ```
 register（免登录，只收用户名/姓名/理由）
 → login → AccountPending（不能登录）
-→ register-approve（管理员，输出一次性 token）
-→ set-password（弱密码被拒，列出缺哪几类字符）→ 合规密码成功
+→ 注册时弱密码被拒（列出缺哪几类字符）→ 合规密码成功
+→ register-approve（管理员，审批后即可登录）
 → login → 成功（角色 writer）
-→ set-password 重复使用 → SetupTokenInvalid
 → repo-request（申请建库）→ import → RepoNotFound（申请未审批时不可用）
-→ repo-approve（管理员，核定 1 GiB 硬上限）→ 仓库创建 + 申请人自动成为 owner + r0
+→ repo-approve（管理员，核定 1 GiB 配额上限）→ 仓库创建 + 申请人自动成为 owner + r0
 → info → admin 尝试读取该仓库 → RepoNotMember（admin 也需被 owner 加为成员）
 → 申请人 import → r1
 → pat-create --scopes read → login --pat（读 OK）
@@ -1039,9 +1035,8 @@ register（免登录，只收用户名/姓名/理由）
 | 场景 | 观测 |
 | --- | --- |
 | 未审批登录 | `AccountPending: 账号待审批，尚不能登录` |
-| 审批通过但未设密码 | 仍是 `AccountPending`，提示「尚未设置密码」，不是「密码错误」 |
+| 已注册未审批就登录 | `AccountPending`，提示「账号待审批」，不是「密码错误」 |
 | 弱密码 | `PasswordPolicyViolation`，一次列出「长度不足；缺少数字；缺少大写字母；缺少特殊字符」 |
-| 一次性 token 复用 | `SetupTokenInvalid: 该设置密码链接已使用过` |
 | 普通用户审批 | `PermissionDenied: 仅管理员可审批仓库申请` |
 | 未审批仓库 | `RepoNotFound`，`repo_creation_requests` 里只有单据，没有 `repo_id` |
 | 审批后归属 | owner 成员行 + r0 空版本 + r0 作者为申请人 |
@@ -1074,7 +1069,7 @@ register（免登录，只收用户名/姓名/理由）
 
 | service | 已实现 |
 | --- | --- |
-| `AuthService` | Login、Register、GetRegistration、ListRegistrations、ApproveRegistration、RejectRegistration、SetPassword、WhoAmI、CreatePat、ListPats、RevokePat |
+| `AuthService` | Login、Register、GetRegistration、ListRegistrations、ApproveRegistration、RejectRegistration、WhoAmI、CreatePat、ListPats、RevokePat |
 | `RepoService` | GetHead、GetRevision、GetTree、GetLog、Checkout（服务端流）、Update、FetchObjects（双向流）、BeginCommit、PushObjects（客户端流）、FinalizeCommit、AbortCommit、GetQuota、ListPurgeCandidates、EstimatePurge、Purge、GetGcStatus |
 | `RepoAdminService` | RequestRepo、GetRepoCreation、ListRepoCreations、ApproveRepoCreation、RejectRepoCreation、CreateRepoDirect、ListRepos、GetRepo、ListMembers、AddMember、SearchUsers、GetQuotaDefaults、UpdateQuotaDefaults、GetRepoQuota |
 
@@ -1095,7 +1090,7 @@ register（免登录，只收用户名/姓名/理由）
 | 过期提交 | `base_rev=99` → `OUT_OF_DATE`（编号 2） |
 | 非成员读仓库 | `REPO_NOT_MEMBER`（编号 28），加成员后同一请求变 `OK` |
 | `ListRepos` | 只返回自己参与的仓库（bob 加成员后能看到 1 个） |
-| 注册→审批→设密码 | 全走网络接口；一次性 token 复用与弱密码都被拒 |
+| 注册→审批→登录 | 全走网络接口；注册时弱密码被拒、未审批不可登录、审批后同一密码可登录 |
 | 未实现方法 | `Lock` 返回 `UNIMPLEMENTED`，不会假装成功 |
 | 清理预估 | 空仓库 `EstimatePurge` 正常返回 0 字节，而非报错 |
 
@@ -1138,8 +1133,8 @@ register（免登录，只收用户名/姓名/理由）
 | maintainer 移除 reader | 成功；maintainer 移除自己 → `REPO_MEMBER_FORBIDDEN` |
 | writer 降为 reader | 会话作废，之后 `BeginCommit` 报 `REPO_MEMBER_FORBIDDEN` |
 | maintainer 把人提成 maintainer | `REPO_MEMBER_FORBIDDEN` |
-| 设置 1 MiB 硬上限 | `QuotaSource::RepoOverride`；`--inherit` 后回到 `FALLBACK` |
-| 非管理员改配额 | `PERMISSION_DENIED`；软 > 硬 → `QUOTA_CONFIG_INVALID` |
+| 设置 1 MiB 上限 | `QuotaSource::RepoOverride`；`--inherit` 后回到 `FALLBACK` |
+| 非管理员改配额 | `PERMISSION_DENIED` |
 | 禁用仓库 | 在途会话作废；`GetHead` / `BeginCommit` / `FilesAt` 全部 `REPO_DISABLED`；恢复 active 后立即可用 |
 | 网络层一致性 | 同样的四条链路在 gRPC 端到端测试里跑过一遍（加成员 → 改角色 → 移除 → 被移除者失去访问权；配额设置 → 回读；禁用 → 拒绝 → 启用） |
 
@@ -1207,15 +1202,15 @@ bootstrap 管理员（CLI 直连存储根）→ 启动 vcs serve（真实端口�
 
 | 区域 | 能力 |
 | --- | --- |
-| 顶栏下方 | 「申请注册」（用户名 / 姓名 / 理由）、「用一次性链接设置密码」、「断开连接」 |
+| 顶栏下方 | 「申请注册」（用户名 / 姓名 / 密码 / 理由）、「断开连接」 |
 | 仓库面板 | 管理员：直通新建；普通用户：提交建库申请（仓库名 + 用途说明） |
-| 审批台（仅管理员） | 待审批注册（可选角色、通过后展示一次性 token、拒绝需填原因）、待审批建库（通过 / 拒绝） |
+| 审批台（仅管理员） | 待审批注册（可选角色、只放行不发凭证、拒绝需填原因）、待审批建库（通过 / 拒绝） |
 
 ### 23.3 冒烟新增链路
 
 ```
 register(bob) → 待审批列表里能看到 → approve（role=writer）
-→ 一次性 setup token → setPassword → 同一 token 复用被拒
+→ register 直设密码 → 未审批登录被拒 → 审批后同一密码可登录
 → bob 登录成功（role=2）
 → bob 申请仓库 bob-repo → 审批前 listRepos 看不到
 → 管理员在待审批列表里看到 → approve → bob 的 listRepos 出现该仓库
@@ -1283,7 +1278,7 @@ bob 的仓库 bob-repo：alice（管理员）加人前 getHead → REPO_NOT_MEMB
 
 | 能力 | 说明 |
 | --- | --- |
-| 用量条 | 已用 / 硬上限百分比，85% 起变黄、95% 起变红；文末标注软上限与生效来源（单仓库覆盖 / 全局默认 / 系统兜底） |
+| 用量条 | 已用 / 配额上限百分比，85% 起变黄、95% 起变红；文末标注生效来源（单仓库覆盖 / 全局默认 / 系统兜底） |
 | 候选目录 | 顶层目录列表，勾选框 + 「可释放（独占，含历史）· 当前（HEAD 字节）」 |
 | 预估所选 | dry-run：可释放字节、影响历史版本数、被共享而不会回收的来源 |
 | 清理所选 | 确认框写明「生成删除提交 + 是否立即释放 + 不可撤销」；执行后展示新版本号与 GC 实际释放量 |
@@ -1501,7 +1496,7 @@ svn-next.app/Contents/Resources/app/
 ```
 （桌面）全局默认从 0 改为 2 MiB
 → 未核定的 reports 仓库生效来源变成「全局默认」(2)
-→ 给 reports 设 1 MiB 覆盖 → 来源变「单仓库覆盖」(1)，生效硬上限 1 MiB
+→ 给 reports 设 1 MiB 覆盖 → 来源变「单仓库覆盖」(1)，生效上限 1 MiB
 → 恢复继承 → 来源回到 (2)
 
 （CLI）vcs maintenance → 输出「维护完成：转正 N 条，清扫 M 个对象，释放 X 字节，覆盖 K 个仓库」
@@ -1611,7 +1606,7 @@ checkout → Rust 工具链 + 缓存 → Node 22 + npm 缓存
 
 - 两条入口共用 `ServerStore::first_user_slot()`：在 `BEGIN IMMEDIATE` 写事务里判定「用户表为空且没有引导审计记录」，谁先落库谁拿走唯一的管理员名额；跨 CLI / gRPC 进程互斥，删掉首用户也不会重发名额。
 - `init-admin` 从「部署前置条件」降级为可选预置 / 救援：只在没有**可登录**管理员时可用；首位注册者没设密码时可用同名 `init-admin` 重置口令，避免 token 丢失导致全库锁死。
-- 首位注册仍不收集密码：申请单直接 `approved`，一次性 token 随 `RegisterResponse` 返回本人；`SetPassword` 复核策略后才能登录。
+- 首位注册也在表单里设置密码：申请单直接 `approved`，注册完即可登录，`RegisterResponse` 不再携带任何凭证。
 - 首位 LDAP 用户由 `login_ldap()` 直接建 `ACTIVE` + `admin` 映射并签发 JWT；之后 JIT 用户按 `ldap_group_roles` 取初始角色（未命中 `readonly`），**已有账号角色以本地为准**，防目录侧组调整把引导管理员降级。
 
 ### 33.2 改动范围
@@ -1623,13 +1618,13 @@ checkout → Rust 工具链 + 缓存 → Node 22 + npm 缓存
 | `vcs-server::ServerStore` | `register` 返回 `RegisterOutcome`（首位自动批准）；`login_ldap` JIT；LDAP 配置读写 / 组映射 / 权限；`bootstrap_admin` 救援；`first_user_slot` |
 | `vcs-grpc` | `Login` 的 LDAP 分支（`spawn_blocking` 做同步 bind）、`Get/Update/TestLdapConfig` 三个 RPC、`RegisterResponse` 新字段 |
 | `vcs-cli` | `register` 打印首位 token；`login --ldap`；`ldap-config` / `ldap-show` / `ldap-test` |
-| `desktop` | 顶栏身份来源下拉、首位注册自动填入设置密码框、管理员「目录设置」面板（配置 + 测试连接） |
+| `desktop` | 顶栏身份来源下拉、注册表单直接收密码（首位注册后自动回填用户名）、管理员「目录设置」面板（配置 + 测试连接） |
 
 ### 33.3 协议变更（只新增字段，编号不复用）
 
 | 消息 | 新增 |
 | --- | --- |
-| `RegisterResponse` | `password_setup_token=4`、`setup_token_expires_at=5`、`auto_approved=6`、`granted_role=7` |
+| `RegisterResponse` | `auto_approved=6`、`granted_role=7`（原 4/5 的一次性 token 字段已 reserved） |
 | `LdapConfig` | `group_roles=12`（新 `GroupRole{group_dn, role}`）；`tls_mode` 注释明确禁止明文 |
 | `GetLdapConfigResponse` | `bind_password_set=3` |
 
@@ -1666,7 +1661,7 @@ checkout → Rust 工具链 + 缓存 → Node 22 + npm 缓存
 
 | 移到 Web 管理端 | 留在桌面端 |
 | --- | --- |
-| 审批台（注册 / 建库）、LDAP 目录设置、管理员直通新建、全局与单仓库配额核定、成员增删与角色、空间治理（清理 / 回收站 / 保留策略 / GC）、全库用户与仓库视图 | 连接 / 断开、自助注册与设置密码、提交建库申请、仓库列表与选择、检出 / 状态 / diff / 冲突三栏 / 提交 / 更新 / 还原 / 历史、**只读**容量条 |
+| 审批台（注册 / 建库）、LDAP 目录设置、管理员直通新建、全局与单仓库配额核定、成员增删与角色、空间治理（清理 / 回收站 / 保留策略 / GC）、全库用户与仓库视图 | 连接 / 断开、自助注册（自带密码）、提交建库申请、仓库列表与选择、检出 / 状态 / diff / 冲突三栏 / 提交 / 更新 / 还原 / 历史、**只读**容量条 |
 
 桌面端原来的「成员」「空间」两个大面板占了渲染层近 500 行，且 `applyRole` 只隐藏管理员专属入口、对所有角色都展示了治理面板——这正是「混乱」的根源。剥离后 `applyRole` 不再需要，`guard()` 里误嵌入的重复 `bootstrap()`（每次点击按钮都会重跑会话恢复）也一并修掉。
 

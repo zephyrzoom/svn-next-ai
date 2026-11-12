@@ -16,7 +16,7 @@
 //!   - 单一共享 CAS，跨仓库/跨路径全局去重；
 //!   - revision 元数据永久保留，内容字节才可能被裁剪；
 //!   - 成员资格是使用仓库的第一道门，`reader` 不能提交；
-//!   - 两级配额解析复用 `vcs-core::resolve_effective_quota`，不重复实现；
+//!   - 配额只有一条上限，解析复用 `vcs-core::resolve_effective_quota`，不重复实现；
 //!   - 每次提交用同一事务分配 rev，`head_rev` 乐观并发。
 
 use std::collections::BTreeMap;
@@ -353,24 +353,22 @@ pub struct RegistrationInfo {
 
 /// 审批通过的结果。
 ///
-/// `setup_token` 是**一次性设置密码凭证**，明文只在这里出现一次——
-/// 注册表单不收集密码，未激活的账号不该持有任何可用凭证。
+/// 审批只做「激活」：密码在提交申请时就已经由本人设好并落库，
+/// 不再发放任何一次性凭证。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovedRegistration {
     pub user_id: String,
-    pub setup_token: String,
-    pub setup_token_expires_at: i64,
 }
 
 /// 自助注册的结果。
 ///
-/// `first_user` 非空表示**这是全库第一个账号**：服务端在同一事务里把它
-/// 自动批准为管理员，并把一次性设置密码 token 直接交回申请人，不必等
-/// （也没有）管理员审批。后续注册仍是普通的 PENDING 申请。
+/// `first_user` 为 true 表示**这是全库第一个账号**：服务端在同一事务里把它
+/// 自动批准为管理员，注册时设置的密码立即可用，不必等管理员审批。
+/// 后续注册仍是普通的 PENDING 申请。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterOutcome {
     pub info: RegistrationInfo,
-    pub first_user: Option<ApprovedRegistration>,
+    pub first_user: bool,
 }
 
 /// 一条仓库创建申请。与 `RepoCreationInfo` 对应。
@@ -450,6 +448,7 @@ impl ServerStore {
             .map_err(|e| io("启用外键失败", &db_path, e))?;
         conn.execute_batch(SERVER_SCHEMA)
             .map_err(|e| Error::new(ErrorCode::IoError, format!("初始化 server.db 失败：{e}")))?;
+        migrate_single_quota(&conn)?;
 
         let secret = load_or_create_secret(&root)?;
         let signer = TokenSigner::new(secret.clone());
@@ -483,9 +482,8 @@ impl ServerStore {
 
     /// 是否存在**真正能登录**的管理员。
     ///
-    /// 首位注册者虽然已被自动批准为 ACTIVE admin，但在设置密码前无法登录，
-    /// 因此不算数：万一一次性 token 丢失或过期，运维仍可用 `init-admin`
-    /// 在本机救援，不至于全库锁死。
+    /// 只有 ACTIVE 且持有可用凭证的管理员才算数：旧流程留下的未设密码账号
+    /// 登录不进去，运维仍可用 `init-admin` 在本机救援，不至于全库锁死。
     fn has_usable_admin(&self) -> Result<bool> {
         let count: i64 = self
             .conn
@@ -500,10 +498,10 @@ impl ServerStore {
         Ok(count > 0)
     }
 
-    /// 引导管理员（空库）或救援首位注册者（已存在但从未激活）。
+    /// 引导管理员（空库）或救援「有账号但没有可用口令」的首位用户。
     ///
     /// 只允许在「没有可用管理员」时执行：既保留原来「只能初始化一次」的语义，
-    /// 又给首位用户丢 token 的场景留一条本机恢复路径。CLI 走的是本地直连
+    /// 又给旧流程遗留的未激活账号留一条本机恢复路径。CLI 走的是本地直连
     /// 存储，本来就是部署时的最高权限通道。
     pub fn bootstrap_admin(
         &self,
@@ -639,7 +637,8 @@ impl ServerStore {
             });
         }
 
-        // 本地账号审批通过后还没设置密码：这不是「密码错」，而是流程没走完。
+        // 本地账号没有口令：新流程在注册时就设好密码，走到这里只可能是
+        // 旧数据或人为改库，明确告诉用户该重新申请，而不是笼统报「密码错」。
         let phc = password_hash.ok_or_else(|| {
             if source == "ldap" {
                 Error::new(
@@ -649,7 +648,7 @@ impl ServerStore {
             } else {
                 Error::new(
                     ErrorCode::AccountPending,
-                    "账号已通过审批但尚未设置密码，请使用审批时发放的链接完成激活",
+                    "该账号尚未设置密码，请重新提交注册申请或联系管理员",
                 )
             }
         })?;
@@ -738,12 +737,12 @@ impl ServerStore {
     // ---------------- 仓库 ----------------
 
     /// 管理员直通建库（对应 `CreateRepoDirect`）：写审计，供紧急开通用。
+    /// `quota_bytes = 0` 表示继承全局默认配额。
     pub fn create_repo_direct(
         &self,
         session: &Session,
         name: &str,
-        quota_soft_bytes: u64,
-        quota_hard_bytes: u64,
+        quota_bytes: u64,
     ) -> Result<RepoInfo> {
         if session.role != Role::Admin {
             return Err(Error::new(
@@ -753,12 +752,6 @@ impl ServerStore {
         }
         session.require(SCOPE_ADMIN, "直通创建仓库")?;
         validate_repo_name(name)?;
-        if quota_hard_bytes > 0 && !core_types::validate_quota(quota_soft_bytes, quota_hard_bytes) {
-            return Err(Error::new(
-                ErrorCode::QuotaConfigInvalid,
-                "配额不合法：硬上限必须大于 0，且软上限不得超过硬上限",
-            ));
-        }
 
         let tx = self
             .conn
@@ -768,8 +761,7 @@ impl ServerStore {
             &tx,
             name,
             &session.user_id,
-            quota_soft_bytes,
-            quota_hard_bytes,
+            quota_bytes,
             None,
             &session.username,
             "repo.create_direct",
@@ -1140,13 +1132,12 @@ impl ServerStore {
         })
     }
 
-    /// 设置单仓库配额覆盖。`inherit = true` 表示清零并回到继承全局默认。
+    /// 设置单仓库配额上限。`inherit = true` 表示清零并回到继承全局默认。
     pub fn set_repo_quota(
         &self,
         actor: &Session,
         name_or_id: &str,
-        soft_bytes: u64,
-        hard_bytes: u64,
+        quota_bytes: u64,
         inherit: bool,
     ) -> Result<EffectiveQuota> {
         if actor.role != Role::Admin {
@@ -1157,23 +1148,13 @@ impl ServerStore {
         }
         actor.require(SCOPE_ADMIN, "调整单仓库配额")?;
         let repo = self.find_repo(name_or_id)?;
-        let (soft, hard) = if inherit {
-            (0, 0)
-        } else {
-            if !core_types::validate_quota(soft_bytes, hard_bytes) {
-                return Err(Error::new(
-                    ErrorCode::QuotaConfigInvalid,
-                    "配额不合法：硬上限必须大于 0，且软上限不得超过硬上限",
-                ));
-            }
-            (soft_bytes, hard_bytes)
-        };
+        let quota = if inherit { 0 } else { quota_bytes };
         let before = self.repo_quota_override(&repo.repo_id)?;
         self.conn
             .execute(
-                "UPDATE repos SET quota_soft_bytes = ?2, quota_hard_bytes = ?3, updated_at = ?4
+                "UPDATE repos SET quota_bytes = ?2, updated_at = ?3
                  WHERE repo_id = ?1",
-                params![repo.repo_id, soft as i64, hard as i64, now_secs()],
+                params![repo.repo_id, quota as i64, now_secs()],
             )
             .map_err(db("更新仓库配额失败"))?;
         self.audit(
@@ -1182,8 +1163,8 @@ impl ServerStore {
             "repo.quota.update",
             &repo.name,
             Some(&format!(
-                "{{\"from\":[{},{}],\"to\":[{},{}],\"inherit\":{}}}",
-                before.0, before.1, soft, hard, inherit
+                "{{\"from\":{},\"to\":{},\"inherit\":{}}}",
+                before, quota, inherit
             )),
         )?;
         self.effective_quota(&repo.repo_id)
@@ -1498,12 +1479,12 @@ impl ServerStore {
 
         let usage = self.usage(&repo.repo_id)?;
         let projected = usage.used_bytes.saturating_add(estimated_new_bytes);
-        if projected > usage.quota.hard_bytes {
+        if projected > usage.quota.bytes {
             return Err(Error::new(
                 ErrorCode::QuotaExceeded,
                 format!(
-                    "提交将超出仓库配额：预计 {} 字节，硬上限 {} 字节。请先清理目录释放空间",
-                    projected, usage.quota.hard_bytes
+                    "提交将超出仓库配额：预计 {} 字节，上限 {} 字节。请先清理目录释放空间",
+                    projected, usage.quota.bytes
                 ),
             ));
         }
@@ -2272,88 +2253,69 @@ impl ServerStore {
     // ---------------- 配额与用量 ----------------
 
     pub fn effective_quota(&self, repo_id: &str) -> Result<EffectiveQuota> {
-        let (soft, hard): (i64, i64) = self
+        let repo_bytes: i64 = self
             .conn
             .query_row(
-                "SELECT quota_soft_bytes, quota_hard_bytes FROM repos WHERE repo_id = ?1",
+                "SELECT quota_bytes FROM repos WHERE repo_id = ?1",
                 params![repo_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .map_err(db("查询仓库配额失败"))?;
-        let default_soft = self.setting_u64("default_quota_soft_bytes")?;
-        let default_hard = self.setting_u64("default_quota_hard_bytes")?;
+        let default_bytes = self.setting_u64("default_quota_bytes")?;
         Ok(core_types::resolve_effective_quota(
-            soft as u64,
-            hard as u64,
-            default_soft,
-            default_hard,
+            repo_bytes.max(0) as u64,
+            default_bytes,
         ))
     }
 
-    pub fn set_default_quota(
-        &self,
-        session: &Session,
-        soft_bytes: u64,
-        hard_bytes: u64,
-    ) -> Result<EffectiveQuota> {
+    pub fn set_default_quota(&self, session: &Session, quota_bytes: u64) -> Result<EffectiveQuota> {
         if session.role != Role::Admin {
             return Err(Error::new(
                 ErrorCode::PermissionDenied,
                 "仅管理员可修改全局配额",
             ));
         }
-        if hard_bytes > 0 && !core_types::validate_quota(soft_bytes, hard_bytes) {
-            return Err(Error::new(
-                ErrorCode::QuotaConfigInvalid,
-                "配额不合法：硬上限必须大于 0，且软上限不得超过硬上限",
-            ));
-        }
         let now = now_secs();
-        for (key, value) in [
-            ("default_quota_soft_bytes", soft_bytes),
-            ("default_quota_hard_bytes", hard_bytes),
-        ] {
-            self.conn
-                .execute(
-                    "INSERT INTO system_settings (key, value, updated_at, updated_by)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value,
-                       updated_at = excluded.updated_at, updated_by = excluded.updated_by",
-                    params![key, value.to_string(), now, session.user_id],
-                )
-                .map_err(db("写入全局配额失败"))?;
-        }
+        self.conn
+            .execute(
+                "INSERT INTO system_settings (key, value, updated_at, updated_by)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                   updated_at = excluded.updated_at, updated_by = excluded.updated_by",
+                params![
+                    "default_quota_bytes",
+                    quota_bytes.to_string(),
+                    now,
+                    session.user_id
+                ],
+            )
+            .map_err(db("写入全局配额失败"))?;
         self.audit(
             "",
             &session.user_id,
             "quota.default.update",
             "",
-            Some(&format!("{{\"soft\":{soft_bytes},\"hard\":{hard_bytes}}}")),
+            Some(&format!("{{\"quota\":{quota_bytes}}}")),
         )?;
-        Ok(core_types::resolve_effective_quota(
-            0, 0, soft_bytes, hard_bytes,
-        ))
+        Ok(core_types::resolve_effective_quota(0, quota_bytes))
     }
 
     /// 全局默认配额（0 表示未配置，由内置兜底接管）。
-    pub fn quota_defaults(&self) -> Result<(u64, u64)> {
-        Ok((
-            self.setting_u64("default_quota_soft_bytes")?,
-            self.setting_u64("default_quota_hard_bytes")?,
-        ))
+    pub fn quota_defaults(&self) -> Result<u64> {
+        self.setting_u64("default_quota_bytes")
     }
 
-    /// 单仓库的显式配额覆盖（0 表示继承全局默认）。
-    pub fn repo_quota_override(&self, repo_id: &str) -> Result<(u64, u64)> {
-        let (soft, hard): (i64, i64) = self
+    /// 单仓库的显式配额上限（0 表示继承全局默认）。
+    pub fn repo_quota_override(&self, repo_id: &str) -> Result<u64> {
+        let quota: i64 = self
             .conn
             .query_row(
-                "SELECT quota_soft_bytes, quota_hard_bytes FROM repos WHERE repo_id = ?1",
+                "SELECT quota_bytes FROM repos WHERE repo_id = ?1",
                 params![repo_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .map_err(db("查询仓库配额失败"))?;
-        Ok((soft.max(0) as u64, hard.max(0) as u64))
+        Ok(quota.max(0) as u64)
     }
 
     /// 提交会话所属的仓库。`FinalizeCommit` 的响应要带 root_tree，而 `ImportOutcome`
@@ -2770,11 +2732,14 @@ impl ServerStore {
         ))
     }
 
-    /// 自助注册（免认证）。只收用户名、姓名与理由，**不收密码**。
+    /// 自助注册（免认证）。用户名、姓名、密码与理由一次交齐。
+    ///
+    /// **密码在这里就设置并落库**：审批通过后本人直接用它登录，服务端不再
+    /// 发放一次性设置密码链接，也不需要在「激活」环节再收集一次密码。
     ///
     /// 两条分支共用同一个 `IMMEDIATE` 事务：
-    ///   - **全库第一个账号**：自动批准为管理员，一次性设置密码 token 直接交回本人；
-    ///   - 其余：仍是 PENDING 申请，等管理员审批。
+    ///   - **全库第一个账号**：自动批准为管理员，注册后即可登录；
+    ///   - 其余：仍是 PENDING 申请，等管理员审批；未激活前密码不可用于登录。
     ///
     /// 首位判定放在写事务内（见 [`first_user_slot`]），CLI 与 gRPC 即使跨进程
     /// 同时引导，也只有一个请求能拿到管理员名额。
@@ -2782,6 +2747,7 @@ impl ServerStore {
         &self,
         username: &str,
         display_name: &str,
+        password: &str,
         reason: &str,
     ) -> Result<RegisterOutcome> {
         validate_username(username)?;
@@ -2790,6 +2756,14 @@ impl ServerStore {
             return Err(Error::new(
                 ErrorCode::InvalidArgument,
                 "姓名不能为空，且不超过 30 个字符",
+            ));
+        }
+        // 密码策略与管理员建号共用同一份校验：服务端是安全边界，客户端提示只是体验。
+        let issues = core_types::validate_password(password);
+        if !issues.is_empty() {
+            return Err(Error::new(
+                ErrorCode::PasswordPolicyViolation,
+                format!("密码不满足策略：{}", describe_password_issues(&issues)),
             ));
         }
         if reason.chars().count() > 200 {
@@ -2841,26 +2815,15 @@ impl ServerStore {
         let user_id = new_id("usr");
         let request_id = new_id("reg");
         let expires_at = now + REGISTRATION_TTL_SECONDS;
+        // Argon2id 很贵：放在事务外算，别把写锁握在 KDF 上。
+        let phc = auth::hash_password(password)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .map_err(db("开启注册事务失败"))?;
 
         // 首位用户在这一刻「占住」名额：账号直接 ACTIVE + admin，申请单直接 approved。
-        // 密码仍然不收，靠一次性 token 完成激活，未激活账号不持有任何可用凭证。
+        // 密码在注册时就已设好，因此首个账号注册完即可登录。
         let first = first_user_slot(&tx)?;
-        let mut first_user = None;
-        let mut setup_token_hash: Option<String> = None;
-        let mut setup_expires: Option<i64> = None;
         let (status, role, request_state, decided_by, decision_note) = if first {
-            let setup_token = format!("{SETUP_PREFIX}{}", auth::random_token(24));
-            let token_hash = to_hex(&auth::token_digest(&setup_token));
-            let token_expires = now + SETUP_TOKEN_TTL_SECONDS;
-            first_user = Some(ApprovedRegistration {
-                user_id: user_id.clone(),
-                setup_token,
-                setup_token_expires_at: token_expires,
-            });
-            setup_token_hash = Some(token_hash);
-            setup_expires = Some(token_expires);
             (
                 "active",
                 "admin",
@@ -2875,13 +2838,14 @@ impl ServerStore {
         tx.execute(
             "INSERT INTO users (user_id, username, display_name, source, status, role,
                                 password_hash, token_version, created_at, approved_at)
-             VALUES (?1, ?2, ?3, 'local', ?4, ?5, NULL, 1, ?6, ?7)",
+             VALUES (?1, ?2, ?3, 'local', ?4, ?5, ?6, 1, ?7, ?8)",
             params![
                 user_id,
                 username,
                 display_name,
                 status,
                 role,
+                phc,
                 now,
                 if first { Some(now) } else { None }
             ],
@@ -2890,8 +2854,8 @@ impl ServerStore {
         tx.execute(
             "INSERT INTO registration_requests
                (request_id, username, display_name, reason, status, submitted_at, expires_at,
-                decided_at, decided_by, decision_note, setup_token_hash, setup_token_expires)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                decided_at, decided_by, decision_note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 request_id,
                 username,
@@ -2906,9 +2870,7 @@ impl ServerStore {
                 expires_at,
                 if first { Some(now) } else { None },
                 decided_by,
-                decision_note,
-                setup_token_hash,
-                setup_expires
+                decision_note
             ],
         )
         .map_err(db("写入注册申请失败"))?;
@@ -2950,7 +2912,7 @@ impl ServerStore {
                 decision_note: decision_note.map(str::to_string),
                 expires_at,
             },
-            first_user,
+            first_user: first,
         })
     }
 
@@ -3019,7 +2981,7 @@ impl ServerStore {
         Ok(out)
     }
 
-    /// 审批通过：账号转 ACTIVE，并发放一次性设置密码 token（明文只返回这一次）。
+    /// 审批通过：账号转 ACTIVE。密码在注册时已由本人设好，审批只是放行。
     pub fn approve_registration(
         &self,
         actor: &Session,
@@ -3035,21 +2997,27 @@ impl ServerStore {
                 format!("该申请已处理（{}），不能重复审批", reg_status_str(state)),
             ));
         }
-        let user_id: String = self
+        let (user_id, password_hash): (String, Option<String>) = self
             .conn
             .query_row(
-                "SELECT user_id FROM users WHERE username = ?1 AND status = 'pending'",
+                "SELECT user_id, password_hash FROM users
+                 WHERE username = ?1 AND status = 'pending'",
                 params![username],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .map_err(db("查询待审批账号失败"))?
             .ok_or_else(|| Error::new(ErrorCode::ApprovalNotFound, "对应的待审批账号不存在"))?;
+        // 旧流程（注册不收密码）留下的申请没有口令，审批后也登不进去；
+        // 与其放行一个死账号，不如让管理员明确要求对方重新申请。
+        if password_hash.is_none() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "该申请是旧流程提交的，没有设置密码；请驳回后让对方重新申请",
+            ));
+        }
 
-        let setup_token = format!("{SETUP_PREFIX}{}", auth::random_token(24));
-        let token_hash = to_hex(&auth::token_digest(&setup_token));
         let now = now_secs();
-        let expires_at = now + SETUP_TOKEN_TTL_SECONDS;
 
         let tx = self
             .conn
@@ -3065,10 +3033,9 @@ impl ServerStore {
         .map_err(db("激活账号失败"))?;
         tx.execute(
             "UPDATE registration_requests
-             SET status = 'approved', decided_at = ?2, decided_by = ?3,
-                 setup_token_hash = ?4, setup_token_expires = ?5
+             SET status = 'approved', decided_at = ?2, decided_by = ?3
              WHERE request_id = ?1",
-            params![request_id, now, actor.user_id, token_hash, expires_at],
+            params![request_id, now, actor.user_id],
         )
         .map_err(db("更新注册申请失败"))?;
         write_audit(
@@ -3082,11 +3049,7 @@ impl ServerStore {
         )?;
         tx.commit().map_err(db("提交审批事务失败"))?;
 
-        Ok(ApprovedRegistration {
-            user_id,
-            setup_token,
-            setup_token_expires_at: expires_at,
-        })
+        Ok(ApprovedRegistration { user_id })
     }
 
     /// 拒绝申请必须写原因：用户需要知道为什么被拒，否则只会反复重试。
@@ -3136,92 +3099,6 @@ impl ServerStore {
             now,
         )?;
         tx.commit().map_err(db("提交驳回事务失败"))?;
-        Ok(())
-    }
-
-    /// 用一次性 token 设置初始密码（免认证）。
-    ///
-    /// 密码策略在这里**再校验一次**：客户端提示只是体验，服务端才是安全边界。
-    pub fn set_password(&self, setup_token: &str, new_password: &str) -> Result<()> {
-        let issues = core_types::validate_password(new_password);
-        if !issues.is_empty() {
-            let detail: Vec<String> = issues.iter().map(|e| e.to_string()).collect();
-            return Err(Error::new(
-                ErrorCode::PasswordPolicyViolation,
-                format!("密码不满足要求：{}", detail.join("；")),
-            ));
-        }
-
-        let now = now_secs();
-        let hash = to_hex(&auth::token_digest(setup_token));
-        let row: Option<SetupTokenRow> = self
-            .conn
-            .query_row(
-                "SELECT request_id, username, setup_token_expires, setup_used_at, status
-                 FROM registration_requests WHERE setup_token_hash = ?1",
-                params![hash],
-                |r| {
-                    Ok(SetupTokenRow {
-                        request_id: r.get(0)?,
-                        username: r.get(1)?,
-                        expires: r.get(2)?,
-                        used_at: r.get(3)?,
-                        status: r.get(4)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(db("查询设置密码令牌失败"))?;
-        let SetupTokenRow {
-            request_id,
-            username,
-            expires,
-            used_at,
-            status,
-        } = row.ok_or_else(|| Error::new(ErrorCode::SetupTokenInvalid, "设置密码链接无效"))?;
-        if used_at.is_some() {
-            return Err(Error::new(
-                ErrorCode::SetupTokenInvalid,
-                "该设置密码链接已使用过",
-            ));
-        }
-        if expires.unwrap_or(0) <= now {
-            return Err(Error::new(ErrorCode::TokenExpired, "设置密码链接已过期"));
-        }
-        if parse_reg_status(&status)? != core_types::RegistrationStatus::Approved {
-            return Err(Error::new(
-                ErrorCode::SetupTokenInvalid,
-                "该申请状态不允许设置密码",
-            ));
-        }
-
-        let phc = auth::hash_password(new_password)?;
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(db("开启事务失败"))?;
-        tx.execute(
-            "UPDATE users SET password_hash = ?2, status = 'active',
-                              token_version = token_version + 1
-             WHERE username = ?1",
-            params![username, phc],
-        )
-        .map_err(db("写入密码失败"))?;
-        tx.execute(
-            "UPDATE registration_requests SET setup_used_at = ?2 WHERE request_id = ?1",
-            params![request_id, now],
-        )
-        .map_err(db("标记令牌已用失败"))?;
-        // 设置密码的 actor 是用户本人；此时账号刚 ACTIVE，可用 username 定位。
-        let user_id: String = tx
-            .query_row(
-                "SELECT user_id FROM users WHERE username = ?1",
-                params![username],
-                |r| r.get(0),
-            )
-            .map_err(db("查询用户失败"))?;
-        write_audit(&tx, "", &user_id, "user.set_password", &username, None, now)?;
-        tx.commit().map_err(db("提交设置密码事务失败"))?;
         Ok(())
     }
 
@@ -3429,22 +3306,16 @@ impl ServerStore {
     }
 
     /// 审批通过：单事务内建仓库 + 登记申请人 owner + 写入初始空版本 r0。
+    /// `quota_bytes = 0` 表示不核定，继承全局默认配额。
     pub fn approve_repo_request(
         &self,
         actor: &Session,
         request_id: &str,
-        quota_soft_bytes: u64,
-        quota_hard_bytes: u64,
+        quota_bytes: u64,
         decision_note: &str,
     ) -> Result<RepoInfo> {
         self.require_admin(actor, "审批仓库申请")?;
         self.expire_stale_requests()?;
-        if quota_hard_bytes > 0 && !core_types::validate_quota(quota_soft_bytes, quota_hard_bytes) {
-            return Err(Error::new(
-                ErrorCode::QuotaConfigInvalid,
-                "配额不合法：硬上限必须大于 0，且软上限不得超过硬上限",
-            ));
-        }
 
         // 连申请人用户名一起取出来：初始空版本 r0 的作者应该是仓库的主人，而不是审批人。
         let (requester, requester_name, repo_name, state): (String, String, String, String) = self
@@ -3477,8 +3348,7 @@ impl ServerStore {
             &tx,
             &repo_name,
             &requester,
-            quota_soft_bytes,
-            quota_hard_bytes,
+            quota_bytes,
             Some(request_id),
             &requester_name,
             "repo.approve",
@@ -3804,8 +3674,7 @@ impl ServerStore {
         tx: &rusqlite::Transaction<'_>,
         name: &str,
         owner_user_id: &str,
-        quota_soft_bytes: u64,
-        quota_hard_bytes: u64,
+        quota_bytes: u64,
         from_request: Option<&str>,
         author: &str,
         audit_action: &str,
@@ -3814,15 +3683,14 @@ impl ServerStore {
         let now = now_secs();
         tx.execute(
             "INSERT INTO repos (repo_id, name, head_rev, status, owner_user_id, created_from_request,
-                                quota_soft_bytes, quota_hard_bytes, created_at, updated_at)
-             VALUES (?1, ?2, 0, 'active', ?3, ?4, ?5, ?6, ?7, ?7)",
+                                quota_bytes, created_at, updated_at)
+             VALUES (?1, ?2, 0, 'active', ?3, ?4, ?5, ?6, ?6)",
             params![
                 repo_id,
                 name,
                 owner_user_id,
                 from_request,
-                quota_soft_bytes,
-                quota_hard_bytes,
+                quota_bytes,
                 now
             ],
         )
@@ -5194,15 +5062,6 @@ impl ServerStore {
 
 // ---------------- 内部辅助 ----------------
 
-/// 设置密码令牌查询的中间结构。
-struct SetupTokenRow {
-    request_id: String,
-    username: String,
-    expires: Option<i64>,
-    used_at: Option<i64>,
-    status: String,
-}
-
 /// `ldap_config` 表的一行（bind 密码仍是密文）。
 struct LdapConfigRow {
     host: String,
@@ -5459,6 +5318,63 @@ fn estimate_new_bytes(
         }
     }
     total
+}
+
+/// 老库升级：把「软 / 硬两条线」合并成单条 `quota_bytes`。
+///
+/// `CREATE TABLE IF NOT EXISTS` 不会改已存在的表，所以必须在这里显式补列并回填：
+/// 旧库真正参与判定的是 `quota_hard_bytes`，它就是那条唯一的线；
+/// 全局默认同理，从 `default_quota_hard_bytes` 复制过来。
+/// 旧列不删（SQLite 的 DROP COLUMN 版本依赖太强），代码不再读写它们。
+fn migrate_single_quota(conn: &Connection) -> Result<()> {
+    // 已经是新库（列存在）就不用再迁移，也避免把管理员后来显式设的 0 覆盖回去。
+    if table_has_column(conn, "repos", "quota_bytes")? {
+        return Ok(());
+    }
+    conn.execute_batch("ALTER TABLE repos ADD COLUMN quota_bytes BIGINT NOT NULL DEFAULT 0;")
+        .map_err(|e| Error::new(ErrorCode::IoError, format!("升级 repos 配额列失败：{e}")))?;
+    // 只有老库才有 quota_hard_bytes，它才是旧版本真正参与判定的那条线。
+    conn.execute(
+        "UPDATE repos SET quota_bytes = quota_hard_bytes WHERE quota_hard_bytes > 0",
+        [],
+    )
+    .map_err(|e| Error::new(ErrorCode::IoError, format!("回填单仓库配额失败：{e}")))?;
+
+    // 全局默认同理。schema 建表时已经写了 '0'，所以这里要用 upsert 覆盖，
+    // 不能 INSERT OR IGNORE —— 否则旧值永远搬不过来。
+    conn.execute(
+        "INSERT INTO system_settings (key, value, updated_at, updated_by)
+         SELECT 'default_quota_bytes', value, updated_at, updated_by
+         FROM system_settings
+         WHERE key = 'default_quota_hard_bytes' AND value <> '0'
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+           updated_at = excluded.updated_at, updated_by = excluded.updated_by",
+        [],
+    )
+    .map_err(|e| Error::new(ErrorCode::IoError, format!("迁移全局默认配额失败：{e}")))?;
+    Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| Error::new(ErrorCode::IoError, format!("读取 {table} 结构失败：{e}")))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| Error::new(ErrorCode::IoError, format!("读取 {table} 结构失败：{e}")))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| Error::new(ErrorCode::IoError, format!("读取 {table} 结构失败：{e}")))?
+    {
+        // PRAGMA table_info 的第 1 列是列名。
+        let name: String = row
+            .get(1)
+            .map_err(|e| Error::new(ErrorCode::IoError, format!("读取 {table} 列名失败：{e}")))?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn load_or_create_secret(root: &Path) -> Result<Vec<u8>> {
@@ -5766,8 +5682,6 @@ fn role_rank(role: Role) -> u8 {
 
 /// PAT 前缀：`authenticate` 靠它区分 JWT 与访问令牌，不必试错解析。
 const PAT_PREFIX: &str = "vcs_pat_";
-/// 一次性设置密码令牌前缀。
-const SETUP_PREFIX: &str = "vcs_setup_";
 
 const SCOPE_READ: &str = "read";
 const SCOPE_WRITE: &str = "write";
@@ -5776,8 +5690,6 @@ const ALLOWED_SCOPES: [&str; 3] = [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN];
 
 /// 注册申请有效期：7 天。超期未审批自动 EXPIRED，用户需要重新申请。
 const REGISTRATION_TTL_SECONDS: i64 = 7 * 86_400;
-/// 设置密码令牌有效期：3 天。比注册申请短——审批通过后应该尽快激活。
-const SETUP_TOKEN_TTL_SECONDS: i64 = 3 * 86_400;
 /// 仓库创建申请有效期：7 天。
 const REPO_REQUEST_TTL_SECONDS: i64 = 7 * 86_400;
 

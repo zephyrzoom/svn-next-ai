@@ -3,7 +3,7 @@
 //! 覆盖 M1 已经落地、且**最容易悄悄失效**的几条约束：
 //!   - 认证：bootstrap 只能一次、仅 ACTIVE 可登录、被篡改的 token 不可用；
 //!   - 成员门：非成员一律 `REPO_NOT_MEMBER`，reader 不能提交，member 管理按角色矩阵；
-//!   - 配额：超出硬上限时在分配版本号之前就拒绝；
+//!   - 配额：超出配额上限时在分配版本号之前就拒绝；
 //!   - 内容寻址：相同内容只落盘一次，`import` 的差异识别正确。
 
 use std::fs;
@@ -136,7 +136,7 @@ fn only_admins_can_create_users_or_change_global_quota() {
         ErrorCode::PermissionDenied
     );
     assert_eq!(
-        store.set_default_quota(&bob, 1, 2).unwrap_err().code,
+        store.set_default_quota(&bob, 1).unwrap_err().code,
         ErrorCode::PermissionDenied
     );
 }
@@ -151,7 +151,7 @@ fn non_members_cannot_touch_the_repo() {
     store
         .create_user(&alice, "bob", "李明", PASSWORD, Role::Writer)
         .unwrap();
-    let repo = store.create_repo_direct(&alice, "reports", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
 
     let (token, _) = store.login("bob", PASSWORD).unwrap();
     let bob = store.authenticate(&token).unwrap();
@@ -188,7 +188,7 @@ fn reader_cannot_commit_but_writer_can() {
     store
         .create_user(&alice, "carol", "王芳", PASSWORD, Role::Writer)
         .unwrap();
-    let repo = store.create_repo_direct(&alice, "reports", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
     store
         .add_member(&alice, &repo.repo_id, "bob", RepoMemberRole::Reader)
         .unwrap();
@@ -228,7 +228,7 @@ fn member_assignment_follows_the_role_matrix() {
             .create_user(&alice, name, display, PASSWORD, Role::Writer)
             .unwrap();
     }
-    let repo = store.create_repo_direct(&alice, "reports", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
     store
         .add_member(&alice, &repo.repo_id, "bob", RepoMemberRole::Maintainer)
         .unwrap();
@@ -276,7 +276,7 @@ fn import_is_deduplicated_and_diffed_correctly() {
     let sb = Sandbox::new("import");
     let store = sb.store();
     let alice = admin(&store);
-    let repo = store.create_repo_direct(&alice, "reports", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
     let src = sb.dir("src");
 
     // 两个路径同样内容：只应落盘一个 blob。
@@ -315,7 +315,7 @@ fn log_and_read_file_reflect_each_revision() {
     let sb = Sandbox::new("log");
     let store = sb.store();
     let alice = admin(&store);
-    let repo = store.create_repo_direct(&alice, "reports", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
     let src = sb.dir("src");
     write_file(&src, "202610/summary.txt", b"v1\n");
     store
@@ -356,12 +356,12 @@ fn quota_is_enforced_before_allocating_a_revision() {
     let sb = Sandbox::new("quota");
     let store = sb.store();
     let alice = admin(&store);
-    let repo = store.create_repo_direct(&alice, "reports", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
 
     // 全局默认配额压到 1 KiB，仓库继承它。
-    store.set_default_quota(&alice, 900, 1024).unwrap();
+    store.set_default_quota(&alice, 1024).unwrap();
     let effective = store.effective_quota(&repo.repo_id).unwrap();
-    assert_eq!(effective.hard_bytes, 1024);
+    assert_eq!(effective.bytes, 1024);
 
     let src = sb.dir("src");
     write_file(&src, "202610/big.bin", &vec![b'x'; 8 * 1024]);
@@ -381,9 +381,7 @@ fn rejected_import_writes_nothing_to_the_object_pool() {
     let sb = Sandbox::new("quota-nowrite");
     let store = sb.store();
     let alice = admin(&store);
-    let repo = store
-        .create_repo_direct(&alice, "reports", 900, 1024)
-        .unwrap();
+    let repo = store.create_repo_direct(&alice, "reports", 1024).unwrap();
     // 建库本身会写入一个空树对象，这是基线，不算提交产生的占用。
     let before = store.objects().list_hashes().unwrap().len();
     let bytes_before = store.objects().total_stored_bytes().unwrap();
@@ -417,33 +415,19 @@ fn repo_level_quota_overrides_global_default() {
     let sb = Sandbox::new("quota-override");
     let store = sb.store();
     let alice = admin(&store);
-    store.set_default_quota(&alice, 0, 1024).unwrap();
+    store.set_default_quota(&alice, 1024).unwrap();
     let repo = store
-        .create_repo_direct(&alice, "reports", 0, 8 * 1024 * 1024)
+        .create_repo_direct(&alice, "reports", 8 * 1024 * 1024)
         .unwrap();
 
     let effective = store.effective_quota(&repo.repo_id).unwrap();
-    assert_eq!(effective.hard_bytes, 8 * 1024 * 1024);
+    assert_eq!(effective.bytes, 8 * 1024 * 1024);
     assert_eq!(effective.source, vcs_core::QuotaSource::RepoOverride);
 
     let src = sb.dir("src");
     write_file(&src, "big.bin", &vec![b'x'; 8 * 1024]);
     // 继承全局默认会失败，这里应该成功。
     assert!(store.import_dir(&alice, &repo.repo_id, &src, "ok").is_ok());
-}
-
-#[test]
-fn rejected_quota_config_is_reported() {
-    let sb = Sandbox::new("quota-invalid");
-    let store = sb.store();
-    let alice = admin(&store);
-    assert_eq!(
-        store
-            .set_default_quota(&alice, 2048, 1024)
-            .unwrap_err()
-            .code,
-        ErrorCode::QuotaConfigInvalid
-    );
 }
 
 // ---------------- 仓库命名与状态 ----------------
@@ -453,21 +437,18 @@ fn repo_names_are_validated_and_unique() {
     let sb = Sandbox::new("names");
     let store = sb.store();
     let alice = admin(&store);
-    store.create_repo_direct(&alice, "reports", 0, 0).unwrap();
+    store.create_repo_direct(&alice, "reports", 0).unwrap();
 
     assert_eq!(
         store
-            .create_repo_direct(&alice, "reports", 0, 0)
+            .create_repo_direct(&alice, "reports", 0)
             .unwrap_err()
             .code,
         ErrorCode::RepoNameInvalid
     );
     for bad in ["", "A", "1", "with space", "中文仓库", "-leading"] {
         assert_eq!(
-            store
-                .create_repo_direct(&alice, bad, 0, 0)
-                .unwrap_err()
-                .code,
+            store.create_repo_direct(&alice, bad, 0).unwrap_err().code,
             ErrorCode::RepoNameInvalid,
             "应当拒绝非法仓库名 {bad:?}"
         );
@@ -487,7 +468,7 @@ fn begin_commit_rejects_out_of_date_base() {
     let sb = Sandbox::new("ood");
     let store = sb.store();
     let alice = admin(&store);
-    let repo = store.create_repo_direct(&alice, "reports", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
     let src = sb.dir("src");
     write_file(&src, "a.txt", b"a\n");
     store.import_dir(&alice, &repo.repo_id, &src, "r1").unwrap();
@@ -512,7 +493,7 @@ fn finalize_requires_pushed_objects() {
     let sb = Sandbox::new("nopush");
     let store = sb.store();
     let alice = admin(&store);
-    let repo = store.create_repo_direct(&alice, "reports", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
 
     // 只算哈希不推送：finalize 必须拒绝，否则会写出悬空引用
     let content = b"never pushed\n";
@@ -540,7 +521,7 @@ fn push_rejects_content_that_does_not_match_its_address() {
     let sb = Sandbox::new("badpush");
     let store = sb.store();
     let alice = admin(&store);
-    let repo = store.create_repo_direct(&alice, "reports", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
     let hash = seed_blob(&store, b"good\n");
     let change = vcs_server::PendingChange {
         path: "a.txt".into(),
@@ -565,7 +546,7 @@ fn second_session_finalize_is_rejected_as_out_of_date() {
     let sb = Sandbox::new("race");
     let store = sb.store();
     let alice = admin(&store);
-    let repo = store.create_repo_direct(&alice, "reports", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
 
     let a = seed_blob(&store, b"A\n");
     let b = seed_blob(&store, b"B\n");
@@ -621,7 +602,7 @@ fn aborted_session_cannot_push() {
     let sb = Sandbox::new("abort");
     let store = sb.store();
     let alice = admin(&store);
-    let repo = store.create_repo_direct(&alice, "reports", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
     let hash = seed_blob(&store, b"x\n");
     let commit = store
         .begin_commit(
@@ -655,7 +636,7 @@ fn commit_is_copy_on_write_for_untouched_directories() {
     let sb = Sandbox::new("cow");
     let store = sb.store();
     let alice = admin(&store);
-    let repo = store.create_repo_direct(&alice, "reports", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
     let src = sb.dir("src");
     write_file(&src, "202610/a.txt", b"a\n");
     write_file(&src, "202611/b.txt", b"b\n");
@@ -686,7 +667,7 @@ fn get_changes_diffs_two_revisions() {
     let sb = Sandbox::new("getchanges");
     let store = sb.store();
     let alice = admin(&store);
-    let repo = store.create_repo_direct(&alice, "reports", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
     let src = sb.dir("src");
     write_file(&src, "keep.txt", b"k\n");
     write_file(&src, "gone.txt", b"g\n");
@@ -720,7 +701,7 @@ fn seed_monthly_repo(
     store: &ServerStore,
 ) -> (vcs_server::Session, String, vcs_core::Hash, vcs_core::Hash) {
     let alice = admin(store);
-    let repo = store.create_repo_direct(&alice, "reports", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
     let src = sb.dir("src");
     write_file(&src, "202610/only-oct.txt", b"oct only\n");
     write_file(&src, "202611/only-nov.txt", b"nov only\n");
@@ -858,7 +839,7 @@ fn gc_never_reclaims_content_used_by_another_repository() {
     let (alice, repo_id, _, shared) = seed_monthly_repo(&sb, &store);
 
     // 另一个仓库引用同一份内容（共享 CAS 下天然去重）。
-    let other = store.create_repo_direct(&alice, "archive", 0, 0).unwrap();
+    let other = store.create_repo_direct(&alice, "archive", 0).unwrap();
     let other_src = sb.dir("other");
     write_file(&other_src, "copy.txt", b"shared content\n");
     store
@@ -923,38 +904,53 @@ fn list_purge_candidates_ranks_by_unique_bytes() {
 // ---------------- 用户体系：注册、审批、仓库申请、PAT ----------------
 
 #[test]
-fn registration_needs_approval_and_password_setup_before_login() {
+fn registration_takes_password_at_signup_and_still_needs_approval() {
     let sb = Sandbox::new("register");
     let store = sb.store();
     let alice = admin(&store);
 
+    // 密码在注册时就校验：不合规直接拒掉，不留下任何账号或申请单。
+    let err = store
+        .register("bob", "李波", "short", "需要一个账号归档月度报表")
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::PasswordPolicyViolation);
+    assert!(err.message.contains("至少 8 位"), "{}", err.message);
+    let err = store.login("bob", PASSWORD).unwrap_err();
+    assert_eq!(
+        err.code,
+        ErrorCode::InvalidCredentials,
+        "被拒的申请不该建号"
+    );
+
     let reg = store
-        .register("bob", "李波", "需要一个账号归档月度报表")
+        .register("bob", "李波", PASSWORD, "需要一个账号归档月度报表")
         .unwrap();
     assert_eq!(reg.info.username, "bob");
-    assert_eq!(reg.first_user, None, "库里已有管理员，不应再自动批准");
+    assert!(!reg.first_user, "库里已有管理员，不应再自动批准");
     assert!(matches!(
         reg.info.state,
         vcs_core::RegistrationStatus::Pending
     ));
 
-    // 未审批：不能登录，且错误码要能让客户端显示「等待审批」。
+    // 未审批：密码即使正确也不能登录，且错误码要能让客户端显示「等待审批」。
     let err = store.login("bob", PASSWORD).unwrap_err();
     assert_eq!(err.code, ErrorCode::AccountPending);
 
-    let approved = store
+    // 审批只放行，不再收集密码：审批后直接用注册时设置的密码登录。
+    store
         .approve_registration(&alice, &reg.info.request_id, Role::Writer)
         .unwrap();
-    // 审批通过但还没设密码：仍然不能登录，且不是「密码错」。
-    let err = store.login("bob", PASSWORD).unwrap_err();
-    assert_eq!(err.code, ErrorCode::AccountPending);
-
-    store.set_password(&approved.setup_token, PASSWORD).unwrap();
+    let err = store.login("bob", "Other1!x").unwrap_err();
+    assert_eq!(
+        err.code,
+        ErrorCode::InvalidCredentials,
+        "密码不该被审批改写"
+    );
     let (token, user) = store.login("bob", PASSWORD).unwrap();
     assert_eq!(user.username, "bob");
     assert_eq!(user.role, Role::Writer);
 
-    // token 版本在审批与设密码时各递增一次，旧凭证一律失效。
+    // token 版本在审批时递增：审批前签发过的凭证一律失效。
     let session = store.authenticate(&token).unwrap();
     assert_eq!(session.username, "bob");
     assert!(session.scopes.is_none());
@@ -966,15 +962,21 @@ fn registration_rejects_duplicates_and_empty_reasons() {
     let store = sb.store();
     let alice = admin(&store);
 
-    store.register("bob", "李波", "第一次申请").unwrap();
+    store
+        .register("bob", "李波", PASSWORD, "第一次申请")
+        .unwrap();
     // 同一个用户名重复申请：明确拒绝，避免刷出一堆待审批单。
-    let err = store.register("bob", "李波", "再申请一次").unwrap_err();
+    let err = store
+        .register("bob", "李波", PASSWORD, "再申请一次")
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::RegistrationExists);
     // 与已有账号重名。
-    let err = store.register("alice", "张爱丽", "冒名").unwrap_err();
+    let err = store
+        .register("alice", "张爱丽", PASSWORD, "冒名")
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::RegistrationExists);
 
-    let reg = store.register("carol", "王佳", "申请").unwrap();
+    let reg = store.register("carol", "王佳", PASSWORD, "申请").unwrap();
     let err = store
         .reject_registration(&alice, &reg.info.request_id, "   ")
         .unwrap_err();
@@ -1003,7 +1005,7 @@ fn only_admins_can_see_or_approve_registrations() {
     let (token, _) = store.login("dave", PASSWORD).unwrap();
     let dave = store.authenticate(&token).unwrap();
 
-    let reg = store.register("eve", "钱一", "申请").unwrap();
+    let reg = store.register("eve", "钱一", PASSWORD, "申请").unwrap();
     let err = store.list_registrations(&dave, None, 10).unwrap_err();
     assert_eq!(err.code, ErrorCode::PermissionDenied);
     let err = store
@@ -1017,31 +1019,22 @@ fn only_admins_can_see_or_approve_registrations() {
 }
 
 #[test]
-fn setup_token_is_single_use_and_password_policy_is_enforced() {
-    let sb = Sandbox::new("setup-token");
+fn registration_password_policy_is_enforced_server_side() {
+    let sb = Sandbox::new("register-policy");
     let store = sb.store();
     let alice = admin(&store);
-    let reg = store.register("frank", "孙飞", "申请").unwrap();
-    let approved = store
-        .approve_registration(&alice, &reg.info.request_id, Role::Readonly)
-        .unwrap();
 
     // 服务端是安全边界：不合规的密码必须被拒，并列出缺什么。
     let err = store
-        .set_password(&approved.setup_token, "short")
+        .register("frank", "孙飞", "short", "申请")
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::PasswordPolicyViolation);
-    assert!(err.message.contains("长度不足"), "{}", err.message);
+    assert!(err.message.contains("至少 8 位"), "{}", err.message);
 
-    store.set_password(&approved.setup_token, PASSWORD).unwrap();
-    // 一次性：同一链接不能再改密码。
-    let err = store
-        .set_password(&approved.setup_token, "Other1!x")
-        .unwrap_err();
-    assert_eq!(err.code, ErrorCode::SetupTokenInvalid);
-    // 伪造的 token 与过期路径都不泄露账号是否存在。
-    let err = store.set_password("vcs_setup_bogus", PASSWORD).unwrap_err();
-    assert_eq!(err.code, ErrorCode::SetupTokenInvalid);
+    // 拒掉之后可以用合规密码重来：失败的申请什么都没留下。
+    let reg = store.register("frank", "孙飞", PASSWORD, "申请").unwrap();
+    assert_eq!(reg.info.username, "frank");
+    assert_eq!(store.list_registrations(&alice, None, 10).unwrap().len(), 1);
 }
 
 #[test]
@@ -1059,7 +1052,7 @@ fn repo_request_stays_unusable_until_approved() {
     assert_eq!(err.code, ErrorCode::RepoNotFound);
 
     let repo = store
-        .approve_repo_request(&alice, &req.request_id, 0, 0, "同意")
+        .approve_repo_request(&alice, &req.request_id, 0, "同意")
         .unwrap();
     assert_eq!(repo.name, "monthly");
     assert_eq!(repo.owner_user_id, alice.user_id);
@@ -1077,7 +1070,7 @@ fn repo_request_stays_unusable_until_approved() {
 
     // 重复审批必须被拒，否则会建出第二个同名仓库。
     let err = store
-        .approve_repo_request(&alice, &req.request_id, 0, 0, "再批一次")
+        .approve_repo_request(&alice, &req.request_id, 0, "再批一次")
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::RepoApprovalNotFound);
 }
@@ -1120,7 +1113,7 @@ fn repo_request_rejects_duplicates_and_limits_visibility() {
     assert!(store.find_repo("grace-repo").is_err());
 
     // 已占用名字不能再申请。
-    store.create_repo_direct(&alice, "taken", 0, 0).unwrap();
+    store.create_repo_direct(&alice, "taken", 0).unwrap();
     let err = store.request_repo(&grace, "taken", "重复", 0).unwrap_err();
     assert_eq!(err.code, ErrorCode::RepoCreationExists);
 }
@@ -1130,7 +1123,7 @@ fn pat_authenticates_and_scopes_cap_what_it_can_do() {
     let sb = Sandbox::new("pat");
     let store = sb.store();
     let alice = admin(&store);
-    let repo = store.create_repo_direct(&alice, "reports", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
     let src = sb.dir("pat-src");
     write_file(&src, "a.txt", b"a\n");
     store.import_dir(&alice, &repo.repo_id, &src, "r1").unwrap();
@@ -1236,7 +1229,7 @@ fn repo_with_team(
     Vec<(String, vcs_server::Session)>,
 ) {
     let alice = admin(store);
-    let repo = store.create_repo_direct(&alice, "reports", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
     let mut team = Vec::new();
     for (name, role) in [
         ("dave", RepoMemberRole::Maintainer),
@@ -1356,28 +1349,23 @@ fn repo_quota_override_can_be_set_and_inherited() {
     let (token, _) = store.login("bob2", PASSWORD).unwrap();
     let bob2 = store.authenticate(&token).unwrap();
 
-    // 管理员核定 1 MiB 硬上限
+    // 管理员核定 1 MiB 上限
     let effective = store
-        .set_repo_quota(&alice, &repo_id, 0, 1024 * 1024, false)
+        .set_repo_quota(&alice, &repo_id, 1024 * 1024, false)
         .unwrap();
-    assert_eq!(effective.hard_bytes, 1024 * 1024);
+    assert_eq!(effective.bytes, 1024 * 1024);
     assert_eq!(effective.source, vcs_core::QuotaSource::RepoOverride);
 
     // 非管理员不能改
     let err = store
-        .set_repo_quota(&bob2, &repo_id, 0, 2048, false)
+        .set_repo_quota(&bob2, &repo_id, 2048, false)
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::PermissionDenied);
-    // 软 > 硬 是非法的
-    let err = store
-        .set_repo_quota(&alice, &repo_id, 4096, 2048, false)
-        .unwrap_err();
-    assert_eq!(err.code, ErrorCode::QuotaConfigInvalid);
 
     // 清零即恢复继承
-    let inherited = store.set_repo_quota(&alice, &repo_id, 0, 0, true).unwrap();
+    let inherited = store.set_repo_quota(&alice, &repo_id, 0, true).unwrap();
     assert_ne!(inherited.source, vcs_core::QuotaSource::RepoOverride);
-    assert_eq!(store.repo_quota_override(&repo_id).unwrap(), (0, 0));
+    assert_eq!(store.repo_quota_override(&repo_id).unwrap(), 0);
 }
 
 #[test]
@@ -1528,7 +1516,7 @@ fn purged_paths_are_member_only() {
 /// 造三个按月归档的目录，每个一份独有内容。
 fn seed_three_months(store: &ServerStore, sb: &Sandbox) -> (vcs_server::Session, String) {
     let alice = admin(store);
-    let repo = store.create_repo_direct(&alice, "monthly", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "monthly", 0).unwrap();
     let src = sb.dir("monthly-src");
     for month in ["202609", "202610", "202611"] {
         write_file(&src, &format!("{month}/report.txt"), month.as_bytes());
@@ -1886,7 +1874,7 @@ fn system_session_cannot_be_authenticated() {
     assert!(!session.is_system());
     assert!(vcs_server::Session::system().is_system());
     // 系统身份仍然要过仓库状态校验：禁用的仓库不该被自动清理。
-    let repo = store.create_repo_direct(&alice, "frozen", 0, 0).unwrap();
+    let repo = store.create_repo_direct(&alice, "frozen", 0).unwrap();
     store
         .set_repo_status(&alice, &repo.repo_id, vcs_core::RepoStatus::Disabled)
         .unwrap();
@@ -1923,38 +1911,34 @@ fn first_registration_is_automatically_an_admin() {
     let sb = Sandbox::new("first-register");
     let store = sb.store();
 
-    let reg = store.register("alice", "张爱丽", "我是第一个用户").unwrap();
+    let reg = store
+        .register("alice", "张爱丽", PASSWORD, "我是第一个用户")
+        .unwrap();
     assert!(matches!(
         reg.info.state,
         vcs_core::RegistrationStatus::Approved
     ));
-    let first = reg.first_user.clone().expect("首个注册应自动批准");
-    assert!(first.setup_token.starts_with("vcs_setup_"));
-    // 没设密码前不能登录，但账号已经是 ACTIVE + admin。
-    assert_eq!(
-        store.login("alice", PASSWORD).unwrap_err().code,
-        ErrorCode::AccountPending
-    );
+    assert!(reg.first_user, "首个注册应自动批准");
 
-    store.set_password(&first.setup_token, PASSWORD).unwrap();
+    // 注册时设置的密码立刻可用，不必再走任何激活链接。
     let (token, user) = store.login("alice", PASSWORD).unwrap();
     assert_eq!(user.role, Role::Admin);
     let session = store.authenticate(&token).unwrap();
     assert_eq!(session.role, Role::Admin);
 
-    // 自动批准过的申请不能被重复审批，也不能再给同一账号发第二张 token。
+    // 自动批准过的申请不能被重复审批。
     let err = store
         .approve_registration(&session, &reg.info.request_id, Role::Writer)
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::ApprovalNotFound);
 
     // 第二个人仍是普通待审批申请，绝不会自动拿到管理员。
-    let second = store.register("bob", "李波", "申请").unwrap();
+    let second = store.register("bob", "李波", PASSWORD, "申请").unwrap();
     assert!(matches!(
         second.info.state,
         vcs_core::RegistrationStatus::Pending
     ));
-    assert!(second.first_user.is_none());
+    assert!(!second.first_user);
     assert_eq!(
         store.login("bob", PASSWORD).unwrap_err().code,
         ErrorCode::AccountPending
@@ -1962,21 +1946,20 @@ fn first_registration_is_automatically_an_admin() {
 }
 
 #[test]
-fn bootstrap_can_rescue_first_user_with_a_lost_setup_token() {
+fn bootstrap_is_closed_once_the_first_user_can_log_in() {
     let sb = Sandbox::new("first-rescue");
     let store = sb.store();
-    let reg = store.register("alice", "张爱丽", "").unwrap();
-    assert!(reg.first_user.is_some());
+    let reg = store.register("alice", "张爱丽", PASSWORD, "").unwrap();
+    assert!(reg.first_user);
 
-    // token 丢了：本机运维用同名 init-admin 重置口令，不必重装整个库。
-    let user = store.bootstrap_admin("alice", "张爱丽", PASSWORD).unwrap();
-    assert_eq!(user.role, Role::Admin);
-    let (_, logged) = store.login("alice", PASSWORD).unwrap();
-    assert_eq!(logged.role, Role::Admin);
-
-    // 一旦有可登录管理员，bootstrap 必须重新关上。
+    // 首位注册者已经有自己的密码，本机 init-admin 不该再开一个后门。
     let err = store
         .bootstrap_admin("mallory", "攻击者", PASSWORD)
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::PermissionDenied);
+    // 也不能借同名重置把提权通道打开。
+    let err = store
+        .bootstrap_admin("alice", "张爱丽", "Other1!x")
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::PermissionDenied);
 }
@@ -2018,7 +2001,7 @@ fn registration_and_ldap_share_a_single_first_user_slot() {
     // 注册先占了名额：之后第一个 LDAP 用户必须按普通规则（只读）建号。
     let sb = Sandbox::new("first-slot-register");
     let store = sb.store();
-    store.register("alice", "张爱丽", "").unwrap();
+    store.register("alice", "张爱丽", PASSWORD, "").unwrap();
     let (_, via_ldap) = store.login_ldap(&dir_user("bob", &[])).unwrap();
     assert_eq!(via_ldap.role, Role::Readonly);
 
@@ -2027,8 +2010,8 @@ fn registration_and_ldap_share_a_single_first_user_slot() {
     let store = sb.store();
     let (_, admin) = store.login_ldap(&dir_user("alice", &[])).unwrap();
     assert_eq!(admin.role, Role::Admin);
-    let reg = store.register("bob", "李波", "申请").unwrap();
-    assert!(reg.first_user.is_none());
+    let reg = store.register("bob", "李波", PASSWORD, "申请").unwrap();
+    assert!(!reg.first_user);
     assert!(matches!(
         reg.info.state,
         vcs_core::RegistrationStatus::Pending

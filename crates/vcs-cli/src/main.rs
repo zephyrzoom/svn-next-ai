@@ -92,12 +92,9 @@ enum Cmd {
     /// 管理员直通创建仓库
     RepoCreate {
         name: String,
-        /// 单仓库软上限（字节，0 表示继承全局默认）
+        /// 单仓库配额上限（字节，0 表示继承全局默认）
         #[arg(long, default_value_t = 0)]
-        soft: u64,
-        /// 单仓库硬上限（字节，0 表示继承全局默认）
-        #[arg(long, default_value_t = 0)]
-        hard: u64,
+        quota: u64,
     },
     /// 把本地目录导入为下一个版本
     Import {
@@ -253,13 +250,16 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
-    /// 自助注册（免登录，不收集密码）
+    /// 自助注册（免登录，注册时即设置登录密码）
     Register {
         #[arg(long)]
         username: String,
         /// 姓名
         #[arg(long)]
         name: String,
+        /// 登录密码；留空则交互式隐藏输入
+        #[arg(long)]
+        password: Option<String>,
         #[arg(long, default_value = "")]
         reason: String,
     },
@@ -271,7 +271,7 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// 审批通过注册申请，输出一次性设置密码 token（仅管理员）
+    /// 审批通过注册申请（仅管理员；申请人用注册时的密码登录）
     RegisterApprove {
         request_id: String,
         /// readonly / writer / admin
@@ -283,13 +283,6 @@ enum Cmd {
         request_id: String,
         #[arg(long)]
         reason: String,
-    },
-    /// 用一次性 token 设置初始密码（免登录）
-    SetPassword {
-        #[arg(long)]
-        token: String,
-        #[arg(long)]
-        password: Option<String>,
     },
     /// 查看目录服务配置（不回显 bind 密码）
     LdapShow,
@@ -346,12 +339,9 @@ enum Cmd {
     /// 审批仓库申请（仅管理员）
     RepoApprove {
         request_id: String,
-        /// 核定硬上限（0 表示继承全局默认）
+        /// 核定配额上限（字节，0 表示继承全局默认）
         #[arg(long, default_value_t = 0)]
-        hard: u64,
-        /// 核定软上限（0 表示按硬上限 85% 推导）
-        #[arg(long, default_value_t = 0)]
-        soft: u64,
+        quota: u64,
         #[arg(long, default_value = "")]
         note: String,
     },
@@ -392,12 +382,9 @@ enum Cmd {
     /// 调整单仓库配额（仅管理员）
     RepoQuota {
         repo: String,
-        /// 硬上限（字节）
+        /// 配额上限（字节，0 表示继承全局默认）
         #[arg(long, default_value_t = 0)]
-        hard: u64,
-        /// 软上限（字节，0 表示按硬上限 85% 推导）
-        #[arg(long, default_value_t = 0)]
-        soft: u64,
+        quota: u64,
         /// 清零并恢复继承全局默认
         #[arg(long)]
         inherit: bool,
@@ -567,10 +554,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        Cmd::RepoCreate { name, soft, hard } => {
+        Cmd::RepoCreate { name, quota } => {
             let store = ServerStore::open(&store_root)?;
             let session = require_session(&store, &store_root)?;
-            let repo = store.create_repo_direct(&session, &name, soft, hard)?;
+            let repo = store.create_repo_direct(&session, &name, quota)?;
             println!("仓库已创建：{}（{}）", repo.name, repo.repo_id);
             println!("你已被登记为 owner，可直接 import / checkout。");
         }
@@ -883,9 +870,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 usage.used_bytes, usage.object_count
             );
             println!(
-                "生效配额   : 软 {} / 硬 {}（来源：{}）",
-                usage.quota.soft_bytes,
-                usage.quota.hard_bytes,
+                "生效配额   : {}（来源：{}）",
+                usage.quota.bytes,
                 quota_source_label(usage.quota.source)
             );
         }
@@ -1177,28 +1163,26 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Register {
             username,
             name,
+            password,
             reason,
         } => {
             let store = ServerStore::open(&store_root)?;
-            let outcome = store.register(&username, &name, &reason)?;
+            let password = match password {
+                Some(p) => p,
+                None => prompt("登录密码（注册时即生效）：")?,
+            };
+            let outcome = store.register(&username, &name, &password, &reason)?;
             let info = &outcome.info;
             println!(
                 "已提交注册申请：{}（申请号 {}）",
                 info.username, info.request_id
             );
-            if let Some(first) = &outcome.first_user {
+            if outcome.first_user {
                 println!("这是全库第一个账号，已自动批准为管理员，无需等待审批。");
-                println!(
-                    "一次性设置密码 token（明文只显示这一次）：{}",
-                    first.setup_token
-                );
-                println!(
-                    "有效期至 {}；执行：vcs set-password --token <token> --password '<新密码>'",
-                    format_time(first.setup_token_expires_at)
-                );
+                println!("现在就可以登录：vcs login --username {username}");
             } else {
                 println!("状态：待审批，有效期至 {}", format_time(info.expires_at));
-                println!("审批通过后管理员会给你一个一次性链接，用它设置密码才能登录。");
+                println!("审批通过后可直接用注册时设置的密码登录，无需再设置密码。");
             }
         }
 
@@ -1233,16 +1217,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let approved =
                 store.approve_registration(&session, &request_id, parse_global_role(&role)?)?;
             println!("已审批通过，账号 user_id = {}", approved.user_id);
-            println!(
-                "一次性设置密码令牌（只显示这一次，{} 前有效）：",
-                format_time(approved.setup_token_expires_at)
-            );
-            println!("  {}", approved.setup_token);
-            println!("请把它转交申请人，由对方执行：");
-            println!(
-                "  vcs set-password --token {} --password '<新密码>'",
-                approved.setup_token
-            );
+            println!("申请人可直接用注册时设置的密码登录，无需再发放任何链接。");
         }
 
         Cmd::RegisterReject { request_id, reason } => {
@@ -1250,16 +1225,6 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let session = require_session(&store, &store_root)?;
             store.reject_registration(&session, &request_id, &reason)?;
             println!("已驳回申请 {request_id}");
-        }
-
-        Cmd::SetPassword { token, password } => {
-            let store = ServerStore::open(&store_root)?;
-            let password = match password {
-                Some(p) => p,
-                None => prompt("新密码：")?,
-            };
-            store.set_password(&token, &password)?;
-            println!("密码已设置，现在可以登录了：vcs login --username <用户名>");
         }
 
         Cmd::LdapShow => {
@@ -1429,13 +1394,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Cmd::RepoApprove {
             request_id,
-            hard,
-            soft,
+            quota,
             note,
         } => {
             let store = ServerStore::open(&store_root)?;
             let session = require_session(&store, &store_root)?;
-            let repo = store.approve_repo_request(&session, &request_id, soft, hard, &note)?;
+            let repo = store.approve_repo_request(&session, &request_id, quota, &note)?;
             println!("仓库已创建：{}（{}）", repo.name, repo.repo_id);
             println!("申请人已成为 owner，可直接 import / checkout。");
         }
@@ -1495,17 +1459,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Cmd::RepoQuota {
             repo,
-            hard,
-            soft,
+            quota,
             inherit,
         } => {
             let store = ServerStore::open(&store_root)?;
             let session = require_session(&store, &store_root)?;
-            let effective = store.set_repo_quota(&session, &repo, soft, hard, inherit)?;
+            let effective = store.set_repo_quota(&session, &repo, quota, inherit)?;
             println!(
-                "生效配额：软 {} / 硬 {}（来源：{}）",
-                human_bytes(effective.soft_bytes),
-                human_bytes(effective.hard_bytes),
+                "生效配额：{}（来源：{}）",
+                human_bytes(effective.bytes),
                 quota_source_label(effective.source)
             );
         }

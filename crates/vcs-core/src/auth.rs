@@ -1,4 +1,4 @@
-//! 认证原语：本地口令哈希、JWT 签发与校验、一次性 token。
+//! 认证原语：本地口令哈希、JWT 签发与校验、PAT 令牌。
 //!
 //! 这里只做密码学与序列化，不碰数据库。用户记录的读取、状态机校验、
 //! `token_version` 比对都在 `vcs-server` 里完成——本模块保证的是
@@ -275,9 +275,9 @@ pub fn open_secret(key: &[u8], encoded: &str) -> Result<Vec<u8>> {
         .collect())
 }
 
-// ---------------- 一次性 token ----------------
+// ---------------- 随机令牌（PAT） ----------------
 
-/// 生成 32 字节随机串（base64url）。用于一次性设置密码 token 与 PAT 明文。
+/// 生成 32 字节随机串（base64url）。用于 PAT 明文等「只展示一次」的凭证。
 ///
 /// 直接取操作系统 CSPRNG：令牌不可预测性是唯一的安全边界，
 /// 拿时间戳或哈希扩散冒充随机数会在审计里被一票否决。
@@ -288,7 +288,7 @@ pub fn random_token(bytes: usize) -> String {
     URL_SAFE_NO_PAD.encode(&buf)
 }
 
-/// 一次性 token 只入库其摘要，明文仅在生成时展示一次。
+/// 令牌只入库其摘要，明文仅在生成时展示一次。
 pub fn token_digest(token: &str) -> Hash {
     hash_bytes(token.as_bytes())
 }

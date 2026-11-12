@@ -151,9 +151,9 @@ message RevisionInfo {
 
 message QuotaHint {
   uint64 used_bytes = 1;
-  uint64 soft_limit = 2;
-  uint64 hard_limit = 3;
+  uint64 limit_bytes = 2;
   uint64 estimated_new_bytes = 4;
+  reserved 3;  // 原 hard_limit：配额已合并成单条上限，见 limit_bytes
 }
 
 // 可清理目录候选，unique_bytes 是删除后真正能回收的字节数。
@@ -338,11 +338,11 @@ message GetQuotaRequest {
 message GetQuotaResponse {
   Status status = 1;
   uint64 used_bytes = 2;
-  uint64 soft_limit = 3;
-  uint64 hard_limit = 4;
+  uint64 limit_bytes = 3;  // 生效的配额上限（字节）
   uint64 reclaimable_bytes = 5;
   repeated DirectoryUsage by_path = 6;
   QuotaEffective effective = 7;  // 生效值及其来源
+  reserved 4;  // 原 hard_limit：与 limit_bytes 合并
 }
 
 message ListPurgeCandidatesRequest {
@@ -549,23 +549,25 @@ message LoginResponse {
   UserInfo user = 5;
 }
 
-// 免认证接口：提交申请，账号处于 PENDING，不能登录。
+// 免认证接口：提交申请时就设置好密码，账号处于 PENDING，不能登录；
+// 管理员审批通过后即可直接用申请时设置的密码登录，不再发放一次性链接。
 // 例外：全库第一个账号（注册或 LDAP 首次登录）自动成为管理员，见 §8.1 引导规则。
 message RegisterRequest {
   string username = 1;
   string display_name = 2;  // 姓名
   reserved 3;               // 原 email 已移除，编号不复用
   string reason = 4;
+  // 申请时即设置登录密码：策略由服务端复核，未通过审批前不能登录。
+  string password = 5;
 }
 
 message RegisterResponse {
   Status status = 1;
   string request_id = 2;
   RegistrationStatus state = 3;
-  // 首位注册者会被自动批准为管理员，直接把一次性设置密码 token 交回本人，
-  // 不必（也没有人能）走管理员审批。非首位用户这三个字段为空 / 默认值。
-  string password_setup_token = 4;
-  int64 setup_token_expires_at = 5;
+  // 原一次性设置密码 token 字段（4 / 5）已移除：密码在注册时设置。
+  reserved 4, 5;
+  // 首位注册者会被自动批准为管理员：审批通过即可用注册时的密码登录。
   bool auto_approved = 6;
   Role granted_role = 7;
 }
@@ -610,9 +612,8 @@ message ApproveRegistrationRequest {
 message ApproveRegistrationResponse {
   Status status = 1;
   string user_id = 2;
-  // 一次性设置密码 token，仅此一次返回；注册表单不收集密码。
-  string password_setup_token = 3;
-  int64 setup_token_expires_at = 4;
+  // 原一次性设置密码 token 字段（3 / 4）已移除：申请人在注册时已设好密码。
+  reserved 3, 4;
 }
 
 message RejectRegistrationRequest {
@@ -621,15 +622,6 @@ message RejectRegistrationRequest {
 }
 
 message RejectRegistrationResponse {
-  Status status = 1;
-}
-
-message SetPasswordRequest {
-  string setup_token = 1;
-  string new_password = 2;
-}
-
-message SetPasswordResponse {
   Status status = 1;
 }
 
@@ -789,9 +781,9 @@ message RepoInfo {
   RepoStatus status = 3;
   string owner_user_id = 4;
   uint64 head_rev = 5;
-  uint64 quota_soft_bytes = 6;
-  uint64 quota_hard_bytes = 7;
+  uint64 quota_bytes = 6;  // 0 表示继承全局默认
   int64 created_at = 8;
+  reserved 7;  // 原 quota_hard_bytes
 }
 
 message RepoCreationInfo {
@@ -844,9 +836,9 @@ message ListRepoCreationsResponse {
 
 message ApproveRepoCreationRequest {
   string request_id = 1;
-  uint64 quota_soft_bytes = 2;  // 0 表示不核定，继承全局默认配额
-  uint64 quota_hard_bytes = 3;  // 0 表示不核定，继承全局默认配额
+  uint64 quota_bytes = 2;  // 0 表示不核定，继承全局默认配额
   string decision_note = 4;
+  reserved 3;  // 原 quota_hard_bytes
 }
 
 message ApproveRepoCreationResponse {
@@ -894,8 +886,8 @@ message SetRepoStatusResponse {
 message CreateRepoDirectRequest {
   string repo_name = 1;
   string repo_id_hint = 2;
-  uint64 quota_soft_bytes = 3;
-  uint64 quota_hard_bytes = 4;
+  uint64 quota_bytes = 3;  // 0 表示继承全局默认配额
+  reserved 4;  // 原 quota_hard_bytes
 }
 
 message CreateRepoDirectResponse {
@@ -990,16 +982,16 @@ enum QuotaSource {
 }
 
 message QuotaDefaults {
-  uint64 soft_bytes = 1;
-  uint64 hard_bytes = 2;
+  uint64 bytes = 1;  // 0 表示未配置，由内置兜底接管
   int64 updated_at = 3;
   string updated_by = 4;
+  reserved 2;  // 原 hard_bytes
 }
 
 message QuotaEffective {
-  uint64 soft_bytes = 1;
-  uint64 hard_bytes = 2;
+  uint64 bytes = 1;  // 生效的配额上限（字节）
   QuotaSource source = 3;
+  reserved 2;  // 原 hard_bytes
 }
 
 message GetQuotaDefaultsRequest {}
@@ -1011,8 +1003,8 @@ message GetQuotaDefaultsResponse {
 }
 
 message UpdateQuotaDefaultsRequest {
-  uint64 soft_bytes = 1;
-  uint64 hard_bytes = 2;
+  uint64 bytes = 1;
+  reserved 2;  // 原 hard_bytes
 }
 
 message UpdateQuotaDefaultsResponse {
@@ -1026,17 +1018,17 @@ message GetRepoQuotaRequest {
 
 message GetRepoQuotaResponse {
   Status status = 1;
-  uint64 repo_soft_bytes = 2;  // 0 表示继承全局默认
-  uint64 repo_hard_bytes = 3;
+  uint64 repo_bytes = 2;  // 0 表示继承全局默认
   QuotaDefaults defaults = 4;
   QuotaEffective effective = 5;
+  reserved 3;  // 原 repo_hard_bytes
 }
 
 message SetRepoQuotaRequest {
   string repo_id = 1;
-  uint64 soft_bytes = 2;
-  uint64 hard_bytes = 3;
+  uint64 bytes = 2;
   bool inherit = 4;  // true 时清零并恢复继承全局默认
+  reserved 3;  // 原 hard_bytes
 }
 
 message SetRepoQuotaResponse {
@@ -1077,7 +1069,7 @@ service RepoService {
   rpc ApplyRetention(ApplyRetentionRequest) returns (ApplyRetentionResponse);
 }
 
-// 用户体系：Register / SetPassword 免认证，其余按角色鉴权。
+// 用户体系：Register / Login 免认证，其余按角色鉴权。
 service AuthService {
   rpc Login(LoginRequest) returns (LoginResponse);
   rpc Register(RegisterRequest) returns (RegisterResponse);
@@ -1085,7 +1077,6 @@ service AuthService {
   rpc ListRegistrations(ListRegistrationsRequest) returns (ListRegistrationsResponse);
   rpc ApproveRegistration(ApproveRegistrationRequest) returns (ApproveRegistrationResponse);
   rpc RejectRegistration(RejectRegistrationRequest) returns (RejectRegistrationResponse);
-  rpc SetPassword(SetPasswordRequest) returns (SetPasswordResponse);
   rpc RefreshToken(RefreshTokenRequest) returns (RefreshTokenResponse);
   rpc Logout(LogoutRequest) returns (LogoutResponse);
   rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse);
