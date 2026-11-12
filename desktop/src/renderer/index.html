@@ -94,7 +94,8 @@
           <ul id="repo-nav" class="repo-nav"></ul>
           <button id="nav-new-repo" class="nav-add" type="button">＋ 申请新建仓库</button>
           <div class="nav-foot">
-            选中仓库后，右侧是它的工作副本、提交历史与容量。<br />管理与审批请访问服务端 Web 管理端。
+            选中仓库后，右侧是它的工作副本、提交历史与容量。<br />
+            自己创建的仓库会多一个「成员」页；审批与其他治理在服务端 Web 管理端。
           </div>
         </nav>
 
@@ -135,6 +136,8 @@
               <button class="tab active" data-tab="wc" role="tab" aria-selected="true" type="button">工作副本</button>
               <button class="tab" data-tab="history" role="tab" aria-selected="false" type="button">提交历史</button>
               <button class="tab" data-tab="quota" role="tab" aria-selected="false" type="button">容量</button>
+              <!-- 成员页只属于仓库拥有者：不是 owner 时整页不出现 -->
+              <button id="tab-members" class="tab hidden" data-tab="members" role="tab" aria-selected="false" type="button">成员</button>
             </div>
 
             <!-- tab：工作副本 -->
@@ -227,6 +230,39 @@
                   <div class="meta" id="quota-text">加载中…</div>
                 </div>
                 <p class="hint">扩容也是「只填申请」：一次固定加 10 GiB，由管理员结合服务器磁盘余量审批。</p>
+              </div>
+            </section>
+
+            <!-- tab：成员（只有仓库拥有者看得到） -->
+            <section class="pane hidden" id="pane-members" data-tab="members">
+              <div class="card narrow">
+                <div class="card-head">
+                  <h2>成员</h2>
+                  <span id="members-repo" class="muted"></span>
+                  <button id="refresh-members" class="ghost">刷新</button>
+                </div>
+                <ul id="members" class="list members"></ul>
+                <p class="hint">
+                  只有成员才能检出、提交与更新这个仓库。拥有者唯一且受保护：不可移除、不可降级；
+                  成员变更立即生效，并写入审计日志。
+                </p>
+              </div>
+
+              <div class="card narrow">
+                <div class="card-head">
+                  <h2>添加成员</h2>
+                  <span class="muted">按用户名或姓名搜索已启用的账号</span>
+                </div>
+                <div class="row">
+                  <input id="member-query" placeholder="用户名 / 姓名" spellcheck="false" />
+                  <select id="member-role" aria-label="新成员角色">
+                    <option value="3" selected>写入者（可读写）</option>
+                    <option value="4">只读</option>
+                    <option value="2">维护者（可管理低阶成员）</option>
+                  </select>
+                  <button id="search-members" class="primary">搜索</button>
+                </div>
+                <ul id="member-candidates" class="list candidates"></ul>
               </div>
             </section>
           </section>

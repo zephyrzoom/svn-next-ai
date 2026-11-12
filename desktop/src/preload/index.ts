@@ -8,7 +8,8 @@ import { contextBridge, ipcRenderer } from 'electron';
  * 真正的网络与文件操作全在主进程，渲染进程拿不到 token，也碰不到磁盘。
  *
  * 桌面端只暴露「仓库使用」所需的 API：连接、仓库列表、工作副本全链路、
- * 账号自助与只读容量。管理与审批相关通道已移除，由服务端 Web 管理端承载。
+ * 账号自助、只读容量，以及 owner 对自己仓库的成员管理。审批与其余的全局治理
+ * 通道由服务端 Web 管理端承载。
  */
 
 export type Envelope<T> =
@@ -55,6 +56,22 @@ export interface RepoDto {
   name: string;
   headRev: number;
   status: number;
+  /** 拥有者的 user_id；与当前登录用户一致时才有成员管理菜单。 */
+  ownerUserId: string;
+}
+
+/** 1=owner 2=maintainer 3=writer 4=reader（与 proto 的 RepoMemberRole 一致）。 */
+export interface MemberDto {
+  userId: string;
+  username: string;
+  displayName: string;
+  role: number;
+}
+
+export interface UserSummaryDto {
+  userId: string;
+  username: string;
+  displayName: string;
 }
 
 export interface UpdateResultDto {
@@ -203,6 +220,14 @@ export interface VcsApi {
     reason?: string,
   ): Promise<Envelope<{ requestId: string; state: number }>>;
 
+  // —— 仓库成员（仅 owner 的仓库在界面上可见） ——
+  listMembers(repoId: string): Promise<Envelope<MemberDto[]>>;
+  addMember(repoId: string, userId: string, role: number): Promise<Envelope<null>>;
+  setMemberRole(repoId: string, userId: string, role: number): Promise<Envelope<null>>;
+  removeMember(repoId: string, userId: string): Promise<Envelope<null>>;
+  /** 按用户名 / 姓名搜可添加的账号（服务端只返回 ACTIVE 用户）。 */
+  searchUsers(query: string, limit?: number): Promise<Envelope<UserSummaryDto[]>>;
+
   // —— 只读容量 ——
   getQuota(repoId: string): Promise<Envelope<QuotaDto>>;
 
@@ -241,6 +266,13 @@ const api: VcsApi = {
   requestRepo: (name, reason) => ipcRenderer.invoke('vcs:requestRepo', name, reason),
   requestRepoExpansion: (repoId, reason) =>
     ipcRenderer.invoke('vcs:requestRepoExpansion', repoId, reason),
+
+  listMembers: (repoId) => ipcRenderer.invoke('vcs:listMembers', repoId),
+  addMember: (repoId, userId, role) => ipcRenderer.invoke('vcs:addMember', repoId, userId, role),
+  setMemberRole: (repoId, userId, role) =>
+    ipcRenderer.invoke('vcs:setMemberRole', repoId, userId, role),
+  removeMember: (repoId, userId) => ipcRenderer.invoke('vcs:removeMember', repoId, userId),
+  searchUsers: (query, limit) => ipcRenderer.invoke('vcs:searchUsers', query, limit),
 
   getQuota: (repoId) => ipcRenderer.invoke('vcs:getQuota', repoId),
 

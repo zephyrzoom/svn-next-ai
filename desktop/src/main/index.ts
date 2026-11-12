@@ -21,9 +21,10 @@ import type { ConflictChoice } from './wc';
  * 也拿不到文件系统与 token。
  *
  * 桌面端定位：只做「仓库使用」的客户端 —— 连接、仓库列表/选择、工作副本的
- * 检出/状态/差异/冲突/提交/更新/还原/历史，以及账号自助注册（注册即设密码）、提交
- * 建库申请。管理与审批（成员、配额、空间治理、目录配置、审批台等）统一由服务端
- * vcs serve 内置的 Web 管理端承载，桌面端不再暴露这些通道。
+ * 检出/状态/差异/冲突/提交/更新/还原/历史、账号自助注册（注册即设密码）、提交
+ * 建库申请，以及**仓库拥有者**对自己的仓库做成员增删改（成员页只对 owner 显示）。
+ * 其余治理与审批（用户/注册审批、仓库审批、配额配置、空间治理、目录配置）统一由
+ * 服务端 vcs serve 内置的 Web 管理端承载，桌面端不暴露这些通道。
  */
 
 /** 统一返回信封：业务错误带 proto 的 ErrorCode，渲染进程据此决定提示还是跳登录。 */
@@ -300,6 +301,43 @@ ipcMain.handle('vcs:requestRepo', (_event, name: string, reason: string) =>
 
 ipcMain.handle('vcs:requestRepoExpansion', (_event, repoId: string, reason = '') =>
   wrap(async () => requireClient().requestRepoExpansion(repoId, reason)),
+);
+
+// ---------------- 仓库成员（仅 owner 的仓库在界面上可见） ----------------
+
+/**
+ * 成员接口挂在 `RepoAdminService` 上，但鉴权走的是**成员门**：调用者必须是该仓库的
+ * owner / maintainer。桌面端只在「当前用户就是 owner」时展示成员页，服务端仍会
+ * 独立复核一次——界面藏起来不等于权限收窄。
+ */
+ipcMain.handle('vcs:listMembers', (_event, repoId: string) =>
+  wrap(async () => requireClient().listMembers(repoId)),
+);
+
+ipcMain.handle('vcs:addMember', (_event, repoId: string, userId: string, role: number) =>
+  wrap<null>(async () => {
+    await requireClient().addMember(repoId, userId, role);
+    return null;
+  }),
+);
+
+ipcMain.handle('vcs:setMemberRole', (_event, repoId: string, userId: string, role: number) =>
+  wrap<null>(async () => {
+    await requireClient().setMemberRole(repoId, userId, role);
+    return null;
+  }),
+);
+
+ipcMain.handle('vcs:removeMember', (_event, repoId: string, userId: string) =>
+  wrap<null>(async () => {
+    await requireClient().removeMember(repoId, userId);
+    return null;
+  }),
+);
+
+/** 按用户名 / 姓名找可添加的 ACTIVE 用户；只返回用户名与姓名，不含敏感信息。 */
+ipcMain.handle('vcs:searchUsers', (_event, query: string, limit = 20) =>
+  wrap(async () => requireClient().searchUsers(query, limit)),
 );
 
 // ---------------- 只读容量 ----------------

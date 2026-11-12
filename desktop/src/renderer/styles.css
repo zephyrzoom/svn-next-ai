@@ -860,6 +860,53 @@ button.ghost:disabled:hover {
   color: var(--accent);
 }
 
+/* ---------- 成员（owner 专属页） ---------- */
+/* 成员行不是「点一下切换选中」的列表，右侧放的是角色下拉与移除按钮 */
+.list.members li,
+.list.candidates li {
+  cursor: default;
+  align-items: center;
+  padding: 8px;
+}
+
+.member-name {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  overflow: hidden;
+}
+
+.member-name .who-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.member-name .who-id {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.member-role {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.member-role .role-select {
+  padding: 3px 6px;
+  font-size: 12px;
+}
+
+.list.candidates {
+  max-height: 220px;
+}
+
 /* ---------- 差异与冲突 ---------- */
 .diff {
   margin: 0;

@@ -292,6 +292,7 @@ LDAP 首次登录成功 ──────────────────�
 客户端启动先显示**登录页**：用「本地账号 / LDAP 账号」两个 tab 切换账号类型（切到哪个按哪个登录，LDAP tab 不显示注册入口），只填用户名、密码并勾「30 天内免登录」；成功后才切到主界面（工作副本 / 仓库 / 账号），已记住的会话在启动时静默恢复。注册入口在登录页：表单只有用户名、姓名、密码、申请理由四项，密码按 8.4 由服务端复核。
 - **服务器地址不上界面**：默认地址由 `desktop/build-config.json`（或 `VCS_DEFAULT_TARGET`）在 `npm run build` 时生成 `dist/renderer/config.js` 注入安装包；登录页与主界面都不展示地址，只有一个齿轮图标 ⚙ 入口，点开才在面板里看到当前生效地址并改成 `host:port` 覆盖默认值。覆盖值存 `userData/settings.json`，「恢复默认」清除。换地址时本机旧凭证一并作废。
 - 登录后的业务请求若返回认证类错误，界面自动退回登录页。管理员审批台在服务端 Web 管理端，桌面端不再提供。仓库列表只显示自己作为成员的仓库。
+- 桌面端唯一的管理入口是**仓库拥有者**的「成员」页：只有 `RepoInfo.owner_user_id` 等于当前登录用户的仓库才出现这个 tab，可增删成员、调整角色、按用户名/姓名搜人；owner 那一行只显示「拥有者」标记，没有下拉也没有移除按钮。不是 owner 时这个 tab 与面板都不存在（不是置灰），服务端仍按成员门独立复核。
 
 ### 8.8 仓库创建与审批
 
@@ -343,6 +344,7 @@ LDAP 首次登录成功 ──────────────────�
 | `reader` | 仅检出与查看历史 |
 
 - owner 用 `ListMembers` / `AddMember` / `RemoveMember` / `SetMemberRole` 管理；`SearchUsers` 按用户名查找可添加的 `ACTIVE` 用户，只返回用户名与姓名，不返回任何敏感信息。`maintainer` 只能增删低阶成员，越权返回 `REPO_MEMBER_FORBIDDEN`。
+- 桌面端把这条自助路径做成仓库工作区里的「成员」tab（见 8.7），入口条件是 `owner_user_id == 当前用户`；`maintainer` 仍可通过 RPC / Web 管理端管理低阶成员，桌面端不为其显示这一页。
 - 成员变更即时生效：移除成员时同步把该用户未完成的 `upload_sessions` 置为 `aborted`，`FinalizeCommit` 仍会二次校验成员资格兜底；所有成员变更写入 `audit_log`。
 - `ListRepos` 只返回调用者作为成员且状态 `active` 的仓库；非成员调用 `RepoService` 返回 `REPO_NOT_MEMBER` 并提示联系 owner。
 - 全局 `admin` 的管理通道（审批、状态变更、审计）不受成员门限制，但使用仓库仍需被 owner 加为成员。

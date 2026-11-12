@@ -17,8 +17,11 @@
  * 目录与仓库对不上时（拷贝过来的工作副本、换了账号），以目录里 wc.db 记录的 repoId
  * 为准自动切换，宁可变上下文，也不在 A 仓库的界面上改 B 仓库的文件。
  *
- * 管理与审批（成员、配额、空间治理、目录配置、审批台）由服务端 Web 管理端承载，
- * 桌面端只保留登录、账号自助、仓库使用与工作副本这条主线。
+ * 治理类的审批（用户与注册、仓库创建、扩容配额、空间治理、目录配置）由服务端
+ * Web 管理端承载，桌面端只保留登录、账号自助、仓库使用与工作副本这条主线。
+ * 唯一的例外是**仓库拥有者**：自己创建的仓库会多一个「成员」页，可以在客户端
+ * 直接增删成员、调整角色——加一个同事不该先让人去开浏览器。这一页只对 owner 出现，
+ * 服务端仍按成员门独立复核，界面藏起来不等于权限收窄。
  */
 const api = window.vcs;
 
@@ -47,6 +50,10 @@ const state = {
   diff: [],
   conflict: null,
   tab: 'wc',
+  /** 当前仓库的成员列表（仅 owner 打开成员页时会加载）。 */
+  members: [],
+  /** 搜索结果里「可以加进来的人」——已在本仓库的会被过滤掉。 */
+  candidates: [],
 };
 
 const el = (id) => document.getElementById(id);
@@ -141,19 +148,22 @@ function setView(name) {
   }
 }
 
-/** 仓库工作区里的 tab：工作副本 / 提交历史 / 容量。 */
+/** 仓库工作区里的 tab：工作副本 / 提交历史 / 容量 / 成员（owner 专属）。 */
 function setTab(name) {
-  state.tab = name;
+  // 成员页只属于 owner：即使有人手动触发，非 owner 也退回工作副本。
+  const next = name === 'members' && !isRepoOwner(currentRepo()) ? 'wc' : name;
+  state.tab = next;
   for (const tab of document.querySelectorAll('.tab')) {
-    const active = tab.dataset.tab === name;
+    const active = tab.dataset.tab === next;
     tab.classList.toggle('active', active);
     tab.setAttribute('aria-selected', String(active));
   }
   for (const pane of document.querySelectorAll('.pane')) {
-    pane.classList.toggle('hidden', pane.dataset.tab !== name);
+    pane.classList.toggle('hidden', pane.dataset.tab !== next);
   }
-  if (name === 'history') void guard('加载历史', loadLog);
-  if (name === 'quota') void guard('加载容量', loadQuota);
+  if (next === 'history') void guard('加载历史', loadLog);
+  if (next === 'quota') void guard('加载容量', loadQuota);
+  if (next === 'members') void guard('加载成员', loadMembers);
 }
 
 for (const tab of document.querySelectorAll('.tab')) {
@@ -400,6 +410,10 @@ async function selectRepo(repoId) {
   el('dir').value = state.wcDir;
   el('changes').innerHTML = '';
   el('log').innerHTML = '';
+  el('members').innerHTML = '';
+  el('member-candidates').innerHTML = '';
+  state.members = [];
+  state.candidates = [];
   el('diff-path').textContent = '';
   el('diff').textContent = state.wcDir ? '正在扫描工作副本…' : '点击左侧变更查看差异';
   el('conflict-editor').classList.add('hidden');
@@ -410,6 +424,8 @@ async function selectRepo(repoId) {
   setView('repo');
 
   await Promise.all([guard('加载容量', loadQuota), guard('加载历史', loadLog)]);
+  // 停在新仓库的成员页时，成员列表也得跟着换仓库（非 owner 已在 renderMemberAccess 里退回）。
+  if (state.tab === 'members') await guard('加载成员', loadMembers);
   if (state.wcDir) await guard('扫描工作副本', refreshStatus);
 }
 
@@ -420,6 +436,21 @@ function renderRepoHead() {
   el('repo-rev').textContent = repo ? `HEAD r${repo.headRev}` : 'HEAD r0';
   document.title = repo ? `${repo.name} — svn-next` : 'svn-next';
   renderWcBar();
+  renderMemberAccess();
+}
+
+/**
+ * 「成员」页只属于仓库拥有者：owner 唯一且不可转让，所以直接比 ownerUserId。
+ * 不是 owner 时整页（连同 tab）都不出现——把人领到一个「无权限」的页面上没有意义。
+ */
+function isRepoOwner(repo) {
+  return Boolean(repo && state.user && repo.ownerUserId && repo.ownerUserId === state.user.userId);
+}
+
+function renderMemberAccess() {
+  const owner = isRepoOwner(currentRepo());
+  el('tab-members').classList.toggle('hidden', !owner);
+  if (!owner && state.tab === 'members') setTab('wc');
 }
 
 function renderWcBar() {
@@ -642,6 +673,160 @@ function renderQuota(quota) {
     `（来源：${quotaSourceLabel(quota.source)}）`;
 }
 
+// ---------------- 成员管理（仅仓库拥有者） ----------------
+
+/** 与 proto 的 RepoMemberRole 一致：1 owner / 2 maintainer / 3 writer / 4 reader。 */
+const MEMBER_ROLE_LABELS = { 1: '拥有者', 2: '维护者', 3: '写入者', 4: '只读' };
+/** 能授予的角色：owner 不可授予他人（唯一），所以这里只列低阶三种。 */
+const ASSIGNABLE_ROLES = [2, 3, 4];
+
+function roleLabel(role) {
+  return MEMBER_ROLE_LABELS[role] || `未知角色（${role}）`;
+}
+
+async function loadMembers() {
+  const repo = currentRepo();
+  el('members-repo').textContent = repo ? repo.name : '';
+  const list = el('members');
+  if (!repo || !isRepoOwner(repo)) {
+    list.innerHTML = '';
+    return;
+  }
+  const members = unwrap(await api.listMembers(repo.repoId), '加载成员');
+  state.members = members;
+  renderMembers();
+  // 还没搜过人就给一句提示，别让「候选列表」看起来像坏掉了。
+  if (state.candidates.length === 0 && !el('member-query').value.trim()) renderCandidates('');
+}
+
+/** 成员行：owner 只显示一个「拥有者」标记，其余成员可改角色、可移除。 */
+function renderMembers() {
+  const list = el('members');
+  list.innerHTML = '';
+  if (state.members.length === 0) {
+    list.innerHTML = '<li class="empty">暂无成员</li>';
+    return;
+  }
+  for (const member of state.members) {
+    const li = document.createElement('li');
+    li.innerHTML =
+      '<span class="member-name"><span class="who-name"></span><span class="who-id"></span></span>' +
+      '<span class="member-role"></span>';
+    li.querySelector('.who-name').textContent = member.displayName || member.username;
+    li.querySelector('.who-id').textContent = `@${member.username}`;
+    const slot = li.querySelector('.member-role');
+
+    if (member.role === 1) {
+      // owner 唯一且受保护：不给下拉，也不给移除按钮。
+      const pill = document.createElement('span');
+      pill.className = 'pill';
+      pill.textContent = roleLabel(member.role);
+      slot.appendChild(pill);
+    } else {
+      const select = document.createElement('select');
+      select.className = 'role-select';
+      select.setAttribute('aria-label', `调整 ${member.username} 的角色`);
+      for (const role of ASSIGNABLE_ROLES) {
+        const option = document.createElement('option');
+        option.value = String(role);
+        option.textContent = roleLabel(role);
+        option.selected = member.role === role;
+        select.appendChild(option);
+      }
+      select.addEventListener('change', () => {
+        void guard('调整成员角色', async () => {
+          try {
+            await changeMemberRole(member, Number(select.value));
+          } finally {
+            // 服务端拒绝时下拉会停在错误的值上，按真实名单重画一次。
+            renderMembers();
+          }
+        });
+      });
+      slot.appendChild(select);
+
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'ghost';
+      remove.textContent = '移除';
+      remove.addEventListener('click', () => void guard('移除成员', () => removeMember(member)));
+      slot.appendChild(remove);
+    }
+    list.appendChild(li);
+  }
+}
+
+async function changeMemberRole(member, role) {
+  const repo = currentRepo();
+  if (!repo || role === member.role) return;
+  unwrap(await api.setMemberRole(repo.repoId, member.userId, role), '调整成员角色');
+  banner(`已把「${member.displayName || member.username}」设为${roleLabel(role)}。`);
+  await loadMembers();
+}
+
+async function removeMember(member) {
+  const repo = currentRepo();
+  if (!repo) return;
+  const name = member.displayName || member.username;
+  // 移除是即时生效的：对方手上的提交会话会被中止，所以先问一句。
+  const ok = window.confirm(
+    `把「${name}」移出仓库「${repo.name}」？\n` +
+      '对方会立即失去该仓库的访问权，未完成的提交也会被中止。',
+  );
+  if (!ok) return;
+  unwrap(await api.removeMember(repo.repoId, member.userId), '移除成员');
+  banner(`已把「${name}」移出「${repo.name}」。`);
+  state.candidates = state.candidates.filter((user) => user.userId !== member.userId);
+  renderCandidates(el('member-query').value.trim());
+  await loadMembers();
+}
+
+async function searchCandidates() {
+  const repo = currentRepo();
+  if (!repo) return;
+  const query = el('member-query').value.trim();
+  if (!query) {
+    banner('请先输入用户名或姓名', 'error');
+    return;
+  }
+  const users = unwrap(await api.searchUsers(query), '搜索用户');
+  const existing = new Set(state.members.map((member) => member.userId));
+  state.candidates = users.filter((user) => !existing.has(user.userId));
+  renderCandidates(query);
+}
+
+function renderCandidates(query = '') {
+  const list = el('member-candidates');
+  list.innerHTML = '';
+  if (state.candidates.length === 0) {
+    list.innerHTML = query
+      ? '<li class="empty">没有可添加的账号：对方可能已经是成员，或账号还没通过审批。</li>'
+      : '<li class="empty">输入用户名或姓名后点「搜索」。</li>';
+    return;
+  }
+  for (const user of state.candidates) {
+    const li = document.createElement('li');
+    li.innerHTML =
+      '<span class="member-name"><span class="who-name"></span><span class="who-id"></span></span>' +
+      '<button class="primary" type="button">添加</button>';
+    li.querySelector('.who-name').textContent = user.displayName || user.username;
+    li.querySelector('.who-id').textContent = `@${user.username}`;
+    li.querySelector('button').addEventListener('click', () => void guard('添加成员', () => addMember(user)));
+    list.appendChild(li);
+  }
+}
+
+async function addMember(user) {
+  const repo = currentRepo();
+  if (!repo) return;
+  const role = Number(el('member-role').value);
+  unwrap(await api.addMember(repo.repoId, user.userId, role), '添加成员');
+  banner(`已把「${user.displayName || user.username}」加入「${repo.name}」，角色：${roleLabel(role)}。`);
+  state.candidates = state.candidates.filter((item) => item.userId !== user.userId);
+  renderCandidates(el('member-query').value.trim());
+  await loadMembers();
+}
+
 // ---------------- 建库申请 / 扩容申请 ----------------
 
 async function requestRepo() {
@@ -804,6 +989,11 @@ async function disconnect() {
   el('repo-nav').innerHTML = '';
   el('changes').innerHTML = '';
   el('log').innerHTML = '';
+  el('members').innerHTML = '';
+  el('member-candidates').innerHTML = '';
+  state.members = [];
+  state.candidates = [];
+  setTab('wc');
   el('wc-path').textContent = '';
   el('checkout-card').classList.remove('hidden');
   el('workbench').classList.add('hidden');
@@ -859,6 +1049,15 @@ el('update').addEventListener('click', () => void guard('更新', update));
 el('revert').addEventListener('click', () => void guard('还原', revertAll));
 el('commit').addEventListener('click', () => void guard('提交', commit));
 el('refresh-log').addEventListener('click', () => void guard('刷新历史', loadLog));
+// 成员页（owner 专属）：刷新名单、按名字搜人、回车即搜。
+el('refresh-members').addEventListener('click', () => void guard('刷新成员', loadMembers));
+el('search-members').addEventListener('click', () => void guard('搜索用户', searchCandidates));
+el('member-query').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    void guard('搜索用户', searchCandidates);
+  }
+});
 // 浮层提示点一下就关，不必等它自己退场。
 el('banner').addEventListener('click', clearBanner);
 

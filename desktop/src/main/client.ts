@@ -140,6 +140,11 @@ export interface RepoInfo {
   name: string;
   headRev: number;
   status: number;
+  /**
+   * 仓库拥有者的 user_id。owner 唯一且不可转让，所以「我是不是 owner」
+   * 直接用它与当前登录用户比较即可，不必再单独查一次成员角色。
+   */
+  ownerUserId: string;
 }
 
 export interface TreeEntry {
