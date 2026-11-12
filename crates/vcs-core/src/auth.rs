@@ -21,8 +21,14 @@ use crate::{hash_bytes, Error, ErrorCode, Hash, Result};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// JWT 有效期默认 12 小时；CLI/GUI 每次启动用 refresh 或重新登录换取。
+/// JWT 有效期默认 12 小时；CLI / Web 管理端与未勾选「记住我」的客户端走这条。
 pub const DEFAULT_TOKEN_TTL_SECONDS: i64 = 12 * 60 * 60;
+
+/// 客户端勾选「30 天内免登录」时的会话长度。
+///
+/// 只在桌面端这类把 token 交给系统钥匙串加密保存的客户端开放；服务器依旧无状态，
+/// 禁用账号 / 改角色 / 重置口令会递增 `token_version`，长期 token 同样立即失效。
+pub const REMEMBER_ME_TTL_SECONDS: i64 = 30 * 86_400;
 
 // ---------------- 口令 ----------------
 
@@ -101,13 +107,26 @@ impl TokenSigner {
 
     /// 签发 token。`jti` 由调用方给出，便于把审计日志与 token 对上。
     pub fn sign(&self, sub: &str, usr: &str, role: &str, tv: i64, now: i64) -> Result<String> {
+        self.sign_with_ttl(sub, usr, role, tv, now, self.ttl_seconds)
+    }
+
+    /// 按本次登录的选择指定有效期（例如 30 天免登录），不必替换全局 signer。
+    pub fn sign_with_ttl(
+        &self,
+        sub: &str,
+        usr: &str,
+        role: &str,
+        tv: i64,
+        now: i64,
+        ttl_seconds: i64,
+    ) -> Result<String> {
         let claims = Claims {
             sub: sub.to_string(),
             usr: usr.to_string(),
             role: role.to_string(),
             tv,
             iat: now,
-            exp: now + self.ttl_seconds,
+            exp: now + ttl_seconds,
             jti: random_token(16),
         };
         self.sign_claims(&claims)

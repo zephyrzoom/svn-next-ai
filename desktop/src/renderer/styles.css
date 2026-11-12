@@ -54,12 +54,7 @@ body {
 }
 
 #target {
-  width: 150px;
-}
-
-#username,
-#password {
-  width: 110px;
+  width: 100%;
 }
 
 .who {
@@ -69,6 +64,131 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ---------- 登录页 ---------- */
+.auth-screen {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: radial-gradient(circle at 50% 0%, #edf3ee 0%, var(--surface) 62%);
+}
+
+.auth-card {
+  width: 360px;
+  max-width: 100%;
+  padding: 28px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 14px 40px rgba(44, 44, 42, 0.08);
+}
+
+.auth-card .brand {
+  font-size: 20px;
+  margin-bottom: 10px;
+}
+
+.auth-card h1 {
+  font-size: 19px;
+  font-weight: 600;
+  margin: 0 0 4px;
+}
+
+.auth-card .view-sub {
+  margin: 0 0 18px;
+}
+
+.field-label {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.auth-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.auth-form label.check {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink);
+}
+
+.auth-form label.check input {
+  width: auto;
+  margin: 0;
+}
+
+#username,
+#password {
+  width: 100%;
+}
+
+button.block {
+  width: 100%;
+  padding: 9px 12px;
+  font-size: 13px;
+}
+
+.auth-switch {
+  margin-top: 16px;
+  text-align: center;
+}
+
+button.link {
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  padding: 4px;
+}
+
+button.link:hover {
+  background: transparent;
+  text-decoration: underline;
+}
+
+.auth-message {
+  margin-top: 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid #f0d7b0;
+  background: #fdf6e8;
+  color: #7a5a12;
+  white-space: pre-wrap;
+}
+
+.auth-message.error {
+  border-color: #eec8c2;
+  background: #fdf1ef;
+  color: #8f2f24;
+}
+
+.auth-card .hint {
+  margin: 14px 0 0;
+}
+
+/* ---------- 主界面骨架 ---------- */
+.app-shell {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 
 /* ---------- 通用控件 ---------- */

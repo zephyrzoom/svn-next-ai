@@ -587,8 +587,22 @@ impl ServerStore {
         })
     }
 
-    /// 本地登录：校验状态机 + 口令，签发带 token_version 的 JWT。
+    /// 本地登录：默认 12 小时会话（CLI / Web 管理端 / 未勾选「记住我」的客户端）。
     pub fn login(&self, username: &str, password: &str) -> Result<(String, UserInfo)> {
+        self.login_with_ttl(username, password, auth::DEFAULT_TOKEN_TTL_SECONDS)
+            .map(|(token, _, user)| (token, user))
+    }
+
+    /// 本地登录并指定本次 token 有效期。
+    ///
+    /// 校验状态机 + 口令，签发带 `token_version` 的 JWT；返回值中间一项是
+    /// `expires_at`（Unix 秒），供客户端展示「免登录到哪天」并在本地到期后直接回登录页。
+    pub fn login_with_ttl(
+        &self,
+        username: &str,
+        password: &str,
+        ttl_seconds: i64,
+    ) -> Result<(String, i64, UserInfo)> {
         let row: Option<LoginRow> = self
             .conn
             .query_row(
@@ -674,13 +688,19 @@ impl ServerStore {
             )
             .map_err(db("更新登录信息失败"))?;
 
-        let token = self
-            .signer
-            .sign(&user_id, &username, role_to_str(role), token_version, now)?;
+        let token = self.signer.sign_with_ttl(
+            &user_id,
+            &username,
+            role_to_str(role),
+            token_version,
+            now,
+            ttl_seconds,
+        )?;
         self.audit("", &user_id, "user.login", &username, None)?;
 
         Ok((
             token,
+            now + ttl_seconds,
             UserInfo {
                 user_id,
                 username,
@@ -2607,12 +2627,22 @@ impl ServerStore {
         Ok(best)
     }
 
-    /// 目录认证**成功之后**的本地落库：JIT 建号（或更新映射）+ 签发 JWT。
+    /// 目录认证**成功之后**的本地落库：JIT 建号（或更新映射）+ 签发默认 12 小时 JWT。
     ///
     /// `profile` 由目录层二次 bind 验证过才传进来；本方法不碰网络，便于测试。
     /// 与自助注册共用 [`first_user_slot`]：两条入口谁先到，谁成为第一个管理员，
     /// 之后所有人都按普通规则处理。
     pub fn login_ldap(&self, profile: &DirectoryUser) -> Result<(String, UserInfo)> {
+        self.login_ldap_with_ttl(profile, auth::DEFAULT_TOKEN_TTL_SECONDS)
+            .map(|(token, _, user)| (token, user))
+    }
+
+    /// 同 [`Self::login_ldap`]，但按客户端「记住我」的选择指定 token 有效期。
+    pub fn login_ldap_with_ttl(
+        &self,
+        profile: &DirectoryUser,
+        ttl_seconds: i64,
+    ) -> Result<(String, i64, UserInfo)> {
         validate_username(&profile.username)?;
         let display_name = profile.display_name.trim();
         if display_name.is_empty() {
@@ -2702,12 +2732,13 @@ impl ServerStore {
             }
         };
 
-        let token = self.signer.sign(
+        let token = self.signer.sign_with_ttl(
             &user_id,
             &profile.username,
             role_to_str(role),
             token_version,
             now,
+            ttl_seconds,
         )?;
         write_audit(
             &tx,
@@ -2722,6 +2753,7 @@ impl ServerStore {
 
         Ok((
             token,
+            now + ttl_seconds,
             UserInfo {
                 user_id,
                 username: profile.username.clone(),

@@ -3,10 +3,13 @@
  *
  * 这里没有任何网络或文件系统能力——全部经 `window.vcs`（preload 暴露）转交主进程。
  * 每个调用都返回统一信封 `{ok, data} | {ok:false, code, message}`，业务错误直接展示
- * `message`，认证类错误（11/12/19/20）额外提示「请重新连接」。
+ * `message`；已登录状态下遇到认证类错误（11/12/19/20）自动退回登录页。
+ *
+ * 界面分两层：启动先显示「登录页」（登录 / 注册），成功后才切到「主界面」。
+ * 勾选 30 天免登录时，主进程用系统加密存储保存凭证，启动时 tryResume 直接恢复会话。
  *
  * 管理与审批（成员、配额、空间治理、目录配置、审批台）由服务端 Web 管理端承载，
- * 桌面端只保留连接、账号自助、仓库使用与工作副本这条主线。
+ * 桌面端只保留登录、账号自助、仓库使用与工作副本这条主线。
  */
 const api = window.vcs;
 
@@ -14,6 +17,9 @@ const AUTH_CODES = new Set([11, 12, 19, 20]);
 
 const state = {
   user: null,
+  target: '',
+  sessionExpiresAt: 0,
+  canPersistToken: true,
   conflicts: [],
   conflict: null,
   repos: [],
@@ -26,13 +32,35 @@ const state = {
 
 const el = (id) => document.getElementById(id);
 
-function banner(message, kind = 'info') {
+function clearBanner() {
   const node = el('banner');
+  node.className = 'banner hidden';
+  node.textContent = '';
+}
+
+/** 登录页内的提示条（主界面隐藏时所有反馈都落在这里）。 */
+function authMessage(message = '', kind = 'info') {
+  const node = el('auth-message');
   if (!message) {
-    node.className = 'banner hidden';
+    node.className = 'auth-message hidden';
     node.textContent = '';
     return;
   }
+  node.className = `auth-message${kind === 'error' ? ' error' : ''}`;
+  node.textContent = message;
+}
+
+/** 主界面提示条；未登录时自动转给登录页，避免提示落在看不见的地方。 */
+function banner(message = '', kind = 'info') {
+  if (!state.user) {
+    authMessage(message, kind);
+    return;
+  }
+  if (!message) {
+    clearBanner();
+    return;
+  }
+  const node = el('banner');
   node.className = `banner${kind === 'error' ? ' error' : ''}`;
   node.textContent = message;
 }
@@ -41,7 +69,12 @@ function banner(message, kind = 'info') {
 function unwrap(res, action) {
   if (res && res.ok) return res.data;
   const message = res && res.message ? res.message : '未知错误';
-  const suffix = res && AUTH_CODES.has(res.code) ? '\n登录状态可能已失效，请重新连接。' : '';
+  if (res && AUTH_CODES.has(res.code) && state.user) {
+    // 已登录却拿到认证错误：不要只弹个提示，直接回登录页让人重新登录。
+    showLogin(`登录状态已失效（${message}），请重新登录。`);
+    throw new Error(message);
+  }
+  const suffix = res && AUTH_CODES.has(res.code) ? '\n请重新登录。' : '';
   banner(`${action}失败：${message}${suffix}`, 'error');
   throw new Error(message);
 }
@@ -50,7 +83,8 @@ async function guard(action, run) {
   try {
     return await run();
   } catch (err) {
-    if (!el('banner').textContent) {
+    const shown = state.user ? el('banner').textContent : el('auth-message').textContent;
+    if (!shown) {
       banner(`${action}失败：${err.message}`, 'error');
     }
     return undefined;
@@ -75,36 +109,134 @@ for (const item of document.querySelectorAll('.nav-item')) {
   item.addEventListener('click', () => setView(item.dataset.view));
 }
 
-// ---------------- 连接与账号 ----------------
+// ---------------- 登录页 / 主界面切换 ----------------
+
+function formatDate(seconds) {
+  const date = new Date(seconds * 1000);
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/** 会话说明：0 表示本次会话有效，没有勾选 30 天免登录。 */
+function sessionText(expiresAt) {
+  return expiresAt > 0
+    ? `30 天内免登录，至 ${formatDate(expiresAt)}`
+    : '仅本次会话有效，关闭应用后需重新登录';
+}
+
+/** 登录页里「登录 / 申请注册」两个表单的切换，纯界面操作。 */
+function setAuthMode(mode) {
+  const register = mode === 'register';
+  el('login-form').classList.toggle('hidden', register);
+  el('register-form').classList.toggle('hidden', !register);
+  el('show-register').classList.toggle('hidden', register);
+  el('show-login').classList.toggle('hidden', !register);
+  el('auth-title').textContent = register ? '申请注册' : '登录';
+  el('auth-sub').textContent = register
+    ? '填写用户名、姓名与密码，提交后等待管理员审批。'
+    : '连接服务端后使用仓库。';
+  const note = register
+    ? '密码在注册时设置，审批通过后直接可用，不需要激活链接。'
+    : '注册时自己设置密码；管理员审批通过后即可用它登录。';
+  el('auth-note').textContent = state.canPersistToken
+    ? note
+    : '当前系统不支持加密存储凭证，关闭应用后需要重新登录。';
+  authMessage('');
+}
+
+/** 回到登录页：清掉主界面状态，登录表单回到默认态。 */
+function showLogin(message = '') {
+  state.user = null;
+  el('app-shell').classList.add('hidden');
+  el('auth-screen').classList.remove('hidden');
+  clearBanner();
+  setAuthMode('login');
+  el('password').value = '';
+  if (message) authMessage(message);
+  else el('username').focus();
+}
+
+function showApp() {
+  el('auth-screen').classList.add('hidden');
+  el('app-shell').classList.remove('hidden');
+  authMessage('');
+}
+
+// ---------------- 登录、注册与会话 ----------------
 
 async function connect() {
   const target = el('target').value.trim();
   const username = el('username').value.trim();
   const password = el('password').value;
+  const rememberMe = el('remember').checked;
   if (!target || !username || !password) {
-    banner('请填写服务端地址、用户名与密码', 'error');
+    authMessage('请填写服务端地址、用户名与密码', 'error');
     return;
   }
   const source = el('auth-source').value === 'LDAP' ? 'LDAP' : 'LOCAL';
-  const data = unwrap(
-    await api.connect(target, username, password, source),
-    '连接',
+  const session = unwrap(
+    await api.connect(target, username, password, source, rememberMe),
+    '登录',
   );
   el('password').value = '';
-  await applySession(data.user);
+  authMessage('');
+  await applySession(session, { target });
 }
 
 /** 登录成功与「用保存的凭证恢复」共用同一段收尾逻辑。 */
-async function applySession(user) {
+async function applySession(session, { target = '', resumed = false } = {}) {
+  const { user, expiresAt } = session;
   state.user = user;
+  state.target = target || state.target || el('target').value.trim();
+  state.sessionExpiresAt = Number(expiresAt || 0);
   el('who').textContent = `${user.displayName || user.username} · ${roleLabel(user.role)}`;
-  el('disconnect').classList.remove('hidden');
+  el('server-label').textContent = state.target;
+  el('account-name').textContent = `${user.displayName || user.username}（${user.username}）`;
+  el('account-role').textContent = roleLabel(user.role);
+  el('account-target').textContent = state.target;
+  el('session-until').textContent = sessionText(state.sessionExpiresAt);
+  el('session-hint').textContent = state.sessionExpiresAt > 0
+    ? `免登录至 ${formatDate(state.sessionExpiresAt)}`
+    : '本次会话';
+  showApp();
   await loadRepos();
   setView('workcopy');
+  banner(resumed ? `已用保存的凭证恢复会话：${user.username}` : '');
 }
 
 function roleLabel(role) {
   return { 1: '只读', 2: '可写', 3: '管理员' }[role] || '未知角色';
+}
+
+async function doRegister() {
+  const target = el('target').value.trim();
+  const username = el('reg-username').value.trim();
+  const displayName = el('reg-name').value.trim();
+  const password = el('reg-password').value;
+  const reason = el('reg-reason').value.trim();
+  if (!target || !username || !displayName || !password) {
+    authMessage('请填写服务端地址、用户名、姓名与密码', 'error');
+    return;
+  }
+  const result = unwrap(
+    await api.register(target, username, displayName, password, reason),
+    '提交注册申请',
+  );
+  el('reg-password').value = '';
+  setAuthMode('login');
+  el('username').value = username;
+  if (result.autoApproved) {
+    authMessage(
+      `你是全库第一个用户，已自动成为管理员（申请号 ${result.requestId}）。\n` +
+        '用户名已填好，输入刚才设置的密码即可登录。',
+    );
+  } else {
+    authMessage(
+      `注册申请已提交（${result.requestId}）。\n` +
+        '账号待审批；管理员通过后，用刚才设置的密码登录即可。',
+    );
+  }
+  el('password').focus();
 }
 
 // ---------------- 仓库列表与只读容量 ----------------
@@ -173,44 +305,6 @@ function renderQuota(quota) {
   el('quota-text').textContent =
     `已用 ${humanBytes(quota.usedBytes)} / 配额上限 ${humanBytes(quota.limitBytes)}` +
     `（来源：${quotaSourceLabel(quota.source)}）`;
-}
-
-// ---------------- 注册 ----------------
-
-function toggle(id) {
-  el(id).classList.toggle('hidden');
-}
-
-async function doRegister() {
-  const target = el('target').value.trim();
-  const username = el('reg-username').value.trim();
-  const displayName = el('reg-name').value.trim();
-  const password = el('reg-password').value;
-  const reason = el('reg-reason').value.trim();
-  if (!target || !username || !displayName || !password) {
-    banner('请填写服务端地址、用户名、姓名与密码', 'error');
-    return;
-  }
-  const result = unwrap(
-    await api.register(target, username, displayName, password, reason),
-    '提交注册申请',
-  );
-  el('register-form').classList.add('hidden');
-  el('reg-password').value = '';
-  if (result.autoApproved) {
-    // 空库第一个用户：服务端已自动批准为管理员，注册时设置的密码立即可用。
-    el('username').value = username;
-    banner(
-      `你是全库第一个用户，已自动成为管理员（申请号 ${result.requestId}）。\n` +
-        '用户名已填到右上角，输入刚才设置的密码点「连接」即可登录。',
-    );
-    el('password').focus();
-    return;
-  }
-  banner(
-    `注册申请已提交（${result.requestId}）。账号处于「待审批」，管理员在服务端 Web 管理端\n` +
-      '通过后，直接用你刚才设置的密码登录即可。',
-  );
 }
 
 // ---------------- 建库申请 ----------------
@@ -436,17 +530,18 @@ async function revertAll() {
 }
 
 async function disconnect() {
-  unwrap(await api.disconnect(), '断开连接');
-  state.user = null;
+  unwrap(await api.disconnect(), '退出登录');
   state.repos = [];
+  state.selectedRepoId = null;
+  state.changes = [];
+  state.sessionExpiresAt = 0;
   el('who').textContent = '';
-  el('disconnect').classList.add('hidden');
+  el('session-hint').textContent = '';
   el('repos').innerHTML = '';
   el('changes').innerHTML = '';
   el('log').innerHTML = '';
   el('wc-path').textContent = '';
-  banner('已断开连接');
-  setView('account');
+  showLogin('已退出登录。');
 }
 
 // ---------------- 历史 ----------------
@@ -473,7 +568,16 @@ async function loadLog() {
 
 // ---------------- 绑定 ----------------
 
-el('connect').addEventListener('click', () => void guard('连接', connect));
+el('login-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  void guard('登录', connect);
+});
+el('register-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  void guard('提交注册申请', doRegister);
+});
+el('show-register').addEventListener('click', () => setAuthMode('register'));
+el('show-login').addEventListener('click', () => setAuthMode('login'));
 el('refresh-repos').addEventListener('click', () => void guard('刷新仓库', loadRepos));
 el('take-mine').addEventListener('click', () => void guard('保留我的', () => resolveConflict('mine')));
 el('take-theirs').addEventListener('click', () =>
@@ -485,10 +589,9 @@ el('save-merge').addEventListener('click', () =>
 el('delete-file').addEventListener('click', () =>
   void guard('删除文件', () => resolveConflict('delete')),
 );
-el('toggle-register').addEventListener('click', () => toggle('register-form'));
-el('do-register').addEventListener('click', () => void guard('提交注册申请', doRegister));
 el('do-request').addEventListener('click', () => void guard('提交建库申请', requestRepo));
-el('disconnect').addEventListener('click', () => void guard('断开连接', disconnect));
+el('disconnect').addEventListener('click', () => void guard('退出登录', disconnect));
+el('account-disconnect').addEventListener('click', () => void guard('退出登录', disconnect));
 el('pick-dir').addEventListener('click', () => void guard('选择目录', pickDir));
 el('checkout').addEventListener('click', () => void guard('检出', checkout));
 el('refresh-status').addEventListener('click', () => void guard('扫描', refreshStatus));
@@ -498,26 +601,34 @@ el('commit').addEventListener('click', () => void guard('提交', commit));
 el('refresh-log').addEventListener('click', () => void guard('刷新历史', loadLog));
 
 /**
- * 启动时：把上次的连接信息填好，并尝试用加密保存的凭证直接恢复会话。
- * 恢复失败不打扰用户（token 过期、被撤销、钥匙串重置都会走到这里），
- * 只是把登录框留在眼前。
+ * 启动时：把上次的连接信息填进登录页，并尝试用加密保存的凭证恢复 30 天会话。
+ * 恢复成功直接进主界面；失败（到期、被撤销、钥匙串重置）静默回到登录页，
+ * 只有「上次确实记住过」时才给一句可解释的提示，不弹错误框。
  */
 async function bootstrap() {
-  banner('');
+  clearBanner();
+  authMessage('');
   const prefs = await api.loadPrefs();
-  if (prefs.ok) {
-    if (prefs.data.target) el('target').value = prefs.data.target;
-    if (prefs.data.username) el('username').value = prefs.data.username;
-    if (!prefs.data.canPersistToken) {
+  const saved = prefs.ok ? prefs.data : null;
+  if (saved) {
+    if (saved.target) el('target').value = saved.target;
+    if (saved.username) el('username').value = saved.username;
+    state.canPersistToken = saved.canPersistToken;
+    if (!saved.canPersistToken) {
+      el('remember').checked = false;
+      el('remember').disabled = true;
       el('repo-hint').textContent =
         '当前系统不支持加密存储凭证，重启后需要重新登录（连接信息仍会保留）。';
     }
   }
   const resumed = await api.tryResume();
   if (resumed.ok && resumed.data) {
-    await applySession(resumed.data.user);
-    banner(`已用保存的凭证恢复会话：${resumed.data.user.username}`);
+    await applySession(resumed.data, { target: saved?.target ?? '', resumed: true });
+    return;
   }
+  showLogin(
+    saved?.hasToken ? '上次的登录已过期或失效，请重新登录。' : '',
+  );
 }
 
 void bootstrap();

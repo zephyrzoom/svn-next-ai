@@ -85,19 +85,33 @@ ipcMain.handle(
     username: string,
     password: string,
     source: 'LOCAL' | 'LDAP' = 'LOCAL',
+    rememberMe = true,
   ) =>
-    wrap<{ user: UserInfo }>(async () => {
-      client?.close();
+    wrap<{ user: UserInfo; expiresAt: number }>(async () => {
       const next = new VcsClient(target);
-      const user = await next.login(username, password, source);
+      // 登录失败不能把当前已登录的 client 关掉：新连接自己收拾干净。
+      let user: UserInfo;
+      try {
+        user = await next.login(username, password, source, rememberMe);
+      } catch (err) {
+        next.close();
+        throw err;
+      }
+      client?.close();
       client = next;
-      // 登录成功才写入本地设置：凭证用 safeStorage 加密，不落明文。
-      if (next.tokenValue) saveLogin(target, user.username, next.tokenValue);
-      return { user };
+      const expiresAt = next.expiresAtValue;
+      if (rememberMe && next.tokenValue) {
+        // 「30 天免登录」：凭证加密落盘，并记下到期时间供启动时快速判断。
+        saveLogin(target, user.username, next.tokenValue, expiresAt);
+      } else {
+        // 不记住：只保留地址与用户名，本机不留任何可复用凭证。
+        saveLogin(target, user.username);
+      }
+      return { user, expiresAt: rememberMe ? expiresAt : 0 };
     }),
 );
 
-/** 上次的连接信息（不含凭证），用于把登录框填好。 */
+/** 上次的连接信息（不含凭证），用于把登录页填好。 */
 ipcMain.handle('vcs:loadPrefs', () => wrap(async () => loadPrefs()));
 
 /**
@@ -105,19 +119,26 @@ ipcMain.handle('vcs:loadPrefs', () => wrap(async () => loadPrefs()));
  * 让用户重新登录——不要弹错误框，这不是用户做错了什么。
  */
 ipcMain.handle('vcs:tryResume', () =>
-  wrap<{ user: UserInfo } | null>(async () => {
-    const token = loadToken();
-    if (!token) return null;
+  wrap<{ user: UserInfo; expiresAt: number } | null>(async () => {
     const prefs = loadPrefs();
     if (!prefs.target) return null;
+    const now = Math.floor(Date.now() / 1000);
+    // 本地记着的会话已到 30 天：不必发请求，直接回登录页。
+    if (prefs.sessionExpiresAt > 0 && prefs.sessionExpiresAt <= now) {
+      clearToken();
+      return null;
+    }
+    const token = loadToken();
+    if (!token) return null;
     const next = new VcsClient(prefs.target);
     next.useToken(token);
     try {
       const user = await next.whoAmI();
       client?.close();
       client = next;
+      // 不带 expiresAt 调用：刷新用户名，但保留原来的到期时间。
       saveLogin(prefs.target, user.username, token);
-      return { user };
+      return { user, expiresAt: prefs.sessionExpiresAt };
     } catch {
       next.close();
       clearToken();

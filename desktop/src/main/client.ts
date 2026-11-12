@@ -338,6 +338,7 @@ export class VcsClient {
   private readonly admin: Record<string, Unary>;
   private raw: grpc.Client[] = [];
   private token?: string;
+  private expiresAt = 0;
 
   constructor(readonly target: string) {
     const definition = protoLoader.loadSync(protoPath(), {
@@ -386,19 +387,25 @@ export class VcsClient {
     });
   }
 
-  /** `source` 决定走本地口令还是目录 bind；默认是本地账号。 */
+  /**
+   * `source` 决定走本地口令还是目录 bind；`rememberMe` 让服务端签发 30 天会话
+   * （登录页默认勾选）。两者都只影响本次签发，不改变后续请求的鉴权方式。
+   */
   async login(
     username: string,
     password: string,
     source: 'LOCAL' | 'LDAP' = 'LOCAL',
+    rememberMe = false,
   ): Promise<UserInfo> {
     const resp = await this.invoke<any>(this.auth, 'login', {
       username,
       password,
       source: source === 'LDAP' ? 2 : 1,
+      rememberMe,
     });
     assertOk(resp.status);
     this.token = resp.accessToken as string;
+    this.expiresAt = Number(resp.expiresAt ?? 0);
     return resp.user as UserInfo;
   }
 
@@ -411,11 +418,17 @@ export class VcsClient {
 
   logout(): void {
     this.token = undefined;
+    this.expiresAt = 0;
   }
 
   /** 当前凭证（仅主进程内部用于加密持久化，绝不发给渲染进程）。 */
   get tokenValue(): string | undefined {
     return this.token;
+  }
+
+  /** 本次登录签发的到期时间（Unix 秒）；用于保存到本地、显示「免登录至」。 */
+  get expiresAtValue(): number {
+    return this.expiresAt;
   }
 
   /** 用已保存的凭证恢复会话；随后调 `whoAmI` 确认它还有效。 */

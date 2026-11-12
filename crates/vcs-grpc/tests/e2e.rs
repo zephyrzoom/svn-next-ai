@@ -105,6 +105,7 @@ async fn login(h: &Harness, username: &str, password: &str) -> String {
             username: username.into(),
             password: password.into(),
             source: pb::AuthSource::Local as i32,
+            remember_me: false,
         }))
         .await
         .unwrap()
@@ -136,6 +137,7 @@ async fn login_requires_credentials_and_maps_business_errors() {
             username: "alice".into(),
             password: "wrong".into(),
             source: pb::AuthSource::Local as i32,
+            remember_me: false,
         }))
         .await
         .unwrap()
@@ -152,6 +154,67 @@ async fn login_requires_credentials_and_maps_business_errors() {
         .auth()
         .await
         .who_am_i(bearer(Request::new(pb::WhoAmIRequest {}), &token))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(me.user.unwrap().username, "alice");
+}
+
+#[tokio::test]
+async fn remember_me_signs_a_30_day_session() {
+    let h = Harness::start("remember-me").await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // 不勾「记住我」：12 小时，CLI / Web 管理端 / 公共机器保持原来的安全边界。
+    let short = h
+        .auth()
+        .await
+        .login(Request::new(pb::LoginRequest {
+            username: "alice".into(),
+            password: PASSWORD.into(),
+            source: pb::AuthSource::Local as i32,
+            remember_me: false,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(short.status.unwrap().code, pb::ErrorCode::Ok as i32);
+    assert!(
+        (short.expires_at - now - vcs_core::auth::DEFAULT_TOKEN_TTL_SECONDS).abs() < 30,
+        "默认会话应为 12 小时，实际 {}",
+        short.expires_at - now
+    );
+
+    // 勾选后：30 天，且这张 token 立刻可用（不是仅仅把数字写大）。
+    let long = h
+        .auth()
+        .await
+        .login(Request::new(pb::LoginRequest {
+            username: "alice".into(),
+            password: PASSWORD.into(),
+            source: pb::AuthSource::Local as i32,
+            remember_me: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(long.status.unwrap().code, pb::ErrorCode::Ok as i32);
+    assert!(
+        (long.expires_at - now - vcs_core::auth::REMEMBER_ME_TTL_SECONDS).abs() < 30,
+        "免登录会话应为 30 天，实际 {}",
+        long.expires_at - now
+    );
+    let me = h
+        .auth()
+        .await
+        .who_am_i(bearer(
+            Request::new(pb::WhoAmIRequest {}),
+            &long.access_token,
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -523,6 +586,7 @@ async fn admin_approval_and_purge_over_grpc() {
             username: "carol".into(),
             password: PASSWORD.into(),
             source: pb::AuthSource::Local as i32,
+            remember_me: false,
         }))
         .await
         .unwrap()
@@ -877,6 +941,7 @@ async fn first_registration_over_grpc_auto_approves_the_admin() {
             username: "alice".into(),
             password: PASSWORD.into(),
             source: pb::AuthSource::Ldap as i32,
+            remember_me: false,
         }))
         .await
         .unwrap()
@@ -912,6 +977,7 @@ async fn first_registration_over_grpc_auto_approves_the_admin() {
             username: "alice".into(),
             password: PASSWORD.into(),
             source: pb::AuthSource::Local as i32,
+            remember_me: false,
         }))
         .await
         .unwrap()

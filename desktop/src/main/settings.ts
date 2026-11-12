@@ -18,6 +18,8 @@ interface SettingsFile {
   username?: string;
   /** base64(safeStorage 密文)。没有加密能力时不会写入。 */
   sealedToken?: string;
+  /** 该 token 的过期时间（Unix 秒），仅「30 天免登录」会话会写入。 */
+  sessionExpiresAt?: number;
 }
 
 function settingsPath(): string {
@@ -48,6 +50,8 @@ export interface Prefs {
   hasToken: boolean;
   /** 当前平台是否支持加密存储。不支持时界面要提示「重启后需重新登录」。 */
   canPersistToken: boolean;
+  /** 已保存会话的过期时间（Unix 秒）；0 表示没有长期会话。 */
+  sessionExpiresAt: number;
 }
 
 export function loadPrefs(): Prefs {
@@ -57,18 +61,33 @@ export function loadPrefs(): Prefs {
     username: file.username ?? '',
     hasToken: Boolean(file.sealedToken),
     canPersistToken: safeStorage.isEncryptionAvailable(),
+    sessionExpiresAt: file.sessionExpiresAt ?? 0,
   };
 }
 
-export function saveLogin(target: string, username: string, token: string): void {
+/**
+ * 保存登录结果。
+ *
+ * - 传 `token`：把凭证加密落盘（「记住我」的 30 天会话同时记下 `expiresAt`）；
+ * - 不传 `token`：只保留服务端地址与用户名，清掉凭证——用于「本次会话有效」的登录
+ *   以及用旧 token 恢复会话时刷新用户名，不覆盖原来的到期时间。
+ */
+export function saveLogin(
+  target: string,
+  username: string,
+  token?: string,
+  expiresAt = 0,
+): void {
   const file = read();
   file.target = target;
   file.username = username;
-  if (safeStorage.isEncryptionAvailable()) {
+  if (token && safeStorage.isEncryptionAvailable()) {
     file.sealedToken = safeStorage.encryptString(token).toString('base64');
+    if (expiresAt > 0) file.sessionExpiresAt = expiresAt;
   } else {
     // 明文令牌绝不落盘；保留连接信息即可。
     delete file.sealedToken;
+    delete file.sessionExpiresAt;
   }
   write(file);
 }
@@ -86,7 +105,8 @@ export function loadToken(): string | null {
 
 export function clearToken(): void {
   const file = read();
-  if (!file.sealedToken) return;
+  if (!file.sealedToken && !file.sessionExpiresAt) return;
   delete file.sealedToken;
+  delete file.sessionExpiresAt;
   write(file);
 }

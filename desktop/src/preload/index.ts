@@ -108,6 +108,14 @@ export interface PrefsDto {
   username: string;
   hasToken: boolean;
   canPersistToken: boolean;
+  /** 已记住会话的到期时间（Unix 秒）；0 表示没有长期会话。 */
+  sessionExpiresAt: number;
+}
+
+export interface SessionDto {
+  user: UserDto;
+  /** 0 表示本次会话有效（没有勾选 30 天免登录）。 */
+  expiresAt: number;
 }
 
 export interface QuotaDto {
@@ -125,12 +133,13 @@ export interface VcsApi {
     username: string,
     password: string,
     source?: 'LOCAL' | 'LDAP',
-  ): Promise<Envelope<{ user: UserDto }>>;
+    rememberMe?: boolean,
+  ): Promise<Envelope<SessionDto>>;
   disconnect(): Promise<Envelope<null>>;
   /** 上次的连接信息（不含凭证）。 */
   loadPrefs(): Promise<Envelope<PrefsDto>>;
   /** 用保存的凭证恢复会话；没有可用凭证时返回 null。 */
-  tryResume(): Promise<Envelope<{ user: UserDto } | null>>;
+  tryResume(): Promise<Envelope<SessionDto | null>>;
   listRepos(): Promise<Envelope<RepoDto[]>>;
   pickDir(): Promise<Envelope<string | null>>;
   checkout(
@@ -186,8 +195,8 @@ export interface VcsApi {
 }
 
 const api: VcsApi = {
-  connect: (target, username, password, source) =>
-    ipcRenderer.invoke('vcs:connect', target, username, password, source),
+  connect: (target, username, password, source, rememberMe) =>
+    ipcRenderer.invoke('vcs:connect', target, username, password, source, rememberMe),
   disconnect: () => ipcRenderer.invoke('vcs:disconnect'),
   loadPrefs: () => ipcRenderer.invoke('vcs:loadPrefs'),
   tryResume: () => ipcRenderer.invoke('vcs:tryResume'),

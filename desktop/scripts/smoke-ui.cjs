@@ -59,6 +59,7 @@ function verify({ app, BrowserWindow, ipcMain }) {
     username: 'smoke',
     hasToken: false,
     canPersistToken: true,
+    sessionExpiresAt: 0,
   };
   const problems = [];
   let settled = false;
@@ -140,6 +141,9 @@ function verify({ app, BrowserWindow, ipcMain }) {
           apiKeys: window.vcs ? Object.keys(window.vcs).length : 0,
           target: document.getElementById('target') && document.getElementById('target').value,
           domIds: document.querySelectorAll('[id]').length,
+          loginVisible: !document.getElementById('auth-screen').classList.contains('hidden'),
+          appHidden: document.getElementById('app-shell').classList.contains('hidden'),
+          rememberChecked: document.getElementById('remember').checked,
         }))()`);
       } catch (err) {
         problems.push(`页面求值失败：${err && err.message}`);
@@ -156,6 +160,9 @@ function verify({ app, BrowserWindow, ipcMain }) {
         样式已加载: /^rgb\(/.test(info.css),
         preload_桥接: info.apiType === 'object' && info.apiKeys > 20,
         渲染脚本已启动: info.target === PREFS.target,
+        // 启动时必须先看到登录页；只有有效的 30 天会话才直接进主界面。
+        登录页默认可见: info.loginVisible === true && info.appHidden === true,
+        免登录默认勾选: info.rememberChecked === true,
       };
       for (const [name, ok] of Object.entries(checks)) {
         if (!ok) problems.push(`断言失败：${name}`);

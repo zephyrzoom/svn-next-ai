@@ -514,6 +514,7 @@ impl AuthApi {
         &self,
         username: &str,
         password: &str,
+        ttl_seconds: i64,
     ) -> Result<Response<pb::LoginResponse>, Status> {
         let cfg = {
             let store = self.api.store();
@@ -568,12 +569,12 @@ impl AuthApi {
         };
 
         let store = self.api.store();
-        match store.login_ldap(&profile) {
-            Ok((token, user)) => Ok(Response::new(pb::LoginResponse {
+        match store.login_ldap_with_ttl(&profile, ttl_seconds) {
+            Ok((token, expires_at, user)) => Ok(Response::new(pb::LoginResponse {
                 status: Some(status_ok()),
                 access_token: token,
                 refresh_token: String::new(),
-                expires_at: now_secs() + vcs_core::auth::DEFAULT_TOKEN_TTL_SECONDS,
+                expires_at,
                 user: Some(user_to_pb(&user)),
             })),
             Err(err) => Ok(Response::new(pb::LoginResponse {
@@ -591,16 +592,27 @@ impl AuthService for AuthApi {
         request: Request<pb::LoginRequest>,
     ) -> Result<Response<pb::LoginResponse>, Status> {
         let req = request.into_inner();
+        // 「30 天免登录」是客户端的显式选择：不勾 / CLI / Web 管理端仍是 12 小时。
+        let ttl = if req.remember_me {
+            vcs_core::auth::REMEMBER_ME_TTL_SECONDS
+        } else {
+            vcs_core::auth::DEFAULT_TOKEN_TTL_SECONDS
+        };
         if req.source == pb::AuthSource::Ldap as i32 {
-            return self.login_with_ldap(&req.username, &req.password).await;
+            return self
+                .login_with_ldap(&req.username, &req.password, ttl)
+                .await;
         }
-        let now = now_secs();
-        match self.api.store().login(&req.username, &req.password) {
-            Ok((token, user)) => Ok(Response::new(pb::LoginResponse {
+        match self
+            .api
+            .store()
+            .login_with_ttl(&req.username, &req.password, ttl)
+        {
+            Ok((token, expires_at, user)) => Ok(Response::new(pb::LoginResponse {
                 status: Some(status_ok()),
                 access_token: token,
                 refresh_token: String::new(),
-                expires_at: now + vcs_core::auth::DEFAULT_TOKEN_TTL_SECONDS,
+                expires_at,
                 user: Some(user_to_pb(&user)),
             })),
             Err(err) => Ok(Response::new(pb::LoginResponse {

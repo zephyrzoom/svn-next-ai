@@ -539,6 +539,10 @@ message LoginRequest {
   string username = 1;
   string password = 2;
   AuthSource source = 3;
+  // 客户端「30 天内免登录」勾选：true 时服务端签发 30 天有效期的 JWT，
+  // false（CLI / Web 管理端 / 公共机器）仍是 12 小时。
+  // 无论哪种，禁用账号、改角色或重置口令都会通过 token_version 让旧 token 立即失效。
+  bool remember_me = 4;
 }
 
 message LoginResponse {
