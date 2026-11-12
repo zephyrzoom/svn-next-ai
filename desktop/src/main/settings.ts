@@ -20,6 +20,8 @@ interface SettingsFile {
   sealedToken?: string;
   /** 该 token 的过期时间（Unix 秒），仅「30 天免登录」会话会写入。 */
   sessionExpiresAt?: number;
+  /** 仓库 → 本地工作副本目录。同一条记录，重启后才知道哪个仓库在本地有目录。 */
+  repoDirs?: Record<string, string>;
 }
 
 function settingsPath(): string {
@@ -123,5 +125,38 @@ export function clearToken(): void {
   if (!file.sealedToken && !file.sessionExpiresAt) return;
   delete file.sealedToken;
   delete file.sessionExpiresAt;
+  write(file);
+}
+
+/**
+ * 仓库 → 本地工作副本目录的绑定。
+ *
+ * 工作副本是「这台机器上的一份拷贝」，所以这份记忆跟着机器走，不跟账号走：换个账号
+ * 登录，同一个仓库的目录依然对得上。里面没有任何凭证，只有路径。
+ */
+export function loadRepoDirs(): Record<string, string> {
+  const file = read();
+  const dirs = file.repoDirs;
+  if (!dirs || typeof dirs !== 'object') return {};
+  const clean: Record<string, string> = {};
+  for (const [repoId, dir] of Object.entries(dirs)) {
+    if (typeof dir === 'string' && dir.trim()) clean[repoId] = dir;
+  }
+  return clean;
+}
+
+/** 保存绑定关系；只收绝对路径，避免把界面上误传的相对路径写进设置。 */
+export function saveRepoDirs(dirs: Record<string, string>): void {
+  const file = read();
+  const clean: Record<string, string> = {};
+  if (dirs && typeof dirs === 'object') {
+    for (const [repoId, dir] of Object.entries(dirs)) {
+      if (typeof dir !== 'string' || !dir.trim()) continue;
+      if (!dir.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(dir)) continue;
+      clean[repoId] = dir;
+    }
+  }
+  if (Object.keys(clean).length === 0) delete file.repoDirs;
+  else file.repoDirs = clean;
   write(file);
 }

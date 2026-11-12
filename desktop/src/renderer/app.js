@@ -10,6 +10,13 @@
  * （config.js）注入，用户在设置里改的地址覆盖它并持久化。
  * 勾选 30 天免登录时，主进程用系统加密存储保存凭证，启动时 tryResume 直接恢复会话。
  *
+ * 主界面只有一条主线：**仓库**。左侧是仓库列表，选中哪一个，右侧整个工作区就属于它
+ * （工作副本 / 提交历史 / 容量三个 tab）。顶部固定一条上下文条，写着当前仓库名、
+ * HEAD 版本与本地工作副本目录——工作副本本质上就是这个仓库在本地的一份拷贝，
+ * 把它和仓库并列成两个菜单会让人在两个视图之间丢失「我在哪个仓库」的坐标。
+ * 目录与仓库对不上时（拷贝过来的工作副本、换了账号），以目录里 wc.db 记录的 repoId
+ * 为准自动切换，宁可变上下文，也不在 A 仓库的界面上改 B 仓库的文件。
+ *
  * 管理与审批（成员、配额、空间治理、目录配置、审批台）由服务端 Web 管理端承载，
  * 桌面端只保留登录、账号自助、仓库使用与工作副本这条主线。
  */
@@ -28,14 +35,19 @@ const state = {
   authMode: 'login',
   sessionExpiresAt: 0,
   canPersistToken: true,
-  conflicts: [],
-  conflict: null,
+
   repos: [],
   selectedRepoId: null,
-  dir: '',
+  /** 仓库 → 本地工作副本目录的绑定，持久化在 userData/settings.json。 */
+  wcDirs: {},
+  /** 当前选中仓库绑定的目录；空串表示这个仓库还没有本地工作副本。 */
+  wcDir: '',
+  wcRev: 0,
   changes: [],
+  conflicts: [],
   diff: [],
-  cwd: '',
+  conflict: null,
+  tab: 'wc',
 };
 
 const el = (id) => document.getElementById(id);
@@ -102,19 +114,32 @@ async function guard(action, run) {
 // ---------------- 视图切换 ----------------
 
 /**
- * 左侧菜单只切换右侧视图与高亮态，纯界面操作：不触发任何网络请求或副作用。
+ * 顶层视图只有三个：空态（一个仓库都没有）/ 仓库工作区 / 建库申请。
+ * 纯界面操作：不触发网络请求。
  */
 function setView(name) {
-  for (const item of document.querySelectorAll('.nav-item')) {
-    item.classList.toggle('active', item.dataset.view === name);
-  }
   for (const view of document.querySelectorAll('.view')) {
     view.classList.toggle('hidden', view.dataset.view !== name);
   }
 }
 
-for (const item of document.querySelectorAll('.nav-item')) {
-  item.addEventListener('click', () => setView(item.dataset.view));
+/** 仓库工作区里的 tab：工作副本 / 提交历史 / 容量。 */
+function setTab(name) {
+  state.tab = name;
+  for (const tab of document.querySelectorAll('.tab')) {
+    const active = tab.dataset.tab === name;
+    tab.classList.toggle('active', active);
+    tab.setAttribute('aria-selected', String(active));
+  }
+  for (const pane of document.querySelectorAll('.pane')) {
+    pane.classList.toggle('hidden', pane.dataset.tab !== name);
+  }
+  if (name === 'history') void guard('加载历史', loadLog);
+  if (name === 'quota') void guard('加载容量', loadQuota);
+}
+
+for (const tab of document.querySelectorAll('.tab')) {
+  tab.addEventListener('click', () => setTab(tab.dataset.tab));
 }
 
 // ---------------- 登录页 / 主界面切换 ----------------
@@ -209,6 +234,7 @@ function showLogin(message = '') {
   state.user = null;
   el('app-shell').classList.add('hidden');
   el('auth-screen').classList.remove('hidden');
+  document.title = 'svn-next';
   clearBanner();
   closeSettings();
   setAuthMode('login');
@@ -255,8 +281,11 @@ async function applySession(session, { target = '', resumed = false } = {}) {
     ? `免登录至 ${formatDate(state.sessionExpiresAt)}`
     : '本次会话';
   showApp();
+  // 工作副本目录属于「这台机器」的记忆，与账号无关：登录后一次性读回来。
+  // 读不到（旧版客户端留下的设置、磁盘只读）不该挡住登录，只是这次要重新选目录。
+  const dirs = await api.loadRepoDirs();
+  state.wcDirs = dirs && dirs.ok && dirs.data ? dirs.data : {};
   await loadRepos();
-  setView('workcopy');
   banner(resumed ? `已用保存的凭证恢复会话：${user.username}` : '');
 }
 
@@ -295,46 +324,291 @@ async function doRegister() {
   el('password').focus();
 }
 
-// ---------------- 仓库列表与只读容量 ----------------
+// ---------------- 仓库列表：唯一的入口菜单 ----------------
+
+function currentRepo() {
+  return state.repos.find((repo) => repo.repoId === state.selectedRepoId) || null;
+}
 
 async function loadRepos() {
   const repos = unwrap(await api.listRepos(), '加载仓库');
   state.repos = repos;
-  renderRepos();
-  if (!state.selectedRepoId && repos.length > 0) {
-    selectRepo(repos[0].repoId);
+  if (repos.length === 0) {
+    state.selectedRepoId = null;
+    state.wcDir = '';
+    state.changes = [];
+    state.conflicts = [];
+    renderRepoNav();
+    renderRepoHead();
+    setView('empty');
+    return;
   }
+  // 选中的仓库被删或不再可见时才回落到第一个，否则保持原位——刷新不该把人踢走。
+  const kept = repos.some((repo) => repo.repoId === state.selectedRepoId);
+  await selectRepo(kept ? state.selectedRepoId : repos[0].repoId);
 }
 
-function renderRepos() {
-  const list = el('repos');
+/** 左侧仓库列表：名字 + HEAD + 「本地有工作副本」的圆点。 */
+function renderRepoNav() {
+  const list = el('repo-nav');
   list.innerHTML = '';
   if (state.repos.length === 0) {
-    list.innerHTML = '<li class="empty">还没有可用的仓库，可在右侧提交建库申请</li>';
+    list.innerHTML = '<li class="repo-empty">暂无仓库</li>';
     return;
   }
   for (const repo of state.repos) {
     const li = document.createElement('li');
-    li.className = repo.repoId === state.selectedRepoId ? 'active' : '';
-    li.innerHTML = `<span class="name"></span><span class="badge">r${repo.headRev}</span>`;
-    li.querySelector('.name').textContent = repo.name;
-    li.addEventListener('click', () => selectRepo(repo.repoId));
+    const dir = state.wcDirs[repo.repoId];
+    li.className = `repo-item${repo.repoId === state.selectedRepoId ? ' active' : ''}`;
+    li.title = dir ? `${repo.name}\n本地工作副本：${dir}` : repo.name;
+    li.innerHTML =
+      '<span class="repo-name"></span>' +
+      '<span class="repo-dot"></span>' +
+      '<span class="repo-rev"></span>';
+    li.querySelector('.repo-name').textContent = repo.name;
+    li.querySelector('.repo-dot').classList.toggle('on', Boolean(dir));
+    li.querySelector('.repo-rev').textContent = `r${repo.headRev}`;
+    li.addEventListener('click', () => {
+      // 已经选中的仓库再点一次 = 「回到这个仓库的工作区」（比如刚从建库申请页回来）。
+      if (repo.repoId === state.selectedRepoId) {
+        setView('repo');
+        return;
+      }
+      void guard('切换仓库', () => selectRepo(repo.repoId));
+    });
     list.appendChild(li);
   }
 }
 
-function selectRepo(repoId) {
+/**
+ * 切换仓库：右侧整个工作区跟着换。工作副本目录来自按仓库记住的绑定，
+ * 没有绑定就显示检出引导——而不是让人先去另一个菜单里「选仓库」。
+ */
+async function selectRepo(repoId) {
   state.selectedRepoId = repoId;
-  renderRepos();
-  void loadLog();
-  void loadQuota(repoId);
+  state.wcDir = state.wcDirs[repoId] || '';
+  state.wcRev = 0;
+  state.changes = [];
+  state.conflicts = [];
+  state.diff = [];
+  state.conflict = null;
+  el('dir').value = state.wcDir;
+  el('changes').innerHTML = '';
+  el('log').innerHTML = '';
+  el('diff-path').textContent = '';
+  el('diff').textContent = state.wcDir ? '正在扫描工作副本…' : '点击左侧变更查看差异';
+  el('conflict-editor').classList.add('hidden');
+  el('diff').classList.remove('hidden');
+
+  renderRepoNav();
+  renderRepoHead();
+  setView('repo');
+
+  await Promise.all([guard('加载容量', loadQuota), guard('加载历史', loadLog)]);
+  if (state.wcDir) await guard('扫描工作副本', refreshStatus);
 }
 
-/** 容量是只读信息：选中仓库后仅刷新这一条，不再触发任何治理类调用。 */
-async function loadQuota(repoId) {
-  const repo = state.repos.find((item) => item.repoId === repoId);
+/** 顶部固定上下文条：仓库名 + HEAD + 本地目录 + 待提交/冲突计数。 */
+function renderRepoHead() {
+  const repo = currentRepo();
+  el('repo-title').textContent = repo ? repo.name : '—';
+  el('repo-rev').textContent = repo ? `HEAD r${repo.headRev}` : 'HEAD r0';
+  document.title = repo ? `${repo.name} — svn-next` : 'svn-next';
+  renderWcBar();
+}
+
+function renderWcBar() {
+  const dir = state.wcDir;
+  el('wc-path').textContent = dir || '未检出到本地';
+  el('wc-path').title = dir;
+  el('wc-dot').className = `wc-dot${dir ? ' on' : ''}`;
+  const conflicts = state.conflicts.length;
+  el('wc-status').textContent = !dir
+    ? '检出后即可提交与更新'
+    : conflicts > 0
+      ? `${conflicts} 个冲突待解决`
+      : `${state.changes.length} 个待提交变更 @ r${state.wcRev}`;
+  el('wc-status').classList.toggle('warn', conflicts > 0);
+  for (const id of ['pick-dir', 'refresh-status', 'update']) {
+    el(id).disabled = !dir;
+  }
+  el('checkout-card').classList.toggle('hidden', Boolean(dir));
+  el('workbench').classList.toggle('hidden', !dir);
+  el('wc-change-count').textContent = dir ? `${state.changes.length} 项` : '';
+}
+
+// ---------------- 检出、扫描与更新 ----------------
+
+/** 把目录与仓库绑定起来：一个目录只属于一个仓库，顺手清掉指向同一目录的旧绑定。 */
+async function bindWorkingCopy(repoId, dir) {
+  for (const [id, value] of Object.entries(state.wcDirs)) {
+    if (value === dir && id !== repoId) delete state.wcDirs[id];
+  }
+  state.wcDirs[repoId] = dir;
+  if (state.selectedRepoId === repoId) state.wcDir = dir;
+  el('dir').value = dir;
+  renderRepoNav();
+  renderWcBar();
+  // 落盘失败不影响这次使用，只是下次要重新选目录——提示一句，不要拦流程。
+  const saved = await api.saveRepoDirs(state.wcDirs);
+  if (!saved || !saved.ok) {
+    banner('工作副本路径没能保存到本机设置，下次打开需要重新选择目录。', 'error');
+  }
+}
+
+async function pickCheckoutDir() {
+  const dir = unwrap(await api.pickDir(), '选择目录');
+  if (dir) el('dir').value = dir;
+}
+
+/**
+ * 更换目录：先问这个目录「本来是谁的工作副本」，再决定是绑定还是引导检出。
+ * 这一步是为了防「在 A 仓库的界面上改 B 仓库的文件」——目录里 wc.db 的 repoId 是唯一权威。
+ */
+async function pickWorkingCopy() {
+  const picked = unwrap(await api.pickDir(), '选择目录');
+  if (!picked) return;
+  const info = unwrap(await api.wcInfo(picked), '读取工作副本信息');
+  if (!info) {
+    el('dir').value = picked;
+    banner(`「${picked}」还不是工作副本，确认目录后点「检出」即可把当前仓库铺到这里。`);
+    el('dir').focus();
+    return;
+  }
+  const owner = state.repos.find((repo) => repo.repoId === info.repoId);
+  if (!owner) {
+    banner(`这个目录属于仓库 ${info.repoId}，但当前账号看不到它，无法在这里使用。`, 'error');
+    return;
+  }
+  await bindWorkingCopy(owner.repoId, picked);
+  if (owner.repoId !== state.selectedRepoId) {
+    banner(`这个目录是「${owner.name}」的工作副本，已切换到该仓库。`);
+    await selectRepo(owner.repoId);
+    return;
+  }
+  await guard('扫描工作副本', refreshStatus);
+  banner(`已绑定工作副本：${picked}（r${info.rev}）。`);
+}
+
+async function checkout() {
+  const repo = currentRepo();
+  if (!repo) {
+    banner('请先在左侧选择一个仓库', 'error');
+    return;
+  }
+  const dir = el('dir').value.trim();
+  if (!dir) {
+    banner('请填写检出目录', 'error');
+    return;
+  }
+  const result = unwrap(await api.checkout(repo.repoId, dir), '检出');
+  await bindWorkingCopy(repo.repoId, result.dir);
+  banner(`已把「${repo.name}」检出到 ${result.dir}（r${result.rev}，共 ${result.files} 个文件）。`);
+  await refreshStatus();
+  await loadLog();
+}
+
+/**
+ * 扫描工作副本。目录里记录的 repoId 与当前仓库不一致时，以目录为准切过去：
+ * 宁可换上下文，也不让「提交」把 A 仓库的改动推到 B 仓库。
+ */
+async function refreshStatus() {
+  const dir = state.wcDir;
+  if (!dir) {
+    banner('这个仓库还没有本地工作副本，请先检出', 'error');
+    return;
+  }
+  const data = unwrap(await api.status(dir), '扫描工作副本');
+  if (data.repoId && data.repoId !== state.selectedRepoId) {
+    const owner = state.repos.find((repo) => repo.repoId === data.repoId);
+    if (owner && owner.repoId !== state.selectedRepoId) {
+      await bindWorkingCopy(owner.repoId, dir);
+      banner(`「${dir}」属于仓库「${owner.name}」，已切换到该仓库。`);
+      await selectRepo(owner.repoId);
+      return;
+    }
+  }
+  state.wcRev = data.rev;
+  state.changes = data.entries;
+  state.conflicts = data.conflicts || [];
+  renderWcBar();
+  renderChanges();
+  closeConflict();
+  const diffs = unwrap(await api.diff(dir), '生成差异');
+  state.diff = diffs;
+  if (state.changes.length === 0) {
+    el('diff').textContent = '工作副本干净';
+    el('diff-path').textContent = '';
+  } else {
+    el('diff').textContent = '点击左侧变更查看差异';
+  }
+}
+
+function renderChanges() {
+  const list = el('changes');
+  list.innerHTML = '';
+  if (state.changes.length === 0 && state.conflicts.length === 0) {
+    list.innerHTML = '<li class="empty">没有变更</li>';
+    return;
+  }
+  const conflicted = new Set(state.conflicts.map((item) => item.path));
+  for (const change of state.changes) {
+    const li = document.createElement('li');
+    const marker =
+      change.kind === 'CONFLICT' || conflicted.has(change.path)
+        ? 'C'
+        : change.kind === 'ADD'
+          ? 'A'
+          : change.kind === 'MODIFY'
+            ? 'M'
+            : 'D';
+    li.innerHTML = `<span class="badge ${marker}"></span><span class="name"></span>`;
+    li.querySelector('.badge').textContent = marker;
+    li.querySelector('.name').textContent = change.path;
+    li.addEventListener('click', () => {
+      if (marker === 'C') {
+        void guard('读取冲突', () => showConflict(change.path, li));
+      } else {
+        showDiff(change.path, li);
+      }
+    });
+    list.appendChild(li);
+  }
+}
+
+// ---------------- 提交历史与容量 ----------------
+
+async function loadLog() {
+  const repo = currentRepo();
+  el('log-repo').textContent = repo ? repo.name : '';
+  const list = el('log');
+  if (!repo) {
+    list.innerHTML = '';
+    return;
+  }
+  const revisions = unwrap(await api.log(repo.repoId, 20), '加载历史');
+  list.innerHTML = '';
+  if (revisions.length === 0) {
+    list.innerHTML = '<li class="empty">还没有提交</li>';
+    return;
+  }
+  for (const revision of revisions) {
+    const li = document.createElement('li');
+    li.innerHTML = '<span class="rev"></span><span class="msg"></span>';
+    li.querySelector('.rev').textContent = `r${revision.rev}`;
+    li.querySelector('.msg').textContent = `${revision.message || '(无提交信息)'} — ${
+      revision.author
+    }`;
+    list.appendChild(li);
+  }
+}
+
+/** 容量是只读信息：跟着当前仓库走，不触发任何治理类调用。 */
+async function loadQuota() {
+  const repo = currentRepo();
   el('quota-repo').textContent = repo ? repo.name : '';
-  const quota = unwrap(await api.getQuota(repoId), '加载容量');
+  if (!repo) return;
+  const quota = unwrap(await api.getQuota(repo.repoId), '加载容量');
   renderQuota(quota);
 }
 
@@ -376,24 +650,19 @@ async function requestRepo() {
   el('request-repo').value = '';
   el('request-reason').value = '';
   banner(
-    `建库申请已提交（${result.requestId}）。通过后容量为 10 GiB，你会自动成为 owner，仓库会出现在列表里。`,
+    `建库申请已提交（${result.requestId}）。通过后容量为 10 GiB，你会自动成为 owner，仓库会出现在左侧列表里。`,
   );
 }
 
 /** 扩容申请同样不填容量：一次固定 +10 GiB，由管理员按磁盘余量批准。 */
 async function requestExpansion() {
-  if (!state.selectedRepoId) {
-    banner('请先选择一个仓库', 'error');
+  const repo = currentRepo();
+  if (!repo) {
+    banner('请先在左侧选择一个仓库', 'error');
     return;
   }
-  const repo = state.repos.find((item) => item.repoId === state.selectedRepoId);
-  const result = unwrap(
-    await api.requestRepoExpansion(state.selectedRepoId, ''),
-    '提交扩容申请',
-  );
-  banner(
-    `已提交 ${repo ? repo.name : ''} 的扩容申请（${result.requestId}）：通过后上限增加 10 GiB。`,
-  );
+  const result = unwrap(await api.requestRepoExpansion(repo.repoId, ''), '提交扩容申请');
+  banner(`已提交「${repo.name}」的扩容申请（${result.requestId}）：通过后上限增加 10 GiB。`);
 }
 
 // ---------------- 冲突三栏 ----------------
@@ -408,10 +677,7 @@ function highlight(node) {
 /** 打开一条冲突：三栏展示 base / mine / theirs，编辑框默认填 mine。 */
 async function showConflict(path, node) {
   highlight(node);
-  const detail = unwrap(
-    await api.conflictDetail(el('dir').value.trim(), path),
-    '读取冲突内容',
-  );
+  const detail = unwrap(await api.conflictDetail(state.wcDir, path), '读取冲突内容');
   state.conflict = { path, kind: detail.kind };
   el('diff-path').textContent = `${path}（${detail.kind} 冲突）`;
   el('diff').classList.add('hidden');
@@ -442,10 +708,9 @@ function closeConflict() {
  */
 async function resolveConflict(choice) {
   if (!state.conflict) return;
-  const dir = el('dir').value.trim();
   const { path } = state.conflict;
   const content = choice === 'custom' ? el('conflict-result').value : undefined;
-  unwrap(await api.resolveConflict(dir, path, choice, content), '解决冲突');
+  unwrap(await api.resolveConflict(state.wcDir, path, choice, content), '解决冲突');
   closeConflict();
   const labels = {
     mine: '已保留你的版本',
@@ -455,90 +720,6 @@ async function resolveConflict(choice) {
   };
   banner(`${path}：${labels[choice]}，冲突已清除。`);
   await refreshStatus();
-}
-
-// ---------------- 检出与工作副本 ----------------
-
-async function pickDir() {
-  const dir = unwrap(await api.pickDir(), '选择目录');
-  if (dir) el('dir').value = dir;
-}
-
-async function checkout() {
-  const dir = el('dir').value.trim();
-  if (!state.selectedRepoId) {
-    banner('先选择要检出的仓库', 'error');
-    return;
-  }
-  if (!dir) {
-    banner('请填写检出目录', 'error');
-    return;
-  }
-  const result = unwrap(
-    await api.checkout(state.selectedRepoId, dir),
-    '检出',
-  );
-  state.dir = result.dir;
-  state.cwd = result.dir;
-  el('wc-path').textContent = `${result.dir} @ r${result.rev}`;
-  banner(`已检出 r${result.rev}，共 ${result.files} 个文件。`);
-  await refreshStatus();
-  await loadLog();
-}
-
-async function refreshStatus() {
-  const dir = el('dir').value.trim();
-  if (!dir) {
-    banner('请先检出或填写工作副本目录', 'error');
-    return;
-  }
-  const data = unwrap(await api.status(dir), '扫描工作副本');
-  state.dir = dir;
-  state.changes = data.entries;
-  state.conflicts = data.conflicts || [];
-  state.cwd = dir;
-  el('wc-path').textContent =
-    `${dir} @ r${data.rev}` + (state.conflicts.length ? ` · ${state.conflicts.length} 个冲突` : '');
-  renderChanges();
-  closeConflict();
-  const diffs = unwrap(await api.diff(dir), '生成差异');
-  state.diff = diffs;
-  if (state.changes.length === 0) {
-    el('diff').textContent = '工作副本干净';
-    el('diff-path').textContent = '';
-  }
-}
-
-function renderChanges() {
-  const list = el('changes');
-  list.innerHTML = '';
-  if (state.changes.length === 0 && state.conflicts.length === 0) {
-    list.innerHTML = '<li class="empty">没有变更</li>';
-    return;
-  }
-  const conflicted = new Set(state.conflicts.map((item) => item.path));
-  for (const change of state.changes) {
-    const li = document.createElement('li');
-    const marker =
-      change.kind === 'CONFLICT' || conflicted.has(change.path)
-        ? 'C'
-        : change.kind === 'ADD'
-          ? 'A'
-          : change.kind === 'MODIFY'
-            ? 'M'
-            : 'D';
-    li.innerHTML = `<span class="badge ${marker}"></span><span class="name"></span>`;
-    li.querySelector('.badge').textContent = marker;
-    li.querySelector('.name').textContent = change.path;
-    li.addEventListener('click', () => {
-      if (marker === 'C') {
-        void guard('读取冲突', () => showConflict(change.path, li));
-      } else {
-        showDiff(change.path, li);
-      }
-    });
-    list.appendChild(li);
-  }
 }
 
 function showDiff(path, node) {
@@ -551,11 +732,17 @@ function showDiff(path, node) {
   el('diff').textContent = entry ? entry.text : '（无文本差异，可能是二进制文件或新增/删除）';
 }
 
+// ---------------- 提交 / 更新 / 还原 ----------------
+
 async function commit() {
-  const dir = el('dir').value.trim();
+  const dir = state.wcDir;
   const message = el('message').value.trim();
-  if (!dir || !message) {
-    banner('请填写工作副本目录与提交信息', 'error');
+  if (!dir) {
+    banner('请先检出工作副本', 'error');
+    return;
+  }
+  if (!message) {
+    banner('请填写提交信息', 'error');
     return;
   }
   const result = unwrap(await api.commit(dir, message), '提交');
@@ -564,15 +751,14 @@ async function commit() {
     `已提交 r${result.rev}：新增 ${result.added}，修改 ${result.modified}，删除 ${result.deleted}` +
       `（上传 ${result.pushed} 个对象，服务端已有内容不重复上传）`,
   );
-  await refreshStatus();
+  // 提交会推进仓库 HEAD：列表里的版本号与历史都要跟着刷新。
   await loadRepos();
-  await loadLog();
 }
 
 async function update() {
-  const dir = el('dir').value.trim();
+  const dir = state.wcDir;
   if (!dir) {
-    banner('请先检出或填写工作副本目录', 'error');
+    banner('请先检出工作副本', 'error');
     return;
   }
   const result = unwrap(await api.update(dir), '更新');
@@ -587,13 +773,13 @@ async function update() {
   }
   banner(`已更新到 r${result.rev}：${parts.join('，')}`);
   await refreshStatus();
-  await loadLog();
+  await loadRepos();
 }
 
 async function revertAll() {
-  const dir = el('dir').value.trim();
+  const dir = state.wcDir;
   if (!dir) {
-    banner('请先检出或填写工作副本目录', 'error');
+    banner('请先检出工作副本', 'error');
     return;
   }
   const restored = unwrap(await api.revert(dir, []), '还原');
@@ -605,37 +791,20 @@ async function disconnect() {
   unwrap(await api.disconnect(), '退出登录');
   state.repos = [];
   state.selectedRepoId = null;
+  state.wcDir = '';
   state.changes = [];
+  state.conflicts = [];
+  state.diff = [];
   state.sessionExpiresAt = 0;
   el('who').textContent = '';
   el('session-hint').textContent = '';
-  el('repos').innerHTML = '';
+  el('repo-nav').innerHTML = '';
   el('changes').innerHTML = '';
   el('log').innerHTML = '';
   el('wc-path').textContent = '';
+  el('checkout-card').classList.remove('hidden');
+  el('workbench').classList.add('hidden');
   showLogin('已退出登录。');
-}
-
-// ---------------- 历史 ----------------
-
-async function loadLog() {
-  if (!state.selectedRepoId) return;
-  const revisions = unwrap(await api.log(state.selectedRepoId, 20), '加载历史');
-  const list = el('log');
-  list.innerHTML = '';
-  if (revisions.length === 0) {
-    list.innerHTML = '<li class="empty">还没有提交</li>';
-    return;
-  }
-  for (const revision of revisions) {
-    const li = document.createElement('li');
-    li.innerHTML = '<span class="rev"></span><span class="msg"></span>';
-    li.querySelector('.rev').textContent = `r${revision.rev}`;
-    li.querySelector('.msg').textContent = `${revision.message || '(无提交信息)'} — ${
-      revision.author
-    }`;
-    list.appendChild(li);
-  }
 }
 
 // ---------------- 绑定 ----------------
@@ -660,6 +829,12 @@ el('reset-target').addEventListener('click', () =>
   void guard('恢复默认服务器地址', resetTargetSetting),
 );
 el('refresh-repos').addEventListener('click', () => void guard('刷新仓库', loadRepos));
+// 建库申请是「创建一个不存在的仓库」，与选中哪一个仓库无关，所以单独成页而不是塞在列表下面。
+el('nav-new-repo').addEventListener('click', () => setView('new'));
+el('empty-new-repo').addEventListener('click', () => setView('new'));
+el('back-from-new').addEventListener('click', () =>
+  setView(state.selectedRepoId ? 'repo' : 'empty'),
+);
 el('take-mine').addEventListener('click', () => void guard('保留我的', () => resolveConflict('mine')));
 el('take-theirs').addEventListener('click', () =>
   void guard('采用服务端', () => resolveConflict('theirs')),
@@ -673,7 +848,8 @@ el('delete-file').addEventListener('click', () =>
 el('do-request').addEventListener('click', () => void guard('提交建库申请', requestRepo));
 el('do-expand').addEventListener('click', () => void guard('提交扩容申请', requestExpansion));
 el('disconnect').addEventListener('click', () => void guard('退出登录', disconnect));
-el('pick-dir').addEventListener('click', () => void guard('选择目录', pickDir));
+el('pick-checkout-dir').addEventListener('click', () => void guard('选择目录', pickCheckoutDir));
+el('pick-dir').addEventListener('click', () => void guard('更换目录', pickWorkingCopy));
 el('checkout').addEventListener('click', () => void guard('检出', checkout));
 el('refresh-status').addEventListener('click', () => void guard('扫描', refreshStatus));
 el('update').addEventListener('click', () => void guard('更新', update));

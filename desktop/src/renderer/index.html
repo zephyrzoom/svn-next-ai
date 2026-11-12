@@ -88,131 +88,165 @@
       <div id="banner" class="banner hidden"></div>
 
       <div class="shell" id="shell">
+        <!-- 左侧只有一个入口：仓库列表。选中哪一个，右侧整个工作区就属于它 -->
         <nav class="nav" id="nav">
-          <div class="nav-title">导航</div>
-          <button class="nav-item active" data-view="workcopy">工作副本</button>
-          <button class="nav-item" data-view="repos">仓库</button>
+          <div class="nav-title">仓库</div>
+          <ul id="repo-nav" class="repo-nav"></ul>
+          <button id="nav-new-repo" class="nav-add" type="button">＋ 申请新建仓库</button>
           <div class="nav-foot">
-            桌面端用于日常仓库使用。<br />管理与审批请访问服务端 Web 管理端。
+            选中仓库后，右侧是它的工作副本、提交历史与容量。<br />管理与审批请访问服务端 Web 管理端。
           </div>
         </nav>
 
         <main class="content" id="content">
-          <!-- 视图：工作副本 -->
-          <section class="view" id="view-workcopy" data-view="workcopy">
-            <div class="view-head">
-              <h1>工作副本</h1>
-              <span id="wc-path" class="muted"></span>
-            </div>
-
-            <div class="card">
-              <div class="card-head"><h2>检出与更新</h2></div>
-              <div class="row">
-                <input id="dir" placeholder="检出目录（绝对路径）" spellcheck="false" />
-                <button id="pick-dir" class="ghost">选择…</button>
-                <button id="checkout" class="primary">检出</button>
-                <button id="update">更新</button>
-              </div>
-              <p class="hint">先在「仓库」里选中一个仓库，再填写本地目录执行检出。</p>
-            </div>
-
-            <div class="split">
-              <div class="card col">
-                <div class="card-head">
-                  <h2>变更</h2>
-                  <button id="revert" class="ghost" title="丢弃所有本地改动">全部还原</button>
-                  <button id="refresh-status" class="ghost">重新扫描</button>
-                </div>
-                <ul id="changes" class="list changes"></ul>
-
-                <div class="card-head"><h2>提交</h2></div>
-                <textarea id="message" rows="2" placeholder="提交信息"></textarea>
-                <button id="commit" class="primary">提交</button>
-              </div>
-
-              <div class="card col">
-                <div class="card-head">
-                  <h2>差异</h2>
-                  <span id="diff-path" class="muted"></span>
-                </div>
-                <pre id="diff" class="diff">点击左侧变更查看差异</pre>
-
-                <div id="conflict-editor" class="conflict hidden">
-                  <div class="conflict-grid">
-                    <div>
-                      <h4>基线（base）</h4>
-                      <pre id="conflict-base" class="diff small"></pre>
-                    </div>
-                    <div>
-                      <h4>我的（mine）</h4>
-                      <pre id="conflict-mine" class="diff small"></pre>
-                    </div>
-                    <div>
-                      <h4>服务端（theirs）</h4>
-                      <pre id="conflict-theirs" class="diff small"></pre>
-                    </div>
-                  </div>
-                  <textarea id="conflict-result" rows="6" placeholder="在这里写合并结果（默认填我的内容）"></textarea>
-                  <div class="row">
-                    <button id="take-mine" class="ghost">保留我的</button>
-                    <button id="take-theirs" class="ghost">采用服务端</button>
-                    <button id="save-merge" class="primary">保存合并结果</button>
-                    <button id="delete-file" class="ghost">删除文件</button>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div class="card">
-              <div class="card-head">
-                <h2>提交历史</h2>
-                <button id="refresh-log" class="ghost">刷新</button>
-              </div>
-              <ul id="log" class="list log"></ul>
-            </div>
+          <!-- 一个仓库都没有：先引导建库申请 -->
+          <section class="view hidden" id="view-empty" data-view="empty">
+            <div class="view-head"><h1>还没有可用仓库</h1></div>
+            <p class="view-sub">
+              建库申请通过后，仓库会自动出现在左侧列表里，选中即可检出到本地。
+            </p>
+            <button id="empty-new-repo" class="primary">申请新建仓库</button>
           </section>
 
-          <!-- 视图：仓库 -->
-          <section class="view hidden" id="view-repos" data-view="repos">
-            <div class="view-head">
-              <h1>仓库</h1>
-              <p class="view-sub">查看可用仓库与容量，并提交建库申请。</p>
+          <!-- 仓库工作区：顶部固定仓库上下文，下面的 tab 都是这个仓库的 -->
+          <section class="view hidden" id="view-repo" data-view="repo">
+            <header class="repo-head">
+              <div class="repo-line">
+                <span class="eyebrow">仓库</span>
+                <h1 id="repo-title">—</h1>
+                <span id="repo-rev" class="pill">HEAD r0</span>
+                <button id="refresh-repos" class="ghost">刷新</button>
+              </div>
+              <!-- 工作副本上下文条：随时看得到「当前在哪个仓库、本地目录在哪」 -->
+              <div class="wc-bar">
+                <span id="wc-dot" class="wc-dot"></span>
+                <span class="wc-title">工作副本</span>
+                <span id="wc-path" class="wc-path">未检出到本地</span>
+                <span id="wc-status" class="muted"></span>
+                <span class="wc-actions">
+                  <button id="pick-dir" class="ghost">更换目录…</button>
+                  <button id="refresh-status" class="ghost">重新扫描</button>
+                  <button id="update">更新</button>
+                </span>
+              </div>
+            </header>
+
+            <div class="tabs" role="tablist" aria-label="仓库视图">
+              <button class="tab active" data-tab="wc" role="tab" aria-selected="true" type="button">工作副本</button>
+              <button class="tab" data-tab="history" role="tab" aria-selected="false" type="button">提交历史</button>
+              <button class="tab" data-tab="quota" role="tab" aria-selected="false" type="button">容量</button>
             </div>
 
-            <div class="split">
-              <div class="card col">
+            <!-- tab：工作副本 -->
+            <section class="pane" id="pane-wc" data-tab="wc">
+              <div class="card" id="checkout-card">
                 <div class="card-head">
-                  <h2>可用仓库</h2>
-                  <button id="refresh-repos" class="ghost">刷新</button>
+                  <h2>检出到本地</h2>
+                  <span class="muted">这个仓库还没有本地工作副本</span>
                 </div>
-                <ul id="repos" class="list"></ul>
+                <div class="row">
+                  <input id="dir" placeholder="本地目录（绝对路径）" spellcheck="false" />
+                  <button id="pick-checkout-dir" class="ghost">选择…</button>
+                  <button id="checkout" class="primary">检出</button>
+                </div>
+                <p class="hint">
+                  检出后，变更、提交、更新都只作用于这个目录；路径按仓库记住，下次打开会自动带上。
+                </p>
               </div>
 
-              <div class="card col">
+              <div class="split" id="workbench">
+                <div class="card col">
+                  <div class="card-head">
+                    <h2>变更</h2>
+                    <span id="wc-change-count" class="muted"></span>
+                    <button id="revert" class="ghost" title="丢弃所有本地改动">全部还原</button>
+                  </div>
+                  <ul id="changes" class="list changes"></ul>
+
+                  <div class="card-head"><h2>提交</h2></div>
+                  <textarea id="message" rows="2" placeholder="提交信息"></textarea>
+                  <button id="commit" class="primary">提交</button>
+                </div>
+
+                <div class="card col">
+                  <div class="card-head">
+                    <h2>差异</h2>
+                    <span id="diff-path" class="muted"></span>
+                  </div>
+                  <pre id="diff" class="diff">点击左侧变更查看差异</pre>
+
+                  <div id="conflict-editor" class="conflict hidden">
+                    <div class="conflict-grid">
+                      <div>
+                        <h4>基线（base）</h4>
+                        <pre id="conflict-base" class="diff small"></pre>
+                      </div>
+                      <div>
+                        <h4>我的（mine）</h4>
+                        <pre id="conflict-mine" class="diff small"></pre>
+                      </div>
+                      <div>
+                        <h4>服务端（theirs）</h4>
+                        <pre id="conflict-theirs" class="diff small"></pre>
+                      </div>
+                    </div>
+                    <textarea id="conflict-result" rows="6" placeholder="在这里写合并结果（默认填我的内容）"></textarea>
+                    <div class="row">
+                      <button id="take-mine" class="ghost">保留我的</button>
+                      <button id="take-theirs" class="ghost">采用服务端</button>
+                      <button id="save-merge" class="primary">保存合并结果</button>
+                      <button id="delete-file" class="ghost">删除文件</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <!-- tab：提交历史 -->
+            <section class="pane hidden" id="pane-history" data-tab="history">
+              <div class="card">
+                <div class="card-head">
+                  <h2>提交历史</h2>
+                  <span id="log-repo" class="muted"></span>
+                  <button id="refresh-log" class="ghost">刷新</button>
+                </div>
+                <ul id="log" class="list log"></ul>
+              </div>
+            </section>
+
+            <!-- tab：容量 -->
+            <section class="pane hidden" id="pane-quota" data-tab="quota">
+              <div class="card narrow">
                 <div class="card-head">
                   <h2>容量</h2>
                   <span id="quota-repo" class="muted"></span>
+                  <button id="do-expand" class="ghost">申请扩容 +10 GiB</button>
                 </div>
                 <div class="quota">
                   <div class="bar"><div id="quota-fill"></div></div>
-                  <div class="meta" id="quota-text">选择仓库后加载</div>
+                  <div class="meta" id="quota-text">加载中…</div>
                 </div>
-                <div class="stack">
-                  <button id="do-expand" class="ghost">申请扩容 +10 GiB</button>
-                </div>
-                <p class="hint">扩容同时也是「只填申请」：一次申请固定加 10 GiB，由管理员结合服务器磁盘余量审批。</p>
-
-                <div class="card-head"><h2>申请建库</h2></div>
-                <div class="stack" id="repo-request-row">
-                  <input id="request-repo" placeholder="仓库名（小写字母/数字/-）" spellcheck="false" />
-                  <input id="request-reason" placeholder="用途说明（审批时会看）" spellcheck="false" />
-                  <button id="do-request" class="primary">提交建库申请</button>
-                </div>
-                <p class="hint">建库申请不用填容量：通过即为 10 GiB，审批人只决定同意或拒绝。</p>
+                <p class="hint">扩容也是「只填申请」：一次固定加 10 GiB，由管理员结合服务器磁盘余量审批。</p>
               </div>
-            </div>
+            </section>
           </section>
 
+          <!-- 建库申请：任何状态下都能进，不占用仓库列表 -->
+          <section class="view hidden" id="view-new" data-view="new">
+            <div class="view-head">
+              <h1>申请新建仓库</h1>
+              <button id="back-from-new" class="ghost" type="button">返回</button>
+            </div>
+            <p class="view-sub">提交后等待管理员审批；通过时你会成为该仓库的 owner，容量 10 GiB。</p>
+            <div class="card narrow">
+              <div class="stack">
+                <input id="request-repo" placeholder="仓库名（小写字母/数字/-）" spellcheck="false" />
+                <input id="request-reason" placeholder="用途说明（审批时会看）" spellcheck="false" />
+                <button id="do-request" class="primary">提交建库申请</button>
+              </div>
+              <p class="hint">建库申请不用填容量：通过即为 10 GiB，审批人只决定同意或拒绝。</p>
+            </div>
+          </section>
         </main>
       </div>
     </div>

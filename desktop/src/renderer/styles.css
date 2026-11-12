@@ -353,13 +353,14 @@ button.ghost {
 }
 
 .nav {
-  flex: 0 0 190px;
+  flex: 0 0 216px;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 4px;
   padding: 16px 10px;
   background: var(--nav);
   border-right: 1px solid var(--line);
+  min-height: 0;
 }
 
 .nav-title {
@@ -370,27 +371,89 @@ button.ghost {
   padding: 0 10px 8px;
 }
 
-.nav-item {
-  text-align: left;
-  width: 100%;
-  border: 1px solid transparent;
-  background: transparent;
-  padding: 9px 12px;
-  border-radius: 8px;
-  color: var(--ink);
-  font-size: 13px;
+/* 左侧就是仓库列表：选中态 = 右侧整个工作区属于它 */
+.repo-nav {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow: auto;
+  min-height: 0;
 }
 
-.nav-item:hover {
+.repo-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--ink);
+}
+
+.repo-item:hover {
   background: #eae7dd;
 }
 
-.nav-item.active {
+.repo-item.active {
   background: var(--panel);
   border-color: var(--line);
   color: var(--accent);
   font-weight: 600;
   box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.repo-item .repo-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repo-item .repo-rev {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* 有本地工作副本的仓库点一个小圆点：一眼看出哪些仓库在本地有目录 */
+.repo-item .repo-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: transparent;
+  flex: 0 0 auto;
+}
+
+.repo-item .repo-dot.on {
+  background: var(--accent);
+}
+
+.repo-empty {
+  padding: 6px 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.nav-add {
+  text-align: left;
+  width: 100%;
+  border: 1px dashed var(--line);
+  background: transparent;
+  padding: 8px 10px;
+  border-radius: 8px;
+  color: var(--accent);
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+
+.nav-add:hover {
+  background: var(--panel);
+  border-style: solid;
 }
 
 .nav-foot {
@@ -436,6 +499,158 @@ button.ghost {
   margin-left: auto;
 }
 
+/* 视图头里的「返回」之类动作靠右 */
+.view-head > :last-child:not(h1) {
+  margin-left: auto;
+}
+
+/* ---------- 仓库上下文（吸顶） ---------- */
+/* 工作副本、历史、容量都在这个上下文之下，滚动多远都看得见自己在哪个仓库。 */
+.repo-head {
+  position: sticky;
+  top: -18px; /* 抵消 .content 的 padding-top，贴住滚动容器顶部 */
+  z-index: 5;
+  margin: 0 -22px 14px;
+  padding: 12px 22px 10px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+
+.repo-line {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.repo-line h1 {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repo-line button {
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+
+.eyebrow {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.pill {
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--accent);
+  background: #eef4ef;
+  border: 1px solid #dbe6de;
+  border-radius: 999px;
+  padding: 1px 8px;
+  flex: 0 0 auto;
+}
+
+.wc-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 6px 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-width: 0;
+}
+
+.wc-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #d6d3c8;
+  flex: 0 0 auto;
+}
+
+.wc-dot.on {
+  background: var(--accent);
+}
+
+.wc-title {
+  font-size: 12px;
+  color: var(--muted);
+  flex: 0 0 auto;
+}
+
+.wc-path {
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.wc-bar #wc-status {
+  flex: 0 0 auto;
+}
+
+.wc-bar #wc-status.warn {
+  color: var(--delete);
+}
+
+.wc-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button:disabled:hover {
+  background: #fff;
+}
+
+button.ghost:disabled:hover {
+  background: transparent;
+}
+
+/* ---------- 仓库工作区 tab ---------- */
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin: 0 0 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.tab {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 7px 12px;
+  margin-bottom: -1px;
+}
+
+.tab:hover {
+  background: transparent;
+  color: var(--ink);
+}
+
+.tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
 /* ---------- 卡片 ---------- */
 .card {
   background: var(--panel);
@@ -458,9 +673,29 @@ button.ghost {
   margin: 0;
 }
 
-.card-head button,
-.card-head .muted {
+/* 卡片头里只有最后一个非标题元素靠右，其余紧跟标题——避免两个 auto 边距把中间文本推到半空 */
+.card-head > :last-child:not(h2) {
   margin-left: auto;
+}
+
+.card-head button + button {
+  margin-left: 0;
+}
+
+/* 同一张卡里的第二段（如「变更」下面的「提交」）用一条细线隔开，避免挤成一坨 */
+.card-head:not(:first-child) {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+/* 单栏信息卡不必铺满整个工作区宽度，读起来更集中 */
+.card.narrow {
+  max-width: 640px;
+}
+
+#empty-new-repo {
+  margin-top: 10px;
 }
 
 .card-head button + button {

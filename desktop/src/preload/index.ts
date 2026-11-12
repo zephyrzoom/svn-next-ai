@@ -71,6 +71,14 @@ export interface StatusEntryDto {
   kind: 'ADD' | 'MODIFY' | 'DELETE';
 }
 
+export interface WorkingCopyInfoDto {
+  repoId: string;
+  /** 工作副本整体记录的版本。 */
+  rev: number;
+  /** 最旧的条目基线版本（混合版本下 update 用）。 */
+  oldestRev: number;
+}
+
 export interface DiffEntryDto {
   path: string;
   text: string;
@@ -144,6 +152,11 @@ export interface VcsApi {
   setTarget(target: string): Promise<Envelope<null>>;
   listRepos(): Promise<Envelope<RepoDto[]>>;
   pickDir(): Promise<Envelope<string | null>>;
+  /** 目录是哪个仓库的工作副本；不是工作副本（还没有 wc.db）时返回 null。 */
+  wcInfo(dir: string): Promise<Envelope<WorkingCopyInfoDto | null>>;
+  /** 仓库 → 本地工作副本目录的绑定（存在 userData/settings.json）。 */
+  loadRepoDirs(): Promise<Envelope<Record<string, string>>>;
+  saveRepoDirs(dirs: Record<string, string>): Promise<Envelope<null>>;
   checkout(
     repoId: string,
     dir: string,
@@ -209,6 +222,9 @@ const api: VcsApi = {
   setTarget: (target) => ipcRenderer.invoke('vcs:setTarget', target),
   listRepos: () => ipcRenderer.invoke('vcs:listRepos'),
   pickDir: () => ipcRenderer.invoke('vcs:pickDir'),
+  wcInfo: (dir) => ipcRenderer.invoke('vcs:wcInfo', dir),
+  loadRepoDirs: () => ipcRenderer.invoke('vcs:repoDirs'),
+  saveRepoDirs: (dirs) => ipcRenderer.invoke('vcs:saveRepoDirs', dirs),
   checkout: (repoId, dir, rev) => ipcRenderer.invoke('vcs:checkout', repoId, dir, rev),
   status: (dir) => ipcRenderer.invoke('vcs:status', dir),
   diff: (dir) => ipcRenderer.invoke('vcs:diff', dir),

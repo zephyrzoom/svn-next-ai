@@ -3,7 +3,15 @@ import * as path from 'node:path';
 
 import { VcsError, VcsClient, type UserInfo } from './client';
 import { checkoutRepo, commitWorkingCopy, revertWorkingCopy, updateWorkingCopy } from './flow';
-import { clearToken, loadPrefs, loadToken, saveLogin, saveTarget } from './settings';
+import {
+  clearToken,
+  loadPrefs,
+  loadRepoDirs,
+  loadToken,
+  saveLogin,
+  saveRepoDirs,
+  saveTarget,
+} from './settings';
 import * as wc from './wc';
 import type { ConflictChoice } from './wc';
 
@@ -182,6 +190,30 @@ ipcMain.handle('vcs:pickDir', () =>
       properties: ['openDirectory', 'createDirectory'],
     });
     return result.canceled ? null : result.filePaths[0];
+  }),
+);
+
+/**
+ * 目录属于哪个仓库。**不是工作副本时返回 null**，让界面能平静地引导「检出到这里」，
+ * 而不是先弹一条「wc.db 不存在」的错误。
+ */
+ipcMain.handle('vcs:wcInfo', (_event, dir: string) =>
+  wrap(async () => {
+    try {
+      return wc.openInfo(dir);
+    } catch {
+      return null;
+    }
+  }),
+);
+
+/** 仓库 → 本地工作副本目录的绑定，重启后仍能对上「哪个仓库在本地有目录」。 */
+ipcMain.handle('vcs:repoDirs', () => wrap(async () => loadRepoDirs()));
+
+ipcMain.handle('vcs:saveRepoDirs', (_event, dirs: Record<string, string>) =>
+  wrap<null>(async () => {
+    saveRepoDirs(dirs);
+    return null;
   }),
 );
 
