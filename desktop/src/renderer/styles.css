@@ -53,7 +53,7 @@ body {
   justify-content: flex-end;
 }
 
-#target {
+#server-target {
   width: 100%;
 }
 
@@ -101,11 +101,72 @@ body {
   margin: 0 0 18px;
 }
 
-.field-label {
-  display: block;
-  margin-bottom: 5px;
+.auth-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.auth-server {
+  margin: 0;
   color: var(--muted);
   font-size: 12px;
+}
+
+.auth-server span {
+  color: var(--ink);
+}
+
+.auth-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 18px 0 4px;
+  padding: 3px;
+  background: var(--nav);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+
+.auth-tab {
+  flex: 1 1 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 7px 10px;
+  border-radius: 7px;
+}
+
+.auth-tab:hover {
+  background: #eae7dd;
+}
+
+.auth-tab.active {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.server-settings {
+  margin-top: 12px;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+
+.server-settings label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.server-settings .row {
+  margin-top: 10px;
 }
 
 .auth-form {

@@ -5,7 +5,9 @@
  * 每个调用都返回统一信封 `{ok, data} | {ok:false, code, message}`，业务错误直接展示
  * `message`；已登录状态下遇到认证类错误（11/12/19/20）自动退回登录页。
  *
- * 界面分两层：启动先显示「登录页」（登录 / 注册），成功后才切到「主界面」。
+ * 界面分两层：启动先显示「登录页」（本地账号 / LDAP 账号两个 tab、注册入口、
+ * 服务器地址「设置」），成功后才切到「主界面」。默认服务器地址由打包配置
+ * （config.js）注入，用户在设置里改的地址覆盖它并持久化。
  * 勾选 30 天免登录时，主进程用系统加密存储保存凭证，启动时 tryResume 直接恢复会话。
  *
  * 管理与审批（成员、配额、空间治理、目录配置、审批台）由服务端 Web 管理端承载，
@@ -17,7 +19,13 @@ const AUTH_CODES = new Set([11, 12, 19, 20]);
 
 const state = {
   user: null,
+  /** 打包时注入的默认地址；登录页不显示地址输入框。 */
+  defaultTarget: '127.0.0.1:50051',
+  /** 用户在「设置」里保存的覆盖值，空串表示用默认地址。 */
   target: '',
+  /** 当前选中的账号类型 tab：LOCAL / LDAP，登录时按它选身份来源。 */
+  source: 'LOCAL',
+  authMode: 'login',
   sessionExpiresAt: 0,
   canPersistToken: true,
   conflicts: [],
@@ -111,6 +119,72 @@ for (const item of document.querySelectorAll('.nav-item')) {
 
 // ---------------- 登录页 / 主界面切换 ----------------
 
+/** config.js 缺失时的兜底（例如直接打开源码目录里的 html）。 */
+const FALLBACK_TARGET = '127.0.0.1:50051';
+
+function effectiveTarget() {
+  return state.target || state.defaultTarget || FALLBACK_TARGET;
+}
+
+function isCustomTarget() {
+  return Boolean(state.target && state.target !== state.defaultTarget);
+}
+
+function renderTarget() {
+  el('current-target').textContent =
+    `${effectiveTarget()}${isCustomTarget() ? '（自定义）' : '（默认）'}`;
+}
+
+/** 「设置」面板：只在用户点开时暴露地址，默认地址来自打包配置。 */
+function openSettings() {
+  el('server-target').value = effectiveTarget();
+  el('target-note').textContent =
+    `默认地址：${state.defaultTarget}（打包时由 build-config.json 配置）`;
+  el('server-settings').classList.remove('hidden');
+  authMessage('');
+  el('server-target').focus();
+}
+
+function closeSettings() {
+  el('server-settings').classList.add('hidden');
+}
+
+async function saveTargetSetting() {
+  const value = el('server-target').value.trim();
+  if (!/^[A-Za-z0-9._:-]+:\d{1,5}$/.test(value)) {
+    authMessage('服务器地址格式应为 host:port，例如 127.0.0.1:50051', 'error');
+    return;
+  }
+  // 填回默认地址就等于「没有覆盖」，本机不再存这个值。
+  const override = value === state.defaultTarget ? '' : value;
+  if (override !== state.target) {
+    unwrap(await api.setTarget(override), '保存服务器地址');
+    state.target = override;
+  }
+  closeSettings();
+  renderTarget();
+  authMessage(override ? `服务器地址已改为 ${value}。` : '已恢复为打包默认地址。');
+}
+
+async function resetTargetSetting() {
+  if (state.target) unwrap(await api.setTarget(''), '恢复默认服务器地址');
+  state.target = '';
+  closeSettings();
+  renderTarget();
+  authMessage(`已恢复默认服务器地址 ${state.defaultTarget}。`);
+}
+
+/** 账号类型 tab：切到哪个就按哪种身份登录；LDAP 不需要注册。 */
+function setSource(source) {
+  state.source = source === 'LDAP' ? 'LDAP' : 'LOCAL';
+  for (const tab of document.querySelectorAll('.auth-tab')) {
+    const active = tab.dataset.source === state.source;
+    tab.classList.toggle('active', active);
+    tab.setAttribute('aria-selected', String(active));
+  }
+  setAuthMode(state.source === 'LDAP' ? 'login' : state.authMode);
+}
+
 function formatDate(seconds) {
   const date = new Date(seconds * 1000);
   const pad = (value) => String(value).padStart(2, '0');
@@ -126,18 +200,23 @@ function sessionText(expiresAt) {
 
 /** 登录页里「登录 / 申请注册」两个表单的切换，纯界面操作。 */
 function setAuthMode(mode) {
+  state.authMode = mode;
   const register = mode === 'register';
   el('login-form').classList.toggle('hidden', register);
   el('register-form').classList.toggle('hidden', !register);
-  el('show-register').classList.toggle('hidden', register);
+  el('show-register').classList.toggle('hidden', register || state.source !== 'LOCAL');
   el('show-login').classList.toggle('hidden', !register);
   el('auth-title').textContent = register ? '申请注册' : '登录';
   el('auth-sub').textContent = register
     ? '填写用户名、姓名与密码，提交后等待管理员审批。'
-    : '连接服务端后使用仓库。';
+    : state.source === 'LDAP'
+      ? '使用 LDAP 账号密码登录，无需注册。'
+      : '使用本地账号登录。';
   const note = register
     ? '密码在注册时设置，审批通过后直接可用，不需要激活链接。'
-    : '注册时自己设置密码；管理员审批通过后即可用它登录。';
+    : state.source === 'LDAP'
+      ? 'LDAP 账号由目录服务管理，密码不在本机保存；需要账号请联系管理员。'
+      : '注册时自己设置密码；管理员审批通过后即可用它登录。';
   el('auth-note').textContent = state.canPersistToken
     ? note
     : '当前系统不支持加密存储凭证，关闭应用后需要重新登录。';
@@ -150,6 +229,8 @@ function showLogin(message = '') {
   el('app-shell').classList.add('hidden');
   el('auth-screen').classList.remove('hidden');
   clearBanner();
+  closeSettings();
+  renderTarget();
   setAuthMode('login');
   el('password').value = '';
   if (message) authMessage(message);
@@ -165,17 +246,16 @@ function showApp() {
 // ---------------- 登录、注册与会话 ----------------
 
 async function connect() {
-  const target = el('target').value.trim();
+  const target = effectiveTarget();
   const username = el('username').value.trim();
   const password = el('password').value;
   const rememberMe = el('remember').checked;
-  if (!target || !username || !password) {
-    authMessage('请填写服务端地址、用户名与密码', 'error');
+  if (!username || !password) {
+    authMessage('请填写用户名与密码', 'error');
     return;
   }
-  const source = el('auth-source').value === 'LDAP' ? 'LDAP' : 'LOCAL';
   const session = unwrap(
-    await api.connect(target, username, password, source, rememberMe),
+    await api.connect(target, username, password, state.source, rememberMe),
     '登录',
   );
   el('password').value = '';
@@ -187,13 +267,14 @@ async function connect() {
 async function applySession(session, { target = '', resumed = false } = {}) {
   const { user, expiresAt } = session;
   state.user = user;
-  state.target = target || state.target || el('target').value.trim();
+  const usedTarget = target || effectiveTarget();
+  state.target = usedTarget;
   state.sessionExpiresAt = Number(expiresAt || 0);
   el('who').textContent = `${user.displayName || user.username} · ${roleLabel(user.role)}`;
-  el('server-label').textContent = state.target;
+  el('server-label').textContent = usedTarget;
   el('account-name').textContent = `${user.displayName || user.username}（${user.username}）`;
   el('account-role').textContent = roleLabel(user.role);
-  el('account-target').textContent = state.target;
+  el('account-target').textContent = usedTarget;
   el('session-until').textContent = sessionText(state.sessionExpiresAt);
   el('session-hint').textContent = state.sessionExpiresAt > 0
     ? `免登录至 ${formatDate(state.sessionExpiresAt)}`
@@ -209,13 +290,13 @@ function roleLabel(role) {
 }
 
 async function doRegister() {
-  const target = el('target').value.trim();
+  const target = effectiveTarget();
   const username = el('reg-username').value.trim();
   const displayName = el('reg-name').value.trim();
   const password = el('reg-password').value;
   const reason = el('reg-reason').value.trim();
-  if (!target || !username || !displayName || !password) {
-    authMessage('请填写服务端地址、用户名、姓名与密码', 'error');
+  if (!username || !displayName || !password) {
+    authMessage('请填写用户名、姓名与密码', 'error');
     return;
   }
   const result = unwrap(
@@ -578,6 +659,15 @@ el('register-form').addEventListener('submit', (event) => {
 });
 el('show-register').addEventListener('click', () => setAuthMode('register'));
 el('show-login').addEventListener('click', () => setAuthMode('login'));
+for (const tab of document.querySelectorAll('.auth-tab')) {
+  tab.addEventListener('click', () => setSource(tab.dataset.source));
+}
+el('open-settings').addEventListener('click', openSettings);
+el('close-settings').addEventListener('click', closeSettings);
+el('save-target').addEventListener('click', () => void guard('保存服务器地址', saveTargetSetting));
+el('reset-target').addEventListener('click', () =>
+  void guard('恢复默认服务器地址', resetTargetSetting),
+);
 el('refresh-repos').addEventListener('click', () => void guard('刷新仓库', loadRepos));
 el('take-mine').addEventListener('click', () => void guard('保留我的', () => resolveConflict('mine')));
 el('take-theirs').addEventListener('click', () =>
@@ -608,10 +698,12 @@ el('refresh-log').addEventListener('click', () => void guard('刷新历史', loa
 async function bootstrap() {
   clearBanner();
   authMessage('');
+  // 默认地址由 npm run build 生成的 config.js 注入（打包时配置）。
+  state.defaultTarget = window.vcsConfig?.defaultTarget || FALLBACK_TARGET;
   const prefs = await api.loadPrefs();
   const saved = prefs.ok ? prefs.data : null;
   if (saved) {
-    if (saved.target) el('target').value = saved.target;
+    if (saved.target) state.target = saved.target;
     if (saved.username) el('username').value = saved.username;
     state.canPersistToken = saved.canPersistToken;
     if (!saved.canPersistToken) {
@@ -621,9 +713,11 @@ async function bootstrap() {
         '当前系统不支持加密存储凭证，重启后需要重新登录（连接信息仍会保留）。';
     }
   }
-  const resumed = await api.tryResume();
+  renderTarget();
+  setSource('LOCAL');
+  const resumed = await api.tryResume(effectiveTarget());
   if (resumed.ok && resumed.data) {
-    await applySession(resumed.data, { target: saved?.target ?? '', resumed: true });
+    await applySession(resumed.data, { target: effectiveTarget(), resumed: true });
     return;
   }
   showLogin(

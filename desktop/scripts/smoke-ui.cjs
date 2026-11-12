@@ -139,11 +139,18 @@ function verify({ app, BrowserWindow, ipcMain }) {
           css: getComputedStyle(document.body).backgroundColor,
           apiType: typeof window.vcs,
           apiKeys: window.vcs ? Object.keys(window.vcs).length : 0,
-          target: document.getElementById('target') && document.getElementById('target').value,
+          currentTarget: document.getElementById('current-target').textContent,
+          defaultTarget: window.vcsConfig && window.vcsConfig.defaultTarget,
           domIds: document.querySelectorAll('[id]').length,
           loginVisible: !document.getElementById('auth-screen').classList.contains('hidden'),
           appHidden: document.getElementById('app-shell').classList.contains('hidden'),
           rememberChecked: document.getElementById('remember').checked,
+          hasTargetInput: Boolean(document.getElementById('target')),
+          settingsHidden: document.getElementById('server-settings').classList.contains('hidden'),
+          hasSettingsButton: Boolean(document.getElementById('open-settings')),
+          localTabActive: document.getElementById('tab-local').classList.contains('active'),
+          ldapLabel: document.getElementById('tab-ldap').textContent.trim(),
+          hasSourceSelect: Boolean(document.getElementById('auth-source')),
         }))()`);
       } catch (err) {
         problems.push(`页面求值失败：${err && err.message}`);
@@ -151,7 +158,43 @@ function verify({ app, BrowserWindow, ipcMain }) {
         return;
       }
 
-      // target 被 stub 的 PREFS 改写，说明 app.js 真的执行了 bootstrap，
+      // 真点一遍：tab 切换要改登录身份与注册入口，设置面板要能覆盖并恢复默认地址。
+      // IPC 已被 stub，所以这里的 click 不会连服务端，只验证界面逻辑与桥接链路。
+      let interaction;
+      try {
+        interaction = await win.webContents.executeJavaScript(`(async () => {
+          const tabLdap = document.getElementById('tab-ldap');
+          tabLdap.click();
+          const ldap = {
+            active: tabLdap.classList.contains('active'),
+            registerHidden: document.getElementById('show-register').classList.contains('hidden'),
+            subtitle: document.getElementById('auth-sub').textContent,
+          };
+          document.getElementById('tab-local').click();
+          const local = {
+            active: document.getElementById('tab-local').classList.contains('active'),
+            registerVisible: !document.getElementById('show-register').classList.contains('hidden'),
+          };
+          document.getElementById('open-settings').click();
+          const opened = !document.getElementById('server-settings').classList.contains('hidden');
+          const prefilled = document.getElementById('server-target').value;
+          document.getElementById('server-target').value = '10.0.0.2:50051';
+          document.getElementById('save-target').click();
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          const custom = document.getElementById('current-target').textContent;
+          document.getElementById('open-settings').click();
+          document.getElementById('reset-target').click();
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          const reset = document.getElementById('current-target').textContent;
+          return { ldap, local, opened, prefilled, custom, reset };
+        })()`);
+      } catch (err) {
+        problems.push(`交互求值失败：${err && err.message}`);
+        finish({ pass: false });
+        return;
+      }
+
+      // 登录页的当前地址被 stub 的 PREFS 改写，说明 app.js 真的执行了 bootstrap，
       // 且 invoke → ipcMain → preload → contextBridge 整条链路是通的。
       const checks = {
         页面标题: info.title === 'svn-next',
@@ -159,15 +202,33 @@ function verify({ app, BrowserWindow, ipcMain }) {
         页面结构: info.brand === 'svn-next' && info.domIds > 25,
         样式已加载: /^rgb\(/.test(info.css),
         preload_桥接: info.apiType === 'object' && info.apiKeys > 20,
-        渲染脚本已启动: info.target === PREFS.target,
-        // 启动时必须先看到登录页；只有有效的 30 天会话才直接进主界面。
+        // PREFS 里保存的是「设置」覆盖值，bootstrap 应把它显示在服务器一行。
+        渲染脚本已启动: info.currentTarget.includes(PREFS.target) && info.currentTarget.includes('自定义'),
+        // 启动契约静态检查之外，这里再确认打包注入的默认地址真的到了渲染层。
+        默认地址已注入: /^[A-Za-z0-9._:-]+:\d{1,5}$/.test(info.defaultTarget || ''),
+        // 登录页不该有地址输入框；改地址只能从「设置」进。
         登录页默认可见: info.loginVisible === true && info.appHidden === true,
         免登录默认勾选: info.rememberChecked === true,
+        地址由设置面板管理:
+          info.hasTargetInput === false && info.settingsHidden === true && info.hasSettingsButton === true,
+        账号类型_tab:
+          info.localTabActive === true && info.ldapLabel === 'LDAP 账号' && info.hasSourceSelect === false,
+        tab_切换生效:
+          interaction.ldap.active === true &&
+          interaction.ldap.registerHidden === true &&
+          interaction.ldap.subtitle.includes('LDAP 账号') &&
+          interaction.local.active === true &&
+          interaction.local.registerVisible === true,
+        设置覆盖与恢复默认:
+          interaction.opened === true &&
+          interaction.prefilled === PREFS.target &&
+          interaction.custom.includes('10.0.0.2:50051（自定义）') &&
+          interaction.reset === `${info.defaultTarget}（默认）`,
       };
       for (const [name, ok] of Object.entries(checks)) {
         if (!ok) problems.push(`断言失败：${name}`);
       }
-      finish({ pass: Object.values(checks).every(Boolean), ...info });
+      finish({ pass: Object.values(checks).every(Boolean), ...info, interaction });
     })
     .catch((err) => finish({ pass: false, fatal: `whenReady 失败：${err && err.message}` }));
 }

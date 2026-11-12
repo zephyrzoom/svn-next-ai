@@ -3,7 +3,7 @@ import * as path from 'node:path';
 
 import { VcsError, VcsClient, type UserInfo } from './client';
 import { checkoutRepo, commitWorkingCopy, revertWorkingCopy, updateWorkingCopy } from './flow';
-import { clearToken, loadPrefs, loadToken, saveLogin } from './settings';
+import { clearToken, loadPrefs, loadToken, saveLogin, saveTarget } from './settings';
 import * as wc from './wc';
 import type { ConflictChoice } from './wc';
 
@@ -114,14 +114,28 @@ ipcMain.handle(
 /** 上次的连接信息（不含凭证），用于把登录页填好。 */
 ipcMain.handle('vcs:loadPrefs', () => wrap(async () => loadPrefs()));
 
+/** 登录页「设置」：保存自定义服务器地址（空串 = 恢复打包默认地址）。 */
+ipcMain.handle('vcs:setTarget', (_event, target: string) =>
+  wrap<null>(async () => {
+    // 换了服务端就别把旧地址的会话留在内存里。
+    client?.close();
+    client = null;
+    saveTarget(target);
+    return null;
+  }),
+);
+
 /**
  * 用保存的凭证尝试恢复会话。失败（过期、被撤销、钥匙串重置）就静默清掉，
  * 让用户重新登录——不要弹错误框，这不是用户做错了什么。
+ *
+ * `target` 由渲染层传入（默认地址来自打包配置，主进程不读 config.js）。
  */
-ipcMain.handle('vcs:tryResume', () =>
+ipcMain.handle('vcs:tryResume', (_event, target: string = '') =>
   wrap<{ user: UserInfo; expiresAt: number } | null>(async () => {
     const prefs = loadPrefs();
-    if (!prefs.target) return null;
+    const resolved = target || prefs.target;
+    if (!resolved) return null;
     const now = Math.floor(Date.now() / 1000);
     // 本地记着的会话已到 30 天：不必发请求，直接回登录页。
     if (prefs.sessionExpiresAt > 0 && prefs.sessionExpiresAt <= now) {
@@ -130,14 +144,14 @@ ipcMain.handle('vcs:tryResume', () =>
     }
     const token = loadToken();
     if (!token) return null;
-    const next = new VcsClient(prefs.target);
+    const next = new VcsClient(resolved);
     next.useToken(token);
     try {
       const user = await next.whoAmI();
       client?.close();
       client = next;
       // 不带 expiresAt 调用：刷新用户名，但保留原来的到期时间。
-      saveLogin(prefs.target, user.username, token);
+      saveLogin(resolved, user.username, token);
       return { user, expiresAt: prefs.sessionExpiresAt };
     } catch {
       next.close();

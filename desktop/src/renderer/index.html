@@ -13,21 +13,32 @@
     <!-- 登录页：启动时默认显示；已有有效会话时 bootstrap 直接切到主界面 -->
     <section id="auth-screen" class="auth-screen">
       <div class="auth-card">
-        <div class="brand">svn-next</div>
+        <div class="auth-head">
+          <div class="brand">svn-next</div>
+          <button id="open-settings" class="link" type="button" title="修改服务器地址">设置</button>
+        </div>
         <h1 id="auth-title">登录</h1>
-        <p id="auth-sub" class="view-sub">连接服务端后使用仓库。</p>
+        <p id="auth-sub" class="view-sub">选择账号类型并登录。</p>
+        <p class="auth-server">服务器：<span id="current-target">—</span></p>
         <div id="auth-message" class="auth-message hidden"></div>
 
-        <label class="field-label" for="target">服务端地址</label>
-        <input id="target" value="127.0.0.1:50051" spellcheck="false" title="host:port，不带 http://" />
+        <!-- 服务器地址默认由打包配置注入，这里只在用户点「设置」时暴露 -->
+        <div id="server-settings" class="server-settings hidden">
+          <label>服务器地址<input id="server-target" placeholder="host:port，不带 http://" spellcheck="false" /></label>
+          <p class="hint" id="target-note"></p>
+          <div class="row">
+            <button id="save-target" class="primary" type="button">保存</button>
+            <button id="reset-target" class="ghost" type="button">恢复默认</button>
+            <button id="close-settings" class="ghost" type="button">关闭</button>
+          </div>
+        </div>
+
+        <div class="auth-tabs" role="tablist" aria-label="账号类型">
+          <button id="tab-local" class="auth-tab active" data-source="LOCAL" role="tab" aria-selected="true" type="button">本地账号</button>
+          <button id="tab-ldap" class="auth-tab" data-source="LDAP" role="tab" aria-selected="false" type="button">LDAP 账号</button>
+        </div>
 
         <form id="login-form" class="auth-form">
-          <label>身份来源
-            <select id="auth-source" title="身份来源">
-              <option value="LOCAL">本地账号</option>
-              <option value="LDAP">LDAP 目录</option>
-            </select>
-          </label>
           <label>用户名<input id="username" placeholder="用户名" autocomplete="username" spellcheck="false" /></label>
           <label>密码<input id="password" type="password" placeholder="密码" autocomplete="current-password" /></label>
           <label class="check"><input id="remember" type="checkbox" checked /> <span>30 天内免登录（本机加密保存）</span></label>
@@ -218,6 +229,7 @@
       </div>
     </div>
 
+    <script src="config.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

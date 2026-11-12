@@ -138,8 +138,10 @@ export interface VcsApi {
   disconnect(): Promise<Envelope<null>>;
   /** 上次的连接信息（不含凭证）。 */
   loadPrefs(): Promise<Envelope<PrefsDto>>;
-  /** 用保存的凭证恢复会话；没有可用凭证时返回 null。 */
-  tryResume(): Promise<Envelope<SessionDto | null>>;
+  /** 用保存的凭证恢复会话；没有可用凭证时返回 null。target 由渲染层给出。 */
+  tryResume(target: string): Promise<Envelope<SessionDto | null>>;
+  /** 登录页「设置」里覆盖服务器地址；空串表示恢复打包默认地址。 */
+  setTarget(target: string): Promise<Envelope<null>>;
   listRepos(): Promise<Envelope<RepoDto[]>>;
   pickDir(): Promise<Envelope<string | null>>;
   checkout(
@@ -199,7 +201,8 @@ const api: VcsApi = {
     ipcRenderer.invoke('vcs:connect', target, username, password, source, rememberMe),
   disconnect: () => ipcRenderer.invoke('vcs:disconnect'),
   loadPrefs: () => ipcRenderer.invoke('vcs:loadPrefs'),
-  tryResume: () => ipcRenderer.invoke('vcs:tryResume'),
+  tryResume: (target) => ipcRenderer.invoke('vcs:tryResume', target),
+  setTarget: (target) => ipcRenderer.invoke('vcs:setTarget', target),
   listRepos: () => ipcRenderer.invoke('vcs:listRepos'),
   pickDir: () => ipcRenderer.invoke('vcs:pickDir'),
   checkout: (repoId, dir, rev) => ipcRenderer.invoke('vcs:checkout', repoId, dir, rev),

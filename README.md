@@ -71,6 +71,17 @@ npm run dist           # 出安装包，输出到 desktop/release/
 
 `stage` 步骤会把根目录的 `proto/repo.proto` 复制进 `desktop/proto/`、把渲染层静态资源复制进 `dist/renderer/` 一起打包（builder 的 files 规则包含整个 `dist`）；原生模块通过 `asarUnpack` 解包，因为 `.node` 无法从 asar 内 `dlopen`。若沙箱环境无法写 asar，可用 `npm run pack:unpacked` / `dist:unpacked` 关闭 asar，功能一致。
 
+**默认服务器地址在打包时配置**：改 `desktop/build-config.json` 的 `defaultTarget`，或用环境变量覆盖（适合给不同环境打同一个包）：
+
+```bash
+# 默认：127.0.0.1:50051
+npm run build
+# 分发到内网：不改源码
+VCS_DEFAULT_TARGET=vcs.internal.example.com:50051 npm run dist
+```
+
+`npm run build` 会据此生成 `dist/renderer/config.js`（`window.vcsConfig.defaultTarget`），随 `dist` 一起进安装包；`npm run check:assets` 会校验它存在且格式合法。登录页**不显示地址输入框**，只显示当前生效地址；用户点「设置」改的地址保存在本机 `userData/settings.json`，覆盖打包默认值（「恢复默认」清掉覆盖）。
+
 三平台产物也可由 CI 生成：push `v*` tag 会触发 `.github/workflows/release.yml`，构建 macOS `dmg`/`zip`、Windows `nsis`/`zip`、Linux `AppImage` 并创建 Release；手动触发 `workflow_dispatch` 只上传 artifact、不发 Release。
 
 ---
@@ -175,13 +186,13 @@ vcs ldap-show     # 回显配置，不显示密码
 
 - 只支持 `ldaps` 或 `starttls`，证书一律校验，**没有明文 bind 选项**；`{username}` 拼进 filter 前按 RFC 4515 转义。
 - bind 密码用 `server.secret` 加密落库，读取接口不回传；再次配置时 `--bind-password` 留空表示沿用。
-- 桌面端在登录页把身份来源切到「LDAP 目录」即可用目录口令登录；CLI 用 `vcs login --ldap --username alice`。
+- 桌面端在登录页切到「LDAP 账号」tab，用目录口令登录；CLI 用 `vcs login --ldap --username alice`。
 - 目录用户首次登录免审批（JIT 建号）；组 → 角色映射只决定**新建账号的初始角色**，已有账号角色以本地为准，避免目录侧调整把管理员降级。
 - 目录不可用时只影响 LDAP 登录（`ERROR_CODE_LDAP_UNAVAILABLE`），本地账号始终能登录，绝不退化成「校验通过」。
 
 ### 3.5 Web 管理端（管理员入口）
 
-浏览器打开 `http://127.0.0.1:8080`（跨机时换成服务器地址），用**管理员账号**登录；身份来源可选「本地账号」或「LDAP 目录」，复用的就是 `ServerStore::login` / `login_ldap` 签发的同一份 JWT。非管理员登录会被拒绝，所有 `/api/*` 接口都要求 `Authorization: Bearer <token>` 且角色为 `admin`。
+浏览器打开 `http://127.0.0.1:8080`（跨机时换成服务器地址），用**管理员账号**登录；身份来源可选「本地账号」或「LDAP 账号」，复用的就是 `ServerStore::login` / `login_ldap` 签发的同一份 JWT。非管理员登录会被拒绝，所有 `/api/*` 接口都要求 `Authorization: Bearer <token>` 且角色为 `admin`。
 
 左侧菜单覆盖全部管理职能，桌面端不再提供这些入口：
 
@@ -203,7 +214,7 @@ vcs ldap-show     # 回显配置，不显示密码
 
 ## 4. 使用桌面客户端
 
-桌面端**打开先进入登录页**（登录 / 申请注册）；登录成功后才进入主界面：顶部信息条 + 左侧菜单（工作副本 / 仓库 / 账号）+ 右侧单一内容视图，切换菜单不会触发网络请求。审批、成员、配额、目录配置、空间治理等管理职能一律在 [§3.5 Web 管理端](#35-web-管理端管理员入口) 完成。
+桌面端**打开先进入登录页**（本地账号 / LDAP 账号两个 tab、申请注册、服务器地址设置）；登录成功后才进入主界面：顶部信息条 + 左侧菜单（工作副本 / 仓库 / 账号）+ 右侧单一内容视图，切换菜单不会触发网络请求。审批、成员、配额、目录配置、空间治理等管理职能一律在 [§3.5 Web 管理端](#35-web-管理端管理员入口) 完成。
 
 ### 4.1 登录与 30 天免登录
 
@@ -211,9 +222,10 @@ vcs ldap-show     # 回显配置，不显示密码
    - macOS：首次「右键 → 打开」，或 `xattr -dr com.apple.quarantine /Applications/svn-next.app`；
    - Windows：SmartScreen 提示「未知发布者」时选择「仍要运行」；
    - Linux：`chmod +x *.AppImage` 后运行。
-2. 登录页默认填的是 `127.0.0.1:50051`，改成实际服务端地址（`host:port`，不带 `http://`），选身份来源「本地账号」或「LDAP 目录」，填用户名与密码后点「登录」。空库时第一个注册 / 第一个 LDAP 登录的人自动成为管理员；也可以先用 `init-admin` 建好管理员再登录。管理员登录后界面**不会**出现审批台等管理入口，请改用 Web 管理端。
-3. **「30 天内免登录」默认勾选**：服务端为这次登录签发 30 天有效的 JWT，凭证由系统钥匙串 / DPAPI / libsecret（`safeStorage`）加密保存在 `userData/settings.json`，重启客户端会自动恢复会话并直接进入主界面。取消勾选则只在本次会话有效、关闭应用后需重新登录。到期、账号被禁用 / 改角色 / 重置口令后会自动回到登录页。
-4. 当前系统不支持加密存储时勾选框会置灰，界面提示「重启后需要重新登录」。点「退出登录」会清除已保存的凭证，但保留服务端地址与用户名。
+2. 登录页**没有地址输入框**：服务器地址由打包配置注入（见 [§2.2 桌面客户端](#22-桌面客户端) 的 `build-config.json` / `VCS_DEFAULT_TARGET`），页面只显示当前生效地址。点右上角「设置」可以改成别的 `host:port`（不带 `http://`）覆盖默认值，或「恢复默认」；改地址会清掉旧凭证，需要重新登录。
+3. 账号类型用两个 **tab** 切换：选「本地账号」按本地口令登录，选「LDAP 账号」按目录口令登录；**切到哪个就登录哪个**，LDAP tab 不提供注册入口。空库时第一个注册 / 第一个 LDAP 登录的人自动成为管理员；也可以先用 `init-admin` 建好管理员再登录。管理员登录后界面**不会**出现审批台等管理入口，请改用 Web 管理端。
+4. **「30 天内免登录」默认勾选**：服务端为这次登录签发 30 天有效的 JWT，凭证由系统钥匙串 / DPAPI / libsecret（`safeStorage`）加密保存在 `userData/settings.json`，重启客户端会自动恢复会话并直接进入主界面。取消勾选则只在本次会话有效、关闭应用后需重新登录。到期、账号被禁用 / 改角色 / 重置口令后会自动回到登录页。
+5. 当前系统不支持加密存储时勾选框会置灰，界面提示「重启后需要重新登录」。点「退出登录」会清除已保存的凭证，但保留服务端地址与用户名。
 
 ### 4.2 注册账号（审批链路）
 
@@ -221,7 +233,7 @@ vcs ldap-show     # 回显配置，不显示密码
 
 > 例外：**空库的第一个注册用户**不走这套流程——在登录页点「申请注册」提交后自动批准为管理员，注册时填的密码直接可用。下面是之后所有普通账号的流程。
 
-1. 用户在**登录页**点「还没有账号？申请注册」，填用户名 / 姓名 / **登录密码** / 申请理由（密码策略由服务端复核，未通过审批前不能登录）。
+1. 用户在**登录页「本地账号」tab**点「还没有账号？申请注册」，填用户名 / 姓名 / **登录密码** / 申请理由（密码策略由服务端复核，未通过审批前不能登录）。
 2. 管理员在 **Web 管理端「审批台 → 注册申请」**通过（可选角色），审批只做放行，不再发放任何一次性链接。
 3. 用户回到登录页，用**注册时设置的密码**登录，成功后进入主界面。
 4. 登录后若需要自己的仓库，在「仓库」视图点「提交建库申请」；管理员在 **Web 管理端「审批台 → 建库申请」**批准，申请人自动成为该仓库 owner。管理员也可在「仓库」页「直通新建」。
@@ -315,10 +327,10 @@ npm run smoke:ui                       # 可选：真启动 Electron，验证页
 | 检查 | 需要 Electron | 能抓到 |
 | --- | --- | --- |
 | `typecheck` | 否 | TS 类型错误；碰不到 html/js/css 与产物装配 |
-| `check:assets`（`build` 末尾自动跑） | 否 | 页面 / preload 漏拷、主进程路径漂移、html 引用失效、源码与产物不一致 |
+| `check:assets`（`build` 末尾自动跑） | 否 | 页面 / preload 漏拷、主进程路径漂移、html 引用失效、源码与产物不一致、默认服务器地址未注入或格式非法 |
 | `smoke` | 否 | 主进程业务逻辑在真实网络与文件系统下的行为；不创建 BrowserWindow（脚本带 `--no-admin`） |
 | `smoke:admin` | 否 | 内置 Web 管理端的静态页面、登录鉴权与全部管理类 HTTP 接口；端口随机分配 |
-| `smoke:ui` | **是** | CSP 拦截、preload 桥接失败、渲染脚本启动即抛错等运行时故障 |
+| `smoke:ui` | **是** | CSP 拦截、preload 桥接失败、渲染脚本启动即抛错；登录页结构、账号类型 tab 切换、服务器地址覆盖 / 恢复默认的真实点击链路 |
 
 `npm run smoke` 不需要 Electron 界面，它用临时目录起真实服务端、走真实 HTTP/2 与文件系统。`npm run smoke:admin` 同样无需浏览器：它会给管理端分配随机空闲端口，验证静态页面、未登录拦截、管理员登录、全库视图、直通建库、成员 / 配额 / 用户治理接口。CI 的 `desktop` job 刻意设置 `ELECTRON_SKIP_BINARY_DOWNLOAD=1`，所以 **`check:assets` 是 CI 里唯一拦住「构建成功但白屏」的防线**；`smoke:ui` 需要本机有 Electron 二进制与图形环境（Linux 无 DISPLAY 时用 `xvfb-run npm run smoke:ui`），目前只在本地跑。`.github/workflows/ci.yml` 还会在三平台执行 Rust 检查、proto / SQL 契约校验、CLI 冒烟与管理端冒烟。
 
@@ -328,7 +340,7 @@ npm run smoke:ui                       # 可选：真启动 Electron，验证页
 
 | 现象 | 处理 |
 | --- | --- |
-| 桌面端连不上 | 确认 `vcs serve` 已启动并打印「vcs serve 已启动」；地址格式是 `host:port`；跨机器时服务端需 `--listen 0.0.0.0:50051` 且防火墙放行 |
+| 桌面端连不上 | 登录页「服务器：」一行会显示当前地址；点「设置」改成正确的 `host:port`（不带 `http://`）。确认 `vcs serve` 已启动并打印「vcs serve 已启动」；跨机器时服务端需 `--listen 0.0.0.0:50051` 且防火墙放行。若地址由安装包固定，检查打包时的 `build-config.json` / `VCS_DEFAULT_TARGET` |
 | 浏览器打不开管理端 | 确认启动日志里有「Web 管理端已启动」；默认地址 `http://127.0.0.1:8080` **只能在服务器本机**打开。跨机访问需 `--admin-listen 0.0.0.0:8080` + 防火墙放行 + TLS 网关 |
 | 管理端提示「仅管理员可登录」 | 该入口只接受全局 `admin`。空库第一个注册 / LDAP 登录用户自动成为管理员；也可在服务器本机用 `vcs init-admin` 预置 |
 | 8080 端口被占用 | 启动会直接报错退出（不会半残启动）；换端口用 `--admin-listen 127.0.0.1:8081`，或加 `--no-admin` 只跑 gRPC |

@@ -92,6 +92,21 @@ export function saveLogin(
   write(file);
 }
 
+/** 保存用户在登录页「设置」里自定义的服务端地址。
+ *
+ * 打包默认地址在渲染层的 config.js 里，主进程不读它：这里存的是**覆盖值**，
+ * 传空字符串表示恢复默认。换地址后旧凭证一律作废，避免把 A 服务器的 token
+ * 拿到 B 服务器去用。
+ */
+export function saveTarget(target: string): void {
+  const file = read();
+  if (target) file.target = target;
+  else delete file.target;
+  delete file.sealedToken;
+  delete file.sessionExpiresAt;
+  write(file);
+}
+
 /** 取回上次的 token；解密失败（换机器、钥匙串重置）就当作没有。 */
 export function loadToken(): string | null {
   const file = read();

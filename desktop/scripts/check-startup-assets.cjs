@@ -12,7 +12,8 @@
  *   2. 主进程产物里 path.join(__dirname, …) 引用的文件（preload、页面）都存在；
  *      一个都找不到就主动报错，避免检查规则悄悄与源码脱节；
  *   3. 页面里所有本地 script / link 引用都存在；
- *   4. dist/renderer 与 src/renderer 内容一致，避免改了源码却用旧产物启动。
+ *   4. 构建期注入的默认服务器地址（dist/renderer/config.js）存在且合法；
+ *   5. dist/renderer 与 src/renderer 内容一致，避免改了源码却用旧产物启动。
  *
  * 用法：node scripts/check-startup-assets.cjs（由 npm run build 末尾自动调用）
  */
@@ -70,6 +71,18 @@ if (requireFile('渲染页面', page)) {
   }
   for (const ref of new Set(localRefs)) {
     requireFile(`页面引用 ${ref}`, path.resolve(path.dirname(page), ref));
+  }
+}
+
+// 3.5) 构建期注入的默认服务器地址：登录页不再有地址输入框，缺了它就没法登录
+const configJs = path.join(DIST, 'renderer', 'config.js');
+if (requireFile('默认地址配置', configJs)) {
+  const content = fs.readFileSync(configJs, 'utf8');
+  const match = content.match(/defaultTarget:\s*"([^"]+)"/);
+  if (!match || !/^[A-Za-z0-9._:-]+:\d{1,5}$/.test(match[1])) {
+    errors.push('config.js 里没有合法的 defaultTarget；重新执行 npm run build');
+  } else {
+    passed.push(`默认地址 ${match[1]} 已注入`);
   }
 }
 
