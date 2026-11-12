@@ -52,10 +52,35 @@ const state = {
 
 const el = (id) => document.getElementById(id);
 
+/** 主界面提示浮层；未登录时自动转给登录页，避免提示落在看不见的地方。 */
+let bannerTimer = 0;
+
 function clearBanner() {
+  window.clearTimeout(bannerTimer);
   const node = el('banner');
   node.className = 'banner hidden';
   node.textContent = '';
+}
+
+/**
+ * 提示是浮在右下角的一小块，不占版面，过几秒自己退场：
+ * 成功类 4 秒够看一眼，错误类留 8 秒（并支持点一下手动关掉）。
+ * 未登录时所有反馈仍然落回登录卡片，那里是唯一可见的区域。
+ */
+function banner(message = '', kind = 'info') {
+  if (!state.user) {
+    authMessage(message, kind);
+    return;
+  }
+  if (!message) {
+    clearBanner();
+    return;
+  }
+  window.clearTimeout(bannerTimer);
+  const node = el('banner');
+  node.className = `banner${kind === 'error' ? ' error' : ''}`;
+  node.textContent = message;
+  bannerTimer = window.setTimeout(() => clearBanner(), kind === 'error' ? 8000 : 4000);
 }
 
 /** 登录页内的提示条（主界面隐藏时所有反馈都落在这里）。 */
@@ -70,21 +95,6 @@ function authMessage(message = '', kind = 'info') {
   node.textContent = message;
 }
 
-/** 主界面提示条；未登录时自动转给登录页，避免提示落在看不见的地方。 */
-function banner(message = '', kind = 'info') {
-  if (!state.user) {
-    authMessage(message, kind);
-    return;
-  }
-  if (!message) {
-    clearBanner();
-    return;
-  }
-  const node = el('banner');
-  node.className = `banner${kind === 'error' ? ' error' : ''}`;
-  node.textContent = message;
-}
-
 /** 解包信封：失败时抛错并展示，成功返回 data。 */
 function unwrap(res, action) {
   if (res && res.ok) return res.data;
@@ -92,19 +102,28 @@ function unwrap(res, action) {
   if (res && AUTH_CODES.has(res.code) && state.user) {
     // 已登录却拿到认证错误：不要只弹个提示，直接回登录页让人重新登录。
     showLogin(`登录状态已失效（${message}），请重新登录。`);
-    throw new Error(message);
+    throw shownError(message);
   }
   const suffix = res && AUTH_CODES.has(res.code) ? '\n请重新登录。' : '';
   banner(`${action}失败：${message}${suffix}`, 'error');
-  throw new Error(message);
+  throw shownError(message);
+}
+
+/**
+ * 已经展示过的错误。`guard` 靠这个标记决定要不要再补一条提示——
+ * 提示是会自动消失的浮层，用「界面上还有没有字」来判断会误判。
+ */
+function shownError(message) {
+  const error = new Error(message);
+  error.shown = true;
+  return error;
 }
 
 async function guard(action, run) {
   try {
     return await run();
   } catch (err) {
-    const shown = state.user ? el('banner').textContent : el('auth-message').textContent;
-    if (!shown) {
+    if (!err || !err.shown) {
       banner(`${action}失败：${err.message}`, 'error');
     }
     return undefined;
@@ -856,6 +875,8 @@ el('update').addEventListener('click', () => void guard('更新', update));
 el('revert').addEventListener('click', () => void guard('还原', revertAll));
 el('commit').addEventListener('click', () => void guard('提交', commit));
 el('refresh-log').addEventListener('click', () => void guard('刷新历史', loadLog));
+// 浮层提示点一下就关，不必等它自己退场。
+el('banner').addEventListener('click', clearBanner);
 
 /**
  * 启动时：把上次的连接信息填进登录页，并尝试用加密保存的凭证恢复 30 天会话。
