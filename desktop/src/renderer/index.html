@@ -198,6 +198,10 @@
                   <div class="bar"><div id="quota-fill"></div></div>
                   <div class="meta" id="quota-text">选择仓库后加载</div>
                 </div>
+                <div class="stack">
+                  <button id="do-expand" class="ghost">申请扩容 +10 GiB</button>
+                </div>
+                <p class="hint">扩容同时也是「只填申请」：一次申请固定加 10 GiB，由管理员结合服务器磁盘余量审批。</p>
 
                 <div class="card-head"><h2>申请建库</h2></div>
                 <div class="stack" id="repo-request-row">
@@ -205,7 +209,7 @@
                   <input id="request-reason" placeholder="用途说明（审批时会看）" spellcheck="false" />
                   <button id="do-request" class="primary">提交建库申请</button>
                 </div>
-                <p class="hint">提交后由管理员在服务端 Web 管理端审批；审批通过会自动出现在左侧列表里。</p>
+                <p class="hint">建库申请不用填容量：通过即为 10 GiB，审批人只决定同意或拒绝。</p>
               </div>
             </div>
           </section>

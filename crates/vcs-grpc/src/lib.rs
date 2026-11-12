@@ -364,6 +364,35 @@ fn request_to_pb(info: &vcs_server::RepoRequestInfo) -> pb::RepoCreationInfo {
     }
 }
 
+/// 扩容申请 → proto。`target_quota_bytes` 是「提交时上限 + 固定增量」，
+/// 审批台据此回答「这次批完是多少」。
+fn quota_request_to_pb(info: &vcs_server::RepoQuotaRequestInfo) -> pb::RepoQuotaRequestInfo {
+    pb::RepoQuotaRequestInfo {
+        request_id: info.request_id.clone(),
+        repo_id: info.repo_id.clone(),
+        repo_name: info.repo_name.clone(),
+        requester_user_id: info.requester_user_id.clone(),
+        increment_bytes: info.increment_bytes,
+        quota_before_bytes: info.quota_before_bytes,
+        target_quota_bytes: info.target_bytes(),
+        reason: info.reason.clone().unwrap_or_default(),
+        state: creation_status_to_pb(info.state),
+        submitted_at: info.submitted_at,
+        decided_at: info.decided_at.unwrap_or(0),
+        decided_by: info.decided_by.clone().unwrap_or_default(),
+        decision_note: info.decision_note.clone().unwrap_or_default(),
+        expires_at: info.expires_at,
+    }
+}
+
+fn capacity_to_pb(cap: &vcs_server::StorageCapacity) -> pb::StorageCapacity {
+    pb::StorageCapacity {
+        total_bytes: cap.total_bytes,
+        available_bytes: cap.available_bytes,
+        used_bytes: cap.used_bytes,
+    }
+}
+
 fn member_to_pb(member: &vcs_server::MemberInfo) -> pb::RepoMemberInfo {
     pb::RepoMemberInfo {
         repo_id: String::new(),
@@ -1850,12 +1879,11 @@ impl RepoAdminService for AdminApi {
     ) -> Result<Response<pb::RequestRepoResponse>, Status> {
         let session = self.api.session(&request)?;
         let req = request.into_inner();
-        match self.api.store().request_repo(
-            &session,
-            &req.repo_name,
-            &req.reason,
-            req.requested_quota_bytes,
-        ) {
+        match self
+            .api
+            .store()
+            .request_repo(&session, &req.repo_name, &req.reason)
+        {
             Ok(info) => Ok(Response::new(pb::RequestRepoResponse {
                 status: Some(status_ok()),
                 request_id: info.request_id,
@@ -1915,12 +1943,11 @@ impl RepoAdminService for AdminApi {
     ) -> Result<Response<pb::ApproveRepoCreationResponse>, Status> {
         let session = self.api.session(&request)?;
         let req = request.into_inner();
-        match self.api.store().approve_repo_request(
-            &session,
-            &req.request_id,
-            req.quota_bytes,
-            &req.decision_note,
-        ) {
+        match self
+            .api
+            .store()
+            .approve_repo_request(&session, &req.request_id, &req.decision_note)
+        {
             Ok(repo) => Ok(Response::new(pb::ApproveRepoCreationResponse {
                 status: Some(status_ok()),
                 repo: Some(repo_to_pb(&repo)),
@@ -1948,6 +1975,119 @@ impl RepoAdminService for AdminApi {
             })),
             Err(err) => Ok(Response::new(pb::RejectRepoCreationResponse {
                 status: Some(status_err(&err)),
+            })),
+        }
+    }
+
+    async fn request_repo_expansion(
+        &self,
+        request: Request<pb::RequestRepoExpansionRequest>,
+    ) -> Result<Response<pb::RequestRepoExpansionResponse>, Status> {
+        let session = self.api.session(&request)?;
+        let req = request.into_inner();
+        match self
+            .api
+            .store()
+            .request_repo_expansion(&session, &req.repo_id, &req.reason)
+        {
+            Ok(info) => Ok(Response::new(pb::RequestRepoExpansionResponse {
+                status: Some(status_ok()),
+                request_id: info.request_id,
+                state: creation_status_to_pb(info.state),
+            })),
+            Err(err) => Ok(Response::new(pb::RequestRepoExpansionResponse {
+                status: Some(status_err(&err)),
+                ..Default::default()
+            })),
+        }
+    }
+
+    async fn list_repo_quota_requests(
+        &self,
+        request: Request<pb::ListRepoQuotaRequestsRequest>,
+    ) -> Result<Response<pb::ListRepoQuotaRequestsResponse>, Status> {
+        let session = self.api.session(&request)?;
+        let req = request.into_inner();
+        let filter = parse_creation_status(req.filter);
+        match self
+            .api
+            .store()
+            .list_repo_quota_requests(&session, filter, req.limit as usize)
+        {
+            Ok(list) => Ok(Response::new(pb::ListRepoQuotaRequestsResponse {
+                status: Some(status_ok()),
+                requests: list.iter().map(quota_request_to_pb).collect(),
+            })),
+            Err(err) => Ok(Response::new(pb::ListRepoQuotaRequestsResponse {
+                status: Some(status_err(&err)),
+                requests: Vec::new(),
+            })),
+        }
+    }
+
+    async fn approve_repo_quota_request(
+        &self,
+        request: Request<pb::ApproveRepoQuotaRequestRequest>,
+    ) -> Result<Response<pb::ApproveRepoQuotaRequestResponse>, Status> {
+        let session = self.api.session(&request)?;
+        let req = request.into_inner();
+        match self.api.store().approve_repo_quota_request(
+            &session,
+            &req.request_id,
+            &req.decision_note,
+        ) {
+            Ok(effective) => Ok(Response::new(pb::ApproveRepoQuotaRequestResponse {
+                status: Some(status_ok()),
+                quota_bytes: effective.bytes,
+            })),
+            Err(err) => Ok(Response::new(pb::ApproveRepoQuotaRequestResponse {
+                status: Some(status_err(&err)),
+                quota_bytes: 0,
+            })),
+        }
+    }
+
+    async fn reject_repo_quota_request(
+        &self,
+        request: Request<pb::RejectRepoQuotaRequestRequest>,
+    ) -> Result<Response<pb::RejectRepoQuotaRequestResponse>, Status> {
+        let session = self.api.session(&request)?;
+        let req = request.into_inner();
+        match self
+            .api
+            .store()
+            .reject_repo_quota_request(&session, &req.request_id, &req.reason)
+        {
+            Ok(()) => Ok(Response::new(pb::RejectRepoQuotaRequestResponse {
+                status: Some(status_ok()),
+            })),
+            Err(err) => Ok(Response::new(pb::RejectRepoQuotaRequestResponse {
+                status: Some(status_err(&err)),
+            })),
+        }
+    }
+
+    async fn get_storage_capacity(
+        &self,
+        request: Request<pb::GetStorageCapacityRequest>,
+    ) -> Result<Response<pb::GetStorageCapacityResponse>, Status> {
+        let session = self.api.session(&request)?;
+        let store = self.api.store();
+        // 磁盘容量是宿主机信息，只给管理员看。
+        if let Err(err) = store.require_admin_action(&session, "查看磁盘容量") {
+            return Ok(Response::new(pb::GetStorageCapacityResponse {
+                status: Some(status_err(&err)),
+                capacity: None,
+            }));
+        }
+        match store.storage_capacity() {
+            Ok(cap) => Ok(Response::new(pb::GetStorageCapacityResponse {
+                status: Some(status_ok()),
+                capacity: Some(capacity_to_pb(&cap)),
+            })),
+            Err(err) => Ok(Response::new(pb::GetStorageCapacityResponse {
+                status: Some(status_err(&err)),
+                capacity: None,
             })),
         }
     }

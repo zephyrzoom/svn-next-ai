@@ -31,6 +31,7 @@ pub struct AdminOverview {
     pub active_repos: i64,
     pub pending_registrations: i64,
     pub pending_repo_requests: i64,
+    pub pending_quota_requests: i64,
     pub objects: i64,
     pub object_bytes: i64,
     pub purged_pending: i64,
@@ -65,6 +66,8 @@ impl ServerStore {
             pending_repo_requests: self.admin_count(
                 "SELECT COUNT(*) FROM repo_creation_requests WHERE status = 'pending'",
             )?,
+            pending_quota_requests: self
+                .admin_count("SELECT COUNT(*) FROM repo_quota_requests WHERE status = 'pending'")?,
             objects,
             object_bytes,
             purged_pending: self

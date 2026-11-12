@@ -182,6 +182,20 @@ export interface RepoRequestRow {
   submittedAt: number;
 }
 
+/** 扩容申请：申请人只提交申请，容量由服务端按固定 10 GiB 增量算出。 */
+export interface RepoExpansionRow {
+  requestId: string;
+  repoId: string;
+  repoName: string;
+  incrementBytes: number;
+  quotaBeforeBytes: number;
+  targetQuotaBytes: number;
+  reason: string;
+  /** 1=pending 2=approved 3=rejected 4=expired（与 proto 的 RepoCreationStatus 一致）。 */
+  state: number;
+  submittedAt: number;
+}
+
 export interface QuotaRow {
   usedBytes: number;
   /** 生效的配额上限（字节）。 */
@@ -819,20 +833,52 @@ export class VcsClient {
     assertOk(resp.status);
   }
 
-  /** 提交仓库创建申请（任何 ACTIVE 用户）。 */
-  async requestRepo(
-    repoName: string,
-    reason: string,
-    requestedQuotaBytes = 0,
-  ): Promise<{ requestId: string; state: number }> {
+  /**
+   * 提交仓库创建申请（任何 ACTIVE 用户）。
+   *
+   * 容量不填：服务端固定按 10 GiB 核定，审批人也不用再配数字。
+   */
+  async requestRepo(repoName: string, reason: string): Promise<{ requestId: string; state: number }> {
     const resp = await this.invoke<any>(this.admin, 'requestRepo', {
       repoName,
       repoIdHint: '',
       reason,
-      requestedQuotaBytes,
     });
     assertOk(resp.status);
     return { requestId: resp.requestId as string, state: resp.state as number };
+  }
+
+  /**
+   * 申请扩容：同样不填容量，服务端固定按 +10 GiB 计算。
+   * 是否批准由管理员结合服务器磁盘余量决定。
+   */
+  async requestRepoExpansion(
+    repoId: string,
+    reason = '',
+  ): Promise<{ requestId: string; state: number }> {
+    const resp = await this.invoke<any>(this.admin, 'requestRepoExpansion', { repoId, reason });
+    assertOk(resp.status);
+    return { requestId: resp.requestId as string, state: resp.state as number };
+  }
+
+  /** 我提交的扩容申请（管理员则看全部）。 */
+  async listRepoQuotaRequests(state = 0): Promise<RepoExpansionRow[]> {
+    const resp = await this.invoke<any>(this.admin, 'listRepoQuotaRequests', {
+      filter: state,
+      limit: 50,
+    });
+    assertOk(resp.status);
+    return (resp.requests ?? []).map((row: any) => ({
+      requestId: row.requestId as string,
+      repoId: row.repoId as string,
+      repoName: row.repoName as string,
+      incrementBytes: row.incrementBytes as number,
+      quotaBeforeBytes: row.quotaBeforeBytes as number,
+      targetQuotaBytes: row.targetQuotaBytes as number,
+      reason: row.reason as string,
+      state: row.state as number,
+      submittedAt: row.submittedAt as number,
+    }));
   }
 
   async listRepoCreations(state = 0): Promise<RepoRequestRow[]> {
@@ -852,16 +898,10 @@ export class VcsClient {
     }));
   }
 
-  async approveRepoCreation(
-    requestId: string,
-    quotaSoftBytes: number,
-    quotaHardBytes: number,
-    decisionNote: string,
-  ): Promise<RepoInfo> {
+  /** 审批通过建库申请：容量由服务端固定 10 GiB，审批人只填意见。 */
+  async approveRepoCreation(requestId: string, decisionNote = ''): Promise<RepoInfo> {
     const resp = await this.invoke<any>(this.admin, 'approveRepoCreation', {
       requestId,
-      quotaSoftBytes,
-      quotaHardBytes,
       decisionNote,
     });
     assertOk(resp.status);
@@ -882,12 +922,11 @@ export class VcsClient {
     return (resp.repos ?? []) as RepoInfo[];
   }
 
-  async createRepo(name: string, quotaHardBytes = 0): Promise<RepoInfo> {
+  async createRepo(name: string, quotaBytes = 0): Promise<RepoInfo> {
     const resp = await this.invoke<any>(this.admin, 'createRepoDirect', {
       repoName: name,
       repoIdHint: '',
-      quotaSoftBytes: 0,
-      quotaHardBytes,
+      quotaBytes,
     });
     assertOk(resp.status);
     return resp.repo as RepoInfo;

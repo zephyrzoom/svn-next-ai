@@ -23,6 +23,8 @@ use vcs_proto::vcs::repo::v1::repo_service_client::RepoServiceClient;
 use vcs_server::ServerStore;
 
 const PASSWORD: &str = "Abcdef1!";
+/// 与 `vcs_core::REPO_QUOTA_EXPANSION_STEP_BYTES` 对齐：一次扩容固定 10 GiB。
+const EXPANSION_STEP: u64 = 10 * 1024 * 1024 * 1024;
 
 struct Harness {
     root: std::path::PathBuf,
@@ -630,9 +632,9 @@ async fn admin_approval_and_purge_over_grpc() {
     assert_eq!(approved.status.unwrap().code, pb::ErrorCode::Ok as i32);
     assert!(!approved.user_id.is_empty());
     // 审批后直接能用注册时的密码登录，服务端不再下发任何凭证。
-    let _carol = login(&h, "carol", PASSWORD).await;
+    let carol = login(&h, "carol", PASSWORD).await;
 
-    // 仓库申请 → 审批 → 清理闭环
+    // 仓库申请 → 审批 → 清理闭环。申请由 carol 本人提交，审批后她就是 owner。
     let req = h
         .admin()
         .await
@@ -641,9 +643,8 @@ async fn admin_approval_and_purge_over_grpc() {
                 repo_name: "carol-repo".into(),
                 repo_id_hint: String::new(),
                 reason: "个人归档".into(),
-                requested_quota_bytes: 0,
             }),
-            &token,
+            &carol,
         ))
         .await
         .unwrap()
@@ -654,7 +655,6 @@ async fn admin_approval_and_purge_over_grpc() {
         .approve_repo_creation(bearer(
             Request::new(pb::ApproveRepoCreationRequest {
                 request_id: req.request_id,
-                quota_bytes: 0,
                 decision_note: "同意".into(),
             }),
             &token,
@@ -665,6 +665,99 @@ async fn admin_approval_and_purge_over_grpc() {
     assert_eq!(repo.status.unwrap().code, pb::ErrorCode::Ok as i32);
     let repo_id = repo.repo.unwrap().repo_id;
 
+    // 扩容申请：容量不填，服务端固定 +10 GiB，由管理员按磁盘余量审批。
+    let expansion = h
+        .admin()
+        .await
+        .request_repo_expansion(bearer(
+            Request::new(pb::RequestRepoExpansionRequest {
+                repo_id: repo_id.clone(),
+                reason: "素材变多".into(),
+            }),
+            &carol,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        expansion.status.unwrap().code,
+        pb::ErrorCode::Ok as i32,
+        "扩容申请应被接受"
+    );
+
+    let mine = h
+        .admin()
+        .await
+        .list_repo_quota_requests(bearer(
+            Request::new(pb::ListRepoQuotaRequestsRequest {
+                filter: pb::RepoCreationStatus::Pending as i32,
+                limit: 10,
+            }),
+            &carol,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(mine.status.unwrap().code, pb::ErrorCode::Ok as i32);
+    assert_eq!(mine.requests.len(), 1);
+    let pending = &mine.requests[0];
+    assert_eq!(pending.increment_bytes, EXPANSION_STEP);
+    assert_eq!(
+        pending.target_quota_bytes,
+        pending.quota_before_bytes + EXPANSION_STEP
+    );
+
+    // 磁盘容量是宿主机信息：普通用户看不到，管理员能看到。
+    let denied = h
+        .admin()
+        .await
+        .get_storage_capacity(bearer(
+            Request::new(pb::GetStorageCapacityRequest {}),
+            &carol,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        denied.status.unwrap().code,
+        pb::ErrorCode::PermissionDenied as i32
+    );
+
+    let capacity = h
+        .admin()
+        .await
+        .get_storage_capacity(bearer(
+            Request::new(pb::GetStorageCapacityRequest {}),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(capacity.status.unwrap().code, pb::ErrorCode::Ok as i32);
+    assert!(capacity.capacity.unwrap().total_bytes > 0);
+
+    let approved_expansion = h
+        .admin()
+        .await
+        .approve_repo_quota_request(bearer(
+            Request::new(pb::ApproveRepoQuotaRequestRequest {
+                request_id: pending.request_id.clone(),
+                decision_note: "同意".into(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        approved_expansion.status.unwrap().code,
+        pb::ErrorCode::Ok as i32
+    );
+    assert_eq!(
+        approved_expansion.quota_bytes,
+        pending.quota_before_bytes + EXPANSION_STEP
+    );
+
     let estimate = h
         .repos()
         .await
@@ -673,7 +766,7 @@ async fn admin_approval_and_purge_over_grpc() {
                 repo_id: repo_id.clone(),
                 paths: vec!["202610".into()],
             }),
-            &token,
+            &carol,
         ))
         .await
         .unwrap()

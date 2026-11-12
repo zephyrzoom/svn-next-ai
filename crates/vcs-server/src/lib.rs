@@ -34,6 +34,8 @@ use vcs_core::{
 
 mod admin;
 pub use admin::{AdminOverview, AdminUser};
+mod disk;
+pub use disk::{disk_capacity, StorageCapacity};
 mod ldap;
 pub use ldap::{
     authenticate_ldap, test_ldap_connection, DirectoryUser, LdapPublicConfig, LdapSettings,
@@ -386,6 +388,36 @@ pub struct RepoRequestInfo {
     pub decision_note: Option<String>,
     pub expires_at: i64,
     pub approved_repo_id: Option<String>,
+}
+
+/// 一条仓库扩容申请。
+///
+/// 申请人只提交「我想加空间」，容量由服务端按固定步长算出：
+/// `target_bytes = quota_before_bytes + increment_bytes`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoQuotaRequestInfo {
+    pub request_id: String,
+    pub repo_id: String,
+    pub repo_name: String,
+    pub requester_user_id: String,
+    /// 本次申请的增量（固定 `vcs_core::REPO_QUOTA_EXPANSION_STEP_BYTES`）。
+    pub increment_bytes: u64,
+    /// 提交时的生效上限，审批台用来展示「从多少加到多少」。
+    pub quota_before_bytes: u64,
+    pub reason: Option<String>,
+    pub state: core_types::RepoCreationStatus,
+    pub submitted_at: i64,
+    pub decided_at: Option<i64>,
+    pub decided_by: Option<String>,
+    pub decision_note: Option<String>,
+    pub expires_at: i64,
+}
+
+impl RepoQuotaRequestInfo {
+    /// 审批通过后的目标上限。审批台与 CLI 都按这个口径展示。
+    pub fn target_bytes(&self) -> u64 {
+        self.quota_before_bytes.saturating_add(self.increment_bytes)
+    }
 }
 
 /// 用户搜索结果。刻意只有三项字段：认人够用，不多给。
@@ -2419,6 +2451,13 @@ impl ServerStore {
                 params![now],
             )
             .map_err(db("过期仓库申请失败"))?;
+        self.conn
+            .execute(
+                "UPDATE repo_quota_requests SET status = 'expired'
+                 WHERE status = 'pending' AND expires_at <= ?1",
+                params![now],
+            )
+            .map_err(db("过期扩容申请失败"))?;
         Ok(())
     }
 
@@ -3155,12 +3194,14 @@ impl ServerStore {
     // ---------------- 仓库创建申请与审批 ----------------
 
     /// 提交仓库创建申请。任何 ACTIVE 用户都可以申请，但必须管理员审批后才分配 repo_id。
+    ///
+    /// 容量不由申请人填写：一律按 `vcs_core::REPO_INITIAL_QUOTA_BYTES`（10 GiB）落库，
+    /// 管理员审批时也只回答「同意 / 拒绝」，不再核定数字。空间不够走扩容申请。
     pub fn request_repo(
         &self,
         actor: &Session,
         repo_name: &str,
         reason: &str,
-        requested_quota_bytes: u64,
     ) -> Result<RepoRequestInfo> {
         validate_repo_name(repo_name)?;
         if reason.chars().count() > 200 {
@@ -3169,6 +3210,7 @@ impl ServerStore {
                 "用途说明不超过 200 个字符",
             ));
         }
+        let requested_quota_bytes = core_types::REPO_INITIAL_QUOTA_BYTES;
         self.expire_stale_requests()?;
 
         let taken: Option<String> = self
@@ -3338,28 +3380,35 @@ impl ServerStore {
     }
 
     /// 审批通过：单事务内建仓库 + 登记申请人 owner + 写入初始空版本 r0。
-    /// `quota_bytes = 0` 表示不核定，继承全局默认配额。
+    ///
+    /// 容量取自申请单上服务端写死的值（10 GiB），不接受审批人再填数字；
+    /// 审批人在这里只有「通过 / 驳回」两个动作。
     pub fn approve_repo_request(
         &self,
         actor: &Session,
         request_id: &str,
-        quota_bytes: u64,
         decision_note: &str,
     ) -> Result<RepoInfo> {
         self.require_admin(actor, "审批仓库申请")?;
         self.expire_stale_requests()?;
 
         // 连申请人用户名一起取出来：初始空版本 r0 的作者应该是仓库的主人，而不是审批人。
-        let (requester, requester_name, repo_name, state): (String, String, String, String) = self
+        let (requester, requester_name, repo_name, state, requested_quota_bytes): (
+            String,
+            String,
+            String,
+            String,
+            i64,
+        ) = self
             .conn
             .query_row(
                 "SELECT q.requester_user_id, COALESCE(u.username, ''),
-                        q.repo_name, q.status
+                        q.repo_name, q.status, q.requested_quota_bytes
                  FROM repo_creation_requests q
                  LEFT JOIN users u ON u.user_id = q.requester_user_id
                  WHERE q.request_id = ?1",
                 params![request_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()
             .map_err(db("查询仓库申请失败"))?
@@ -3371,6 +3420,12 @@ impl ServerStore {
             ));
         }
         validate_repo_name(&repo_name)?;
+        // 老库里的申请单可能没写过容量，按固定初始配额补齐，而不是退回「继承默认」。
+        let quota_bytes = if requested_quota_bytes > 0 {
+            requested_quota_bytes as u64
+        } else {
+            core_types::REPO_INITIAL_QUOTA_BYTES
+        };
 
         let tx = self
             .conn
@@ -3461,6 +3516,331 @@ impl ServerStore {
         )?;
         tx.commit().map_err(db("提交驳回事务失败"))?;
         Ok(())
+    }
+
+    // ---------------- 仓库扩容申请与审批 ----------------
+
+    /// 提交扩容申请。
+    ///
+    /// 申请人只表达「要扩容」，不填任何数字：增量由服务端固定按
+    /// `REPO_QUOTA_EXPANSION_STEP_BYTES`（10 GiB）计算。同一仓库同时只允许一条
+    /// 待审批申请，避免连点两下就把上限抬两档。
+    pub fn request_repo_expansion(
+        &self,
+        actor: &Session,
+        repo_id: &str,
+        reason: &str,
+    ) -> Result<RepoQuotaRequestInfo> {
+        if reason.chars().count() > 200 {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "扩容说明不超过 200 个字符",
+            ));
+        }
+        self.expire_stale_requests()?;
+        // 成员门 + 仓库状态门：不是成员就不能替别人的仓库要空间。
+        let repo = self.require_repo(actor, repo_id)?;
+        let pending: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT request_id FROM repo_quota_requests
+                 WHERE repo_id = ?1 AND status = 'pending'",
+                params![repo.repo_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db("查询扩容申请失败"))?;
+        if pending.is_some() {
+            return Err(Error::new(
+                ErrorCode::RepoCreationExists,
+                "该仓库已有待审批的扩容申请，请等待管理员处理",
+            ));
+        }
+
+        let increment_bytes = core_types::REPO_QUOTA_EXPANSION_STEP_BYTES;
+        let quota_before_bytes = self.effective_quota(&repo.repo_id)?.bytes;
+        let now = now_secs();
+        let request_id = new_id("eq");
+        let expires_at = now + REPO_REQUEST_TTL_SECONDS;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(db("开启事务失败"))?;
+        tx.execute(
+            "INSERT INTO repo_quota_requests
+               (request_id, repo_id, requester_user_id, increment_bytes, quota_before_bytes,
+                reason, status, submitted_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
+            params![
+                request_id,
+                repo.repo_id,
+                actor.user_id,
+                increment_bytes as i64,
+                quota_before_bytes as i64,
+                reason,
+                now,
+                expires_at
+            ],
+        )
+        .map_err(db("写入扩容申请失败"))?;
+        write_audit(
+            &tx,
+            &repo.repo_id,
+            &actor.user_id,
+            "repo.expand.request",
+            &repo.name,
+            Some(&format!(
+                "{{\"request_id\":\"{request_id}\",\"increment\":{increment_bytes}}}"
+            )),
+            now,
+        )?;
+        tx.commit().map_err(db("提交扩容申请事务失败"))?;
+
+        Ok(RepoQuotaRequestInfo {
+            request_id,
+            repo_id: repo.repo_id,
+            repo_name: repo.name,
+            requester_user_id: actor.user_id.clone(),
+            increment_bytes,
+            quota_before_bytes,
+            reason: if reason.is_empty() {
+                None
+            } else {
+                Some(reason.to_string())
+            },
+            state: core_types::RepoCreationStatus::Pending,
+            submitted_at: now,
+            decided_at: None,
+            decided_by: None,
+            decision_note: None,
+            expires_at,
+        })
+    }
+
+    /// 列出扩容申请。管理员看全部，普通用户只看自己的。
+    pub fn list_repo_quota_requests(
+        &self,
+        actor: &Session,
+        filter: Option<core_types::RepoCreationStatus>,
+        limit: usize,
+    ) -> Result<Vec<RepoQuotaRequestInfo>> {
+        self.expire_stale_requests()?;
+        let filter = filter.map(creation_status_str).unwrap_or("");
+        let mine = if actor.role == Role::Admin {
+            ""
+        } else {
+            actor.user_id.as_str()
+        };
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT q.request_id, q.repo_id, COALESCE(r.name, ''), q.requester_user_id,
+                        q.increment_bytes, q.quota_before_bytes, q.reason, q.status,
+                        q.submitted_at, q.decided_at, q.decided_by, q.decision_note, q.expires_at
+                 FROM repo_quota_requests q
+                 LEFT JOIN repos r ON r.repo_id = q.repo_id
+                 WHERE (?1 = '' OR q.status = ?1)
+                   AND (?2 = '' OR q.requester_user_id = ?2)
+                 ORDER BY q.submitted_at DESC LIMIT ?3",
+            )
+            .map_err(db("查询扩容申请失败"))?;
+        let rows = stmt
+            .query_map(params![filter, mine, limit.max(1) as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, i64>(8)?,
+                    r.get::<_, Option<i64>>(9)?,
+                    r.get::<_, Option<String>>(10)?,
+                    r.get::<_, Option<String>>(11)?,
+                    r.get::<_, i64>(12)?,
+                ))
+            })
+            .map_err(db("查询扩容申请失败"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (
+                request_id,
+                repo_id,
+                repo_name,
+                requester_user_id,
+                increment_bytes,
+                quota_before_bytes,
+                reason,
+                status,
+                submitted_at,
+                decided_at,
+                decided_by,
+                decision_note,
+                expires_at,
+            ) = row.map_err(db("查询扩容申请失败"))?;
+            out.push(RepoQuotaRequestInfo {
+                request_id,
+                repo_id,
+                repo_name,
+                requester_user_id,
+                increment_bytes: increment_bytes.max(0) as u64,
+                quota_before_bytes: quota_before_bytes.max(0) as u64,
+                reason,
+                state: parse_creation_status(&status)?,
+                submitted_at,
+                decided_at,
+                decided_by,
+                decision_note,
+                expires_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 审批扩容申请：把仓库上限提到「当前生效值 + 固定增量」。
+    ///
+    /// 审批人真正要判断的是机器磁盘还剩多少，所以这里先探测数据卷：
+    /// 连这一次增量都放不下时直接拒绝审批——批了也写不进去。
+    pub fn approve_repo_quota_request(
+        &self,
+        actor: &Session,
+        request_id: &str,
+        decision_note: &str,
+    ) -> Result<EffectiveQuota> {
+        self.require_admin(actor, "审批扩容申请")?;
+        self.expire_stale_requests()?;
+        let (repo_id, state, increment_bytes): (String, String, i64) = self
+            .conn
+            .query_row(
+                "SELECT repo_id, status, increment_bytes FROM repo_quota_requests
+                 WHERE request_id = ?1",
+                params![request_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(db("查询扩容申请失败"))?
+            .ok_or_else(|| Error::new(ErrorCode::RepoApprovalNotFound, "扩容申请不存在"))?;
+        if parse_creation_status(&state)? != core_types::RepoCreationStatus::Pending {
+            return Err(Error::new(
+                ErrorCode::RepoApprovalNotFound,
+                format!("该扩容申请已处理（{state}），不能重复审批"),
+            ));
+        }
+        let repo = self.find_repo(&repo_id)?;
+        let increment = if increment_bytes > 0 {
+            increment_bytes as u64
+        } else {
+            core_types::REPO_QUOTA_EXPANSION_STEP_BYTES
+        };
+        let capacity = self.storage_capacity()?;
+        if capacity.available_bytes < increment {
+            return Err(Error::new(
+                ErrorCode::QuotaExceeded,
+                format!(
+                    "数据盘可用空间不足：可用 {}，本次扩容需要 {}；请先清理空间再审批",
+                    human_bytes(capacity.available_bytes),
+                    human_bytes(increment)
+                ),
+            ));
+        }
+
+        // 目标值按「审批这一刻」的生效上限重算：期间管理员若调整过配额，
+        // 申请单上的快照只用于展示，不参与计算。
+        let target = self
+            .effective_quota(&repo.repo_id)?
+            .bytes
+            .saturating_add(increment);
+        let now = now_secs();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(db("开启事务失败"))?;
+        tx.execute(
+            "UPDATE repos SET quota_bytes = ?2, updated_at = ?3 WHERE repo_id = ?1",
+            params![repo.repo_id, target as i64, now],
+        )
+        .map_err(db("更新仓库配额失败"))?;
+        tx.execute(
+            "UPDATE repo_quota_requests
+             SET status = 'approved', decided_at = ?2, decided_by = ?3, decision_note = ?4
+             WHERE request_id = ?1",
+            params![request_id, now, actor.user_id, decision_note],
+        )
+        .map_err(db("更新扩容申请失败"))?;
+        write_audit(
+            &tx,
+            &repo.repo_id,
+            &actor.user_id,
+            "repo.expand.approve",
+            &repo.name,
+            Some(&format!(
+                "{{\"request_id\":\"{request_id}\",\"quota\":{target}}}"
+            )),
+            now,
+        )?;
+        tx.commit().map_err(db("提交扩容审批事务失败"))?;
+        Ok(core_types::resolve_effective_quota(target, 0))
+    }
+
+    /// 驳回扩容申请（仅管理员，必须写原因）。
+    pub fn reject_repo_quota_request(
+        &self,
+        actor: &Session,
+        request_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.require_admin(actor, "驳回扩容申请")?;
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(Error::new(ErrorCode::InvalidArgument, "驳回必须填写原因"));
+        }
+        self.expire_stale_requests()?;
+        let (repo_id, state): (String, String) = self
+            .conn
+            .query_row(
+                "SELECT repo_id, status FROM repo_quota_requests WHERE request_id = ?1",
+                params![request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(db("查询扩容申请失败"))?
+            .ok_or_else(|| Error::new(ErrorCode::RepoApprovalNotFound, "扩容申请不存在"))?;
+        if parse_creation_status(&state)? != core_types::RepoCreationStatus::Pending {
+            return Err(Error::new(
+                ErrorCode::RepoApprovalNotFound,
+                format!("该扩容申请已处理（{state}），不能重复处理"),
+            ));
+        }
+        let now = now_secs();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(db("开启事务失败"))?;
+        tx.execute(
+            "UPDATE repo_quota_requests
+             SET status = 'rejected', decided_at = ?2, decided_by = ?3, decision_note = ?4
+             WHERE request_id = ?1",
+            params![request_id, now, actor.user_id, reason],
+        )
+        .map_err(db("更新扩容申请失败"))?;
+        write_audit(
+            &tx,
+            &repo_id,
+            &actor.user_id,
+            "repo.expand.reject",
+            request_id,
+            Some(&format!("{{\"reason\":\"{}\"}}", json_escape(reason))),
+            now,
+        )?;
+        tx.commit().map_err(db("提交驳回事务失败"))?;
+        Ok(())
+    }
+
+    /// 数据卷容量：管理端审批扩容时展示的「机器磁盘可用空间」。
+    pub fn storage_capacity(&self) -> Result<StorageCapacity> {
+        disk_capacity(&self.root)
     }
 
     // ---------------- PAT ----------------
@@ -5486,6 +5866,22 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// 字节数的可读形式，只用于错误提示与审计文案。
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn validate_username(username: &str) -> Result<()> {

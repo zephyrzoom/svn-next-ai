@@ -796,7 +796,7 @@ message RepoCreationInfo {
   string repo_name = 3;
   string repo_id_hint = 4;
   string reason = 5;
-  uint64 requested_quota_bytes = 6;
+  uint64 requested_quota_bytes = 6;  // 服务端固定 10 GiB，申请人不填
   RepoCreationStatus state = 7;
   int64 submitted_at = 8;
   int64 decided_at = 9;
@@ -810,7 +810,7 @@ message RequestRepoRequest {
   string repo_name = 1;
   string repo_id_hint = 2;
   string reason = 3;
-  uint64 requested_quota_bytes = 4;
+  reserved 4;  // 原 requested_quota_bytes：容量由服务端固定，申请人不再填写
 }
 
 message RequestRepoResponse {
@@ -840,9 +840,8 @@ message ListRepoCreationsResponse {
 
 message ApproveRepoCreationRequest {
   string request_id = 1;
-  uint64 quota_bytes = 2;  // 0 表示不核定，继承全局默认配额
   string decision_note = 4;
-  reserved 3;  // 原 quota_hard_bytes
+  reserved 2, 3;  // 原 quota_bytes / quota_hard_bytes：审批人不再核定容量
 }
 
 message ApproveRepoCreationResponse {
@@ -857,6 +856,81 @@ message RejectRepoCreationRequest {
 
 message RejectRepoCreationResponse {
   Status status = 1;
+}
+
+// ---------------- 仓库扩容申请 ----------------
+
+// 扩容申请同样不填数字：一次申请固定增加 10 GiB，
+// 服务端按「当前生效上限 + 固定增量」算出目标值。
+message RepoQuotaRequestInfo {
+  string request_id = 1;
+  string repo_id = 2;
+  string repo_name = 3;
+  string requester_user_id = 4;
+  uint64 increment_bytes = 5;      // 固定增量（当前 10 GiB）
+  uint64 quota_before_bytes = 6;   // 提交时的生效上限
+  uint64 target_quota_bytes = 7;   // quota_before_bytes + increment_bytes
+  string reason = 8;
+  RepoCreationStatus state = 9;    // 复用同一套申请状态
+  int64 submitted_at = 10;
+  int64 decided_at = 11;
+  string decided_by = 12;
+  string decision_note = 13;
+  int64 expires_at = 14;
+}
+
+message RequestRepoExpansionRequest {
+  string repo_id = 1;
+  string reason = 2;
+}
+
+message RequestRepoExpansionResponse {
+  Status status = 1;
+  string request_id = 2;
+  RepoCreationStatus state = 3;
+}
+
+message ListRepoQuotaRequestsRequest {
+  RepoCreationStatus filter = 1;
+  uint32 limit = 2;
+}
+
+message ListRepoQuotaRequestsResponse {
+  Status status = 1;
+  repeated RepoQuotaRequestInfo requests = 2;
+}
+
+message ApproveRepoQuotaRequestRequest {
+  string request_id = 1;
+  string decision_note = 2;
+}
+
+message ApproveRepoQuotaRequestResponse {
+  Status status = 1;
+  uint64 quota_bytes = 2;  // 审批后的生效上限
+}
+
+message RejectRepoQuotaRequestRequest {
+  string request_id = 1;
+  string reason = 2;
+}
+
+message RejectRepoQuotaRequestResponse {
+  Status status = 1;
+}
+
+// 服务器数据卷容量：管理员据此判断这次扩容批不批。
+message StorageCapacity {
+  uint64 total_bytes = 1;
+  uint64 available_bytes = 2;
+  uint64 used_bytes = 3;
+}
+
+message GetStorageCapacityRequest {}
+
+message GetStorageCapacityResponse {
+  Status status = 1;
+  StorageCapacity capacity = 2;
 }
 
 message ListReposRequest {
@@ -1094,14 +1168,20 @@ service AuthService {
   rpc SetUserRole(SetUserRoleRequest) returns (SetUserRoleResponse);
 }
 
-// 仓库创建与审批：RequestRepo 面向所有 ACTIVE 用户，
-// Approve / Reject / CreateRepoDirect / SetRepoStatus 仅限全局 admin。
+// 仓库创建与审批：RequestRepo / RequestRepoExpansion 面向所有 ACTIVE 用户（扩容还要求
+// 是仓库成员），Approve / Reject / CreateRepoDirect / SetRepoStatus / GetStorageCapacity
+// 仅限全局 admin。
 service RepoAdminService {
   rpc RequestRepo(RequestRepoRequest) returns (RequestRepoResponse);
   rpc GetRepoCreation(GetRepoCreationRequest) returns (GetRepoCreationResponse);
   rpc ListRepoCreations(ListRepoCreationsRequest) returns (ListRepoCreationsResponse);
   rpc ApproveRepoCreation(ApproveRepoCreationRequest) returns (ApproveRepoCreationResponse);
   rpc RejectRepoCreation(RejectRepoCreationRequest) returns (RejectRepoCreationResponse);
+  rpc RequestRepoExpansion(RequestRepoExpansionRequest) returns (RequestRepoExpansionResponse);
+  rpc ListRepoQuotaRequests(ListRepoQuotaRequestsRequest) returns (ListRepoQuotaRequestsResponse);
+  rpc ApproveRepoQuotaRequest(ApproveRepoQuotaRequestRequest) returns (ApproveRepoQuotaRequestResponse);
+  rpc RejectRepoQuotaRequest(RejectRepoQuotaRequestRequest) returns (RejectRepoQuotaRequestResponse);
+  rpc GetStorageCapacity(GetStorageCapacityRequest) returns (GetStorageCapacityResponse);
   rpc CreateRepoDirect(CreateRepoDirectRequest) returns (CreateRepoDirectResponse);
   rpc ListRepos(ListReposRequest) returns (ListReposResponse);
   rpc GetRepo(GetRepoQuery) returns (GetRepoResponse);

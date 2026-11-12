@@ -125,10 +125,17 @@ async function main() {
     const token = res.data.data.token;
     for (const route of ['/api/session', '/api/overview', '/api/users',
       '/api/registrations?state=pending', '/api/repo-requests?state=pending',
+      '/api/repo-expansions?state=pending', '/api/storage',
       '/api/repos', '/api/quota-defaults', '/api/ldap']) {
       res = await api(base, route, { token });
       check(res.status === 200 && res.data.ok, `GET ${route} 失败：${JSON.stringify(res.data)}`);
     }
+
+    step('磁盘容量与扩容审批视图');
+    res = await api(base, '/api/repo-expansions?state=pending', { token });
+    check(res.status === 200 && Array.isArray(res.data.data.items), '扩容申请列表结构不对');
+    check(res.data.data.storage.total_bytes > 0, '扩容审批页应带出磁盘容量');
+    check(res.data.data.step_bytes > 0, '扩容步长缺失');
 
     step('直通建库与仓库治理');
     res = await api(base, '/api/repos', {

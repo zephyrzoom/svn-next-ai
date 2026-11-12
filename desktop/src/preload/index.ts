@@ -183,7 +183,11 @@ export interface VcsApi {
   requestRepo(
     name: string,
     reason: string,
-    quota?: number,
+  ): Promise<Envelope<{ requestId: string; state: number }>>;
+  /** 申请扩容：容量固定 +10 GiB，由管理员结合磁盘余量审批。 */
+  requestRepoExpansion(
+    repoId: string,
+    reason?: string,
   ): Promise<Envelope<{ requestId: string; state: number }>>;
 
   // —— 只读容量 ——
@@ -218,8 +222,9 @@ const api: VcsApi = {
 
   register: (target, username, displayName, password, reason) =>
     ipcRenderer.invoke('vcs:register', target, username, displayName, password, reason),
-  requestRepo: (name, reason, quota) =>
-    ipcRenderer.invoke('vcs:requestRepo', name, reason, quota),
+  requestRepo: (name, reason) => ipcRenderer.invoke('vcs:requestRepo', name, reason),
+  requestRepoExpansion: (repoId, reason) =>
+    ipcRenderer.invoke('vcs:requestRepoExpansion', repoId, reason),
 
   getQuota: (repoId) => ipcRenderer.invoke('vcs:getQuota', repoId),
 

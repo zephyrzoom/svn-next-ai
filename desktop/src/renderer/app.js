@@ -373,7 +373,7 @@ function renderQuota(quota) {
     `（来源：${quotaSourceLabel(quota.source)}）`;
 }
 
-// ---------------- 建库申请 ----------------
+// ---------------- 建库申请 / 扩容申请 ----------------
 
 async function requestRepo() {
   const name = el('request-repo').value.trim();
@@ -386,7 +386,23 @@ async function requestRepo() {
   el('request-repo').value = '';
   el('request-reason').value = '';
   banner(
-    `建库申请已提交（${result.requestId}）。审批通过后你会自动成为 owner，仓库会出现在列表里。`,
+    `建库申请已提交（${result.requestId}）。通过后容量为 10 GiB，你会自动成为 owner，仓库会出现在列表里。`,
+  );
+}
+
+/** 扩容申请同样不填容量：一次固定 +10 GiB，由管理员按磁盘余量批准。 */
+async function requestExpansion() {
+  if (!state.selectedRepoId) {
+    banner('请先选择一个仓库', 'error');
+    return;
+  }
+  const repo = state.repos.find((item) => item.repoId === state.selectedRepoId);
+  const result = unwrap(
+    await api.requestRepoExpansion(state.selectedRepoId, ''),
+    '提交扩容申请',
+  );
+  banner(
+    `已提交 ${repo ? repo.name : ''} 的扩容申请（${result.requestId}）：通过后上限增加 10 GiB。`,
   );
 }
 
@@ -665,6 +681,7 @@ el('delete-file').addEventListener('click', () =>
   void guard('删除文件', () => resolveConflict('delete')),
 );
 el('do-request').addEventListener('click', () => void guard('提交建库申请', requestRepo));
+el('do-expand').addEventListener('click', () => void guard('提交扩容申请', requestExpansion));
 el('disconnect').addEventListener('click', () => void guard('退出登录', disconnect));
 el('account-disconnect').addEventListener('click', () => void guard('退出登录', disconnect));
 el('pick-dir').addEventListener('click', () => void guard('选择目录', pickDir));

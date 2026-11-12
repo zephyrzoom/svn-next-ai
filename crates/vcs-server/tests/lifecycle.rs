@@ -1044,18 +1044,27 @@ fn repo_request_stays_unusable_until_approved() {
     let alice = admin(&store);
 
     let req = store
-        .request_repo(&alice, "monthly", "按月归档报表", 0)
+        .request_repo(&alice, "monthly", "按月归档报表")
         .unwrap();
     assert_eq!(req.repo_name, "monthly");
+    // 容量不用填：服务端固定按初始配额落库，审批人也不会再看到配额输入框。
+    assert_eq!(
+        req.requested_quota_bytes,
+        vcs_core::REPO_INITIAL_QUOTA_BYTES
+    );
     // 未审批：仓库不存在，任何 RepoService 调用都拿不到它。
     let err = store.find_repo("monthly").unwrap_err();
     assert_eq!(err.code, ErrorCode::RepoNotFound);
 
     let repo = store
-        .approve_repo_request(&alice, &req.request_id, 0, "同意")
+        .approve_repo_request(&alice, &req.request_id, "同意")
         .unwrap();
     assert_eq!(repo.name, "monthly");
     assert_eq!(repo.owner_user_id, alice.user_id);
+    assert_eq!(
+        store.effective_quota(&repo.repo_id).unwrap().bytes,
+        vcs_core::REPO_INITIAL_QUOTA_BYTES
+    );
 
     // 申请人自动成为 owner，且仓库从 r0 空版本开始可用。
     let found = store.find_repo("monthly").unwrap();
@@ -1070,9 +1079,71 @@ fn repo_request_stays_unusable_until_approved() {
 
     // 重复审批必须被拒，否则会建出第二个同名仓库。
     let err = store
-        .approve_repo_request(&alice, &req.request_id, 0, "再批一次")
+        .approve_repo_request(&alice, &req.request_id, "再批一次")
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::RepoApprovalNotFound);
+}
+
+#[test]
+fn quota_expansion_adds_one_fixed_step() {
+    let sb = Sandbox::new("quota-expand");
+    let store = sb.store();
+    let alice = admin(&store);
+    store
+        .create_user(&alice, "heidi", "何迪", PASSWORD, Role::Writer)
+        .unwrap();
+    let (token, _) = store.login("heidi", PASSWORD).unwrap();
+    let heidi = store.authenticate(&token).unwrap();
+
+    let req = store.request_repo(&heidi, "assets", "素材库").unwrap();
+    let repo = store
+        .approve_repo_request(&alice, &req.request_id, "同意")
+        .unwrap();
+    let before = store.effective_quota(&repo.repo_id).unwrap().bytes;
+    assert_eq!(before, vcs_core::REPO_INITIAL_QUOTA_BYTES);
+
+    // 成员申请扩容：不填容量，增量由服务端固定。
+    let expansion = store
+        .request_repo_expansion(&heidi, &repo.repo_id, "素材变多了")
+        .unwrap();
+    assert_eq!(
+        expansion.increment_bytes,
+        vcs_core::REPO_QUOTA_EXPANSION_STEP_BYTES
+    );
+    assert_eq!(expansion.quota_before_bytes, before);
+    assert_eq!(expansion.target_bytes(), before + expansion.increment_bytes);
+
+    // 同一仓库同时只允许一条待审批申请。
+    let err = store
+        .request_repo_expansion(&heidi, &repo.repo_id, "再来一次")
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::RepoCreationExists);
+
+    // 审批前上限不变；审批后才增加一个固定步长。
+    assert_eq!(store.effective_quota(&repo.repo_id).unwrap().bytes, before);
+    let effective = store
+        .approve_repo_quota_request(&alice, &expansion.request_id, "同意")
+        .unwrap();
+    assert_eq!(
+        effective.bytes,
+        before + vcs_core::REPO_QUOTA_EXPANSION_STEP_BYTES
+    );
+    assert_eq!(
+        store.effective_quota(&repo.repo_id).unwrap().bytes,
+        effective.bytes
+    );
+
+    // 重复审批必须被拒。
+    let err = store
+        .approve_repo_quota_request(&alice, &expansion.request_id, "再批一次")
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::RepoApprovalNotFound);
+
+    // 非成员不能替别人的仓库要空间。
+    let err = store
+        .request_repo_expansion(&alice, &repo.repo_id, "我不是成员")
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::RepoNotMember);
 }
 
 #[test]
@@ -1087,10 +1158,10 @@ fn repo_request_rejects_duplicates_and_limits_visibility() {
     let grace = store.authenticate(&token).unwrap();
 
     let req = store
-        .request_repo(&grace, "grace-repo", "个人归档", 0)
+        .request_repo(&grace, "grace-repo", "个人归档")
         .unwrap();
     let err = store
-        .request_repo(&grace, "grace-repo", "再申请", 0)
+        .request_repo(&grace, "grace-repo", "再申请")
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::RepoCreationExists);
 
@@ -1114,7 +1185,7 @@ fn repo_request_rejects_duplicates_and_limits_visibility() {
 
     // 已占用名字不能再申请。
     store.create_repo_direct(&alice, "taken", 0).unwrap();
-    let err = store.request_repo(&grace, "taken", "重复", 0).unwrap_err();
+    let err = store.request_repo(&grace, "taken", "重复").unwrap_err();
     assert_eq!(err.code, ErrorCode::RepoCreationExists);
 }
 

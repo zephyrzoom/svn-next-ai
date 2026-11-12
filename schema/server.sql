@@ -44,6 +44,8 @@ VALUES ('default_quota_bytes', '0', 0, 'bootstrap');
 
 -- 未审批的申请只是一张单据：不分配 repo_id、不创建 CAS 目录、不能调用 RepoService。
 -- 审批通过后在单事务内插入 repos(active) + repo_members 的 owner 行 + 更新本申请 + 审计日志。
+-- requested_quota_bytes 由服务端固定写成 10 GiB（vcs-core::REPO_INITIAL_QUOTA_BYTES），
+-- 申请人与审批人都不填容量：建库申请只回答「要不要建」。
 CREATE TABLE IF NOT EXISTS repo_creation_requests (
   request_id            TEXT PRIMARY KEY,
   requester_user_id     TEXT NOT NULL,
@@ -63,6 +65,33 @@ CREATE TABLE IF NOT EXISTS repo_creation_requests (
 
 CREATE INDEX IF NOT EXISTS idx_repo_req_requester ON repo_creation_requests (requester_user_id, status);
 CREATE INDEX IF NOT EXISTS idx_repo_req_pending ON repo_creation_requests (status, submitted_at);
+
+-- ---------------- 仓库扩容申请 ----------------
+
+-- 已建仓库要加空间时提交的单据：容量不由申请人填写，服务端固定按
+-- +10 GiB（vcs-core::REPO_QUOTA_EXPANSION_STEP_BYTES）计算。
+-- 管理员审批时参照服务器数据卷的可用空间（管理端 /api/storage），
+-- 通过后在单事务内把 repos.quota_bytes 提到 quota_before_bytes + increment_bytes，
+-- 更新本申请并写审计日志。同一仓库同时只允许一条待审批扩容申请。
+CREATE TABLE IF NOT EXISTS repo_quota_requests (
+  request_id         TEXT PRIMARY KEY,
+  repo_id            TEXT NOT NULL,
+  requester_user_id  TEXT NOT NULL,
+  increment_bytes    BIGINT NOT NULL,  -- 固定增量，当前为 10 GiB
+  quota_before_bytes BIGINT NOT NULL,  -- 提交时的生效上限，审批台用来展示「加了多少」
+  reason             TEXT,
+  status             TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
+  submitted_at       BIGINT NOT NULL,
+  decided_at         BIGINT,
+  decided_by         TEXT,
+  decision_note      TEXT,
+  expires_at         BIGINT NOT NULL,
+  FOREIGN KEY (repo_id) REFERENCES repos (repo_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_repo_quota_req_repo ON repo_quota_requests (repo_id, status);
+CREATE INDEX IF NOT EXISTS idx_repo_quota_req_state ON repo_quota_requests (status, submitted_at);
 
 -- ---------------- 仓库成员 ----------------
 

@@ -262,8 +262,12 @@ ipcMain.handle(
     ),
 );
 
-ipcMain.handle('vcs:requestRepo', (_event, name: string, reason: string, quota = 0) =>
-  wrap(async () => requireClient().requestRepo(name, reason, quota)),
+ipcMain.handle('vcs:requestRepo', (_event, name: string, reason: string) =>
+  wrap(async () => requireClient().requestRepo(name, reason)),
+);
+
+ipcMain.handle('vcs:requestRepoExpansion', (_event, repoId: string, reason = '') =>
+  wrap(async () => requireClient().requestRepoExpansion(repoId, reason)),
 );
 
 // ---------------- 只读容量 ----------------

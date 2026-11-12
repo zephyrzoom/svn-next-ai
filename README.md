@@ -236,7 +236,8 @@ vcs ldap-show     # 回显配置，不显示密码
 1. 用户在**登录页「本地账号」tab**点「还没有账号？申请注册」，填用户名 / 姓名 / **登录密码** / 申请理由（密码策略由服务端复核，未通过审批前不能登录）。
 2. 管理员在 **Web 管理端「审批台 → 注册申请」**通过（可选角色），审批只做放行，不再发放任何一次性链接。
 3. 用户回到登录页，用**注册时设置的密码**登录，成功后进入主界面。
-4. 登录后若需要自己的仓库，在「仓库」视图点「提交建库申请」；管理员在 **Web 管理端「审批台 → 建库申请」**批准，申请人自动成为该仓库 owner。管理员也可在「仓库」页「直通新建」。
+4. 登录后若需要自己的仓库，在「仓库」视图点「提交建库申请」；管理员在 **Web 管理端「审批台 → 建库申请」**点「通过」，申请人自动成为该仓库 owner。申请与审批都**不填容量**：通过即为 10 GiB，管理员只决定同意或拒绝。管理员也可在「仓库」页「直通新建」。
+5. 空间不够时，在「仓库」视图点「申请扩容 +10 GiB」（同样不填容量，一次固定加 10 GiB）；管理员在「审批台 → 扩容申请」结合页面顶部的**磁盘可用空间**决定批不批。
 
 等价的 CLI 操作（管理员在服务器本机执行）：
 
@@ -246,7 +247,10 @@ vcs register --username bob --name "李波"            # 交互式输入登录�
 vcs register-list --state pending
 vcs register-approve <request_id> --role writer
 vcs repo-request-list --state pending
-vcs repo-approve <request_id> --quota 1073741824 --note "同意"
+vcs repo-approve <request_id> --note "同意"        # 容量固定 10 GiB，不填数字
+vcs repo-expand <仓库名> --reason "素材变多"        # 一次固定 +10 GiB
+vcs repo-expand-list                              # 顺带打印数据盘可用空间
+vcs repo-expand-approve <request_id> --note "同意"
 ```
 
 ### 4.3 日常操作
@@ -258,7 +262,7 @@ vcs repo-approve <request_id> --quota 1073741824 --note "同意"
 | 更新 | 「更新」拉取服务端新版本。**本地版本落后时提交会被拒**，必须先更新 |
 | 冲突 | 三栏查看 base / mine / theirs，选择「保留我的」「采用服务端」或手工合并后保存；带冲突无法提交 |
 | 还原 | 「全部还原」丢弃本地改动并清冲突（未受控文件不会被删） |
-| 只读容量 | 「仓库」视图显示当前仓库的已用 / 上限（只读，桌面端不能改配额） |
+| 只读容量 | 「仓库」视图显示当前仓库的已用 / 上限（只读，桌面端不能改配额）；不够用时点「申请扩容 +10 GiB」 |
 | 成员 / 配额 | Web 管理端「仓库」页：增删成员与调整角色（owner 受保护）、单仓库配额覆盖与恢复继承；「配额」页设全局默认 |
 | 空间治理 | Web 管理端「空间治理」页：预估可释放 → 清理所选 → 回收站撤销（内容已被 GC 回收则明确失败）；保留策略先预览、再切为可执行 |
 
@@ -294,7 +298,7 @@ vcs info reports                                # 用量与生效配额
 | 分组 | 命令 |
 | --- | --- |
 | 账号 / 会话 | `init-admin`、`login`（`--password` / `--pat` / `--ldap`）、`logout`、`user-create`、`register*`、`ldap-config` / `ldap-show` / `ldap-test` |
-| 仓库 | `repo-create`、`repo-request*`、`repo-approve` / `repo-reject`、`repo-list`、`repo-quota`、`repo-status` |
+| 仓库 | `repo-create`、`repo-request*`、`repo-approve` / `repo-reject`、`repo-expand` / `repo-expand-list`、`repo-expand-approve` / `repo-expand-reject`、`repo-list`、`repo-quota`、`repo-status` |
 | 成员 | `member-add` / `member-list` / `member-remove` / `member-set-role` |
 | 读写 | `import`、`checkout`（`-r` 指定历史版本）、`status`、`diff`、`commit`、`update`、`revert`、`log`、`cat` |
 | 容量治理 | `info`、`candidates`、`estimate`、`purge`（`--immediate`）、`gc` / `gc-status`、`purged` / `unpurge`、`retention-*`、`maintenance` |

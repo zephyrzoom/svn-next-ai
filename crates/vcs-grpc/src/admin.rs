@@ -24,8 +24,9 @@ use vcs_core::{
 use vcs_server::{
     authenticate_ldap, ActorKind, AdminOverview, AdminUser, GcJobStatus, LdapPublicConfig,
     LdapSettings, LdapTestOutcome, MemberInfo, PurgeCandidate, PurgeEstimate, PurgeOutcome,
-    PurgedPathInfo, RegistrationInfo, RepoInfo, RepoRequestInfo, RetentionApplyOutcome,
-    RetentionPolicyInfo, RetentionPolicyInput, ServerStore, Session, TlsMode, UsageInfo, UserInfo,
+    PurgedPathInfo, RegistrationInfo, RepoInfo, RepoQuotaRequestInfo, RepoRequestInfo,
+    RetentionApplyOutcome, RetentionPolicyInfo, RetentionPolicyInput, ServerStore, Session,
+    StorageCapacity, TlsMode, UsageInfo, UserInfo,
 };
 
 use crate::Store;
@@ -57,6 +58,16 @@ pub fn app(store: Store) -> Router {
         .route("/api/repo-requests", get(repo_requests))
         .route("/api/repo-requests/:id/approve", post(approve_repo_request))
         .route("/api/repo-requests/:id/reject", post(reject_repo_request))
+        .route("/api/repo-expansions", get(repo_expansions))
+        .route(
+            "/api/repo-expansions/:id/approve",
+            post(approve_repo_expansion),
+        )
+        .route(
+            "/api/repo-expansions/:id/reject",
+            post(reject_repo_expansion),
+        )
+        .route("/api/storage", get(storage))
         .route("/api/users", get(users).post(create_user))
         .route("/api/users/search", get(search_users))
         .route("/api/users/:id/status", post(set_user_status))
@@ -326,6 +337,28 @@ fn repo_request_json(r: &RepoRequestInfo) -> Value {
     })
 }
 
+fn repo_expansion_json(r: &RepoQuotaRequestInfo) -> Value {
+    json!({
+        "request_id": r.request_id, "repo_id": r.repo_id, "repo_name": r.repo_name,
+        "requester_user_id": r.requester_user_id,
+        "increment_bytes": r.increment_bytes,
+        "quota_before_bytes": r.quota_before_bytes,
+        "target_quota_bytes": r.target_bytes(),
+        "reason": r.reason,
+        "state": format!("{:?}", r.state), "submitted_at": r.submitted_at,
+        "decided_at": r.decided_at, "decided_by": r.decided_by,
+        "decision_note": r.decision_note, "expires_at": r.expires_at,
+    })
+}
+
+fn storage_json(cap: &StorageCapacity) -> Value {
+    json!({
+        "total_bytes": cap.total_bytes,
+        "available_bytes": cap.available_bytes,
+        "used_bytes": cap.used_bytes,
+    })
+}
+
 fn repo_json(r: &RepoInfo) -> Value {
     json!({
         "repo_id": r.repo_id, "name": r.name, "head_rev": r.head_rev,
@@ -378,6 +411,7 @@ fn overview_json(o: &AdminOverview) -> Value {
         "repos": o.repos, "active_repos": o.active_repos,
         "pending_registrations": o.pending_registrations,
         "pending_repo_requests": o.pending_repo_requests,
+        "pending_quota_requests": o.pending_quota_requests,
         "objects": o.objects, "object_bytes": o.object_bytes,
         "purged_pending": o.purged_pending,
     })
@@ -640,10 +674,9 @@ async fn approve_repo_request(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let quota_bytes = u(&body, "quota_bytes");
     let note = s(&body, "note");
     run(&state, move |store| {
-        let repo = store.approve_repo_request(&session, &id, quota_bytes, &note)?;
+        let repo = store.approve_repo_request(&session, &id, &note)?;
         Ok(json!({ "repo": repo_json(&repo) }))
     })
     .await
@@ -663,6 +696,79 @@ async fn reject_repo_request(
     run(&state, move |store| {
         store.reject_repo_request(&session, &id, &reason)?;
         Ok(json!({}))
+    })
+    .await
+}
+
+// ---------------- 扩容审批 ----------------
+
+async fn repo_expansions(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let session = match admin_session(&state, &headers).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let filter = q.get("state").and_then(|v| parse_request_status(v));
+    run(&state, move |store| {
+        let items = store.list_repo_quota_requests(&session, filter, 200)?;
+        Ok(json!({
+            "items": items.iter().map(repo_expansion_json).collect::<Vec<_>>(),
+            // 审批人要判断的是「磁盘还放得下吗」，把容量一起带回来省一次请求。
+            "storage": storage_json(&store.storage_capacity()?),
+            "step_bytes": vcs_core::REPO_QUOTA_EXPANSION_STEP_BYTES,
+        }))
+    })
+    .await
+}
+
+async fn approve_repo_expansion(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let session = match admin_session(&state, &headers).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let note = s(&body, "note");
+    run(&state, move |store| {
+        let effective = store.approve_repo_quota_request(&session, &id, &note)?;
+        Ok(json!({ "quota_bytes": effective.bytes }))
+    })
+    .await
+}
+
+async fn reject_repo_expansion(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let session = match admin_session(&state, &headers).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let reason = s(&body, "reason");
+    run(&state, move |store| {
+        store.reject_repo_quota_request(&session, &id, &reason)?;
+        Ok(json!({}))
+    })
+    .await
+}
+
+/// 数据卷容量：扩容审批的依据，也在概览页展示。
+async fn storage(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    let session = match admin_session(&state, &headers).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    run(&state, move |store| {
+        store.require_admin_action(&session, "查看磁盘容量")?;
+        Ok(json!({ "storage": storage_json(&store.storage_capacity()?) }))
     })
     .await
 }

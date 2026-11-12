@@ -124,6 +124,7 @@ count                 u32 LE
 | --- | --- |
 | `repos` / `revisions` / `revision_changes` | 版本与变更元数据，**永久保留**；`repos` 另含 owner、状态与核定配额 |
 | `repo_creation_requests` | 仓库创建申请与审批记录（未审批不分配 `repo_id`、不创建 CAS 目录） |
+| `repo_quota_requests` | 扩容申请与审批记录（固定 +10 GiB，审批时参考数据卷可用空间） |
 | `repo_members` | 仓库成员与角色；成员资格是使用仓库的第一道门 |
 | `objects` / `trees` | CAS 对象索引、大小、`first_seen_rev`，支撑可达性计算 |
 | `purged_paths` | 路径级裁剪标记，GC 可达性遍历时跳过 |
@@ -159,8 +160,8 @@ count                 u32 LE
 | 锁 | `Lock`、`Unlock` |
 | 容量治理 | `GetQuota`、`ListPurgeCandidates`、`EstimatePurge`、`Purge`、`GetGcStatus` |
 | 用户体系 | 独立 `AuthService`：`Login`、`Register`、`List/Approve/RejectRegistration`、`RefreshToken`/`Logout`、`WhoAmI`、PAT 管理、LDAP 配置与连通性测试、用户启停与角色 |
-| 仓库管理 | 独立 `RepoAdminService`：`RequestRepo`、`List/Approve/RejectRepoCreation`、`CreateRepoDirect`（管理员直通）、`ListRepos`/`GetRepo`、`SetRepoStatus`；成员管理 `ListMembers`/`AddMember`/`RemoveMember`/`SetMemberRole`/`SearchUsers`（owner 自助） |
-| 配额配置 | `Get/UpdateQuotaDefaults`（全局默认，仅 admin）、`Get/SetRepoQuota`（单仓库覆盖，仅 admin；owner 只读查看生效值） |
+| 仓库管理 | 独立 `RepoAdminService`：`RequestRepo`、`List/Approve/RejectRepoCreation`、`RequestRepoExpansion`、`List/Approve/RejectRepoQuotaRequest`、`GetStorageCapacity`、`CreateRepoDirect`（管理员直通）、`ListRepos`/`GetRepo`、`SetRepoStatus`；成员管理 `ListMembers`/`AddMember`/`RemoveMember`/`SetMemberRole`/`SearchUsers`（owner 自助） |
+| 配额配置 | `Get/UpdateQuotaDefaults`（全局默认，仅 admin）、`Get/SetRepoQuota`（单仓库覆盖，仅 admin；owner 只读查看生效值）；扩容申请不填数字，固定 +10 GiB |
 
 **两阶段提交**：对象先落 CAS（此时是孤儿，GC 可回收），只有 `FinalizeCommit` 才在单事务里分配版本号。因此断网或中断不会产生半个版本，支持断点续传，重复哈希可秒级跳过。
 
@@ -303,13 +304,28 @@ LDAP 首次登录成功 ──────────────────�
 管理员可 SetRepoStatus 将已激活仓库置为 DISABLED / ARCHIVED
 ```
 
-- **申请单** `repo_creation_requests`：申请人、仓库名、期望 `repo_id`、用途说明、申请配额、状态、审批人与决定、有效期。仓库名与 `repo_id` 全局唯一，命名限定小写字母 / 数字 / 连字符。
-- **审批动作**：`ApproveRepoCreation` 时管理员可核定 `quota_bytes`（可驳回申请值），也可**留空继承全局默认**；通过后在**单事务**内插入 `repos`（状态 `active`、记录 `owner_user_id` 与来源申请）、写入 `repo_members` 的 owner 行、更新申请状态与审计日志。
+- **申请单** `repo_creation_requests`：申请人、仓库名、期望 `repo_id`、用途说明、配额（服务端固定 10 GiB）、状态、审批人与决定、有效期。仓库名与 `repo_id` 全局唯一，命名限定小写字母 / 数字 / 连字符。
+- **审批动作**：`ApproveRepoCreation` 不接受配额参数——管理员只回答「同意 / 拒绝」。通过后在**单事务**内插入 `repos`（状态 `active`、记录 `owner_user_id` 与来源申请）、写入 `repo_members` 的 owner 行、更新申请状态与审计日志。
 - **初始化顺序**：先幂等创建 `repo/objects/` 目录（残留的孤儿目录由 GC 清理），再提交数据库事务；目录创建失败则事务不提交，申请保持 `PENDING` 可重试。绝不允许出现「有 `repos` 行但无目录」或「有目录但无 `repos` 行」的可使用状态。
 - **owner 权限**：申请人自动成为该仓库 owner（`repo_members` 中 `role=owner`），可自行增删成员、调整成员角色与管理配额内空间；**其他用户默认无权限，必须被 owner 加入成员才能使用仓库**（见 8.9）。
 - **管理员直通**：全局 `admin` 可用 `CreateRepoDirect` 直接创建已激活仓库，供首次部署、迁移与自动化测试使用，同样写审计日志；该入口按推荐默认保留（见第 15 章收口说明）。
 - **RPC 校验**：`RepoService` 所有方法依次校验 `repos.status == active` → 调用者在 `repo_members` 中 → 成员角色允许该操作 → 路径级 `acl`；分别返回 `REPO_DISABLED` / `REPO_ARCHIVED`、`REPO_NOT_MEMBER`、`PERMISSION_DENIED`。`PENDING` 申请没有 `repo_id`，携带该 ID 的请求返回 `REPO_NOT_FOUND`，不向非申请人泄漏审批状态。
-- **容量联动**：审批时若核定配额则写入 `repos`，留空则写 0 表示继承全局默认；最终由 9.6 的生效规则解析后供 `BeginCommit` 预检使用。
+- **容量联动**：建库申请不填容量，服务端固定写入 `REPO_INITIAL_QUOTA_BYTES`（10 GiB）；要更多空间走 8.10 的扩容申请。
+
+### 8.10 仓库扩容申请
+
+**建库申请只回答「要不要建」，扩容申请只回答「加不加」，容量都不由申请人填写。**
+
+| 环节 | 输入 | 结果 |
+| --- | --- | --- |
+| 提交扩容 | 仓库 + 可选说明 | 服务端读当前生效上限，按 `REPO_QUOTA_EXPANSION_STEP_BYTES`（10 GiB）算出目标值，写 `repo_quota_requests` |
+| 审批通过 | 仅审批意见 | 单事务内 `repos.quota_bytes = 当前生效值 + 10 GiB`、更新申请、写审计 |
+| 审批驳回 | 原因（必填） | 申请置 `REJECTED`，配额不变 |
+
+- **成员门**：只有仓库成员能提交；同一仓库同时只允许一条 `PENDING` 申请，避免连点两下抬两档。
+- **过期**：与建库申请同一套惰性过期机制（7 天 TTL），`PENDING` 到期自动置 `EXPIRED`。
+- **磁盘依据**：审批人要判断的是宿主机还放得下吗，因此服务端提供 `GetStorageCapacity`（`statvfs` / `GetDiskFreeSpaceExW` 探测数据卷，仅 admin），管理端审批页直接展示「磁盘可用 / 总量」。审批时若可用空间小于本次增量，直接返回 `QUOTA_EXCEEDED` 并提示先清理——批了也写不进去。
+- **审计**：`repo.expand.request` / `repo.expand.approve` / `repo.expand.reject` 三类动作都落 `audit_log`。
 
 `init` 语义随之调整：申请审批通过生成空仓库（r0），owner 再用 `import` 从本地目录导入内容产生首个 revision，不再由 `init` 一步创建可用仓库。
 
@@ -387,13 +403,13 @@ CAS 去重下，「目录有多大」与「删掉它能释放多少」是两回�
 
 | 优先级 | 来源 | 说明 |
 | --- | --- | --- |
-| 1 | 单仓库显式值 `repos.quota_bytes` | 非 0 时优先；审批时核定，或用 `SetRepoQuota` 事后调整 |
+| 1 | 单仓库显式值 `repos.quota_bytes` | 非 0 时优先；建库审批固定写 10 GiB，扩容审批每次 +10 GiB，或用 `SetRepoQuota` 事后调整 |
 | 2 | 全局默认值 `system_settings` 的 `default_quota_bytes` | 仓库值为 0 时继承；管理员用 `Get/UpdateQuotaDefaults` 配置 |
 | 3 | 系统内置兜底 `FALLBACK_QUOTA_BYTES`（100 GiB） | 两者都未配置时启用，保证任何情况下都有上限，避免空间无限膨胀 |
 
 - **继承语义**：`repos.quota_bytes = 0` 表示「继承全局默认」；`SetRepoQuota(inherit=true)` 可清零恢复继承。改全局默认后，所有继承默认值的仓库**立即**按新阈值预检；改单仓库值只影响该仓库。
-- **合法性**：只有「0（继承）」与「> 0（显式上限）」两种取值，不再存在软硬比例约束，审批人只需填一个数字。
-- **只读可见**：owner 与成员可查看本仓库的生效配额及其来源（`QuotaSource`），但只有全局 `admin` 能修改；审批时也可选择「不核定」，留空即继承全局默认。
+- **合法性**：只有「0（继承）」与「> 0（显式上限）」两种取值，不再存在软硬比例约束。审批流量不填数字：建库固定 10 GiB，扩容固定 +10 GiB。
+- **只读可见**：owner 与成员可查看本仓库的生效配额及其来源（`QuotaSource`），但只有全局 `admin` 能修改；仓库空间不够时成员走扩容申请（8.10），由 admin 结合磁盘余量决定批不批。
 - **审计**：全局默认与单仓库配额的每次变更写入 `audit_log`，记录改前 / 改后值、执行者与仓库。
 
 **提交前预检**：把容量检查前移到 `BeginCommit`：
@@ -570,8 +586,10 @@ vcs --store /srv/vcs import reports ./src -m "初始导入"  # 本地直连的�
 | `vcs register-list` | `ListRegistrations` | **M3**：管理员查看申请（可按状态过滤） |
 | `vcs register-approve` | `ApproveRegistration` | **M3**：通过审批并激活账号（密码由申请人注册时设置） |
 | `vcs register-reject` | `RejectRegistration` | **M3**：驳回，必须写原因 |
-| `vcs repo-request` / `repo-request-list` | `RequestRepo` / `ListRepoCreations` | **M3**：任何 ACTIVE 用户可申请建库；普通用户只看自己的申请 |
-| `vcs repo-approve` / `repo-reject` | `ApproveRepoCreation` / `RejectRepoCreation` | **M3**：管理员审批，单事务建库 + owner + r0 |
+| `vcs repo-request` / `repo-request-list` | `RequestRepo` / `ListRepoCreations` | **M3**：任何 ACTIVE 用户可申请建库；容量固定 10 GiB，普通用户只看自己的申请 |
+| `vcs repo-approve` / `repo-reject` | `ApproveRepoCreation` / `RejectRepoCreation` | **M3**：管理员只决定同意或拒绝，单事务建库 + owner + r0 |
+| `vcs repo-expand` / `repo-expand-list` | `RequestRepoExpansion` / `ListRepoQuotaRequests` | **M3**：固定 +10 GiB，仅成员可申请；列表带数据盘可用空间 |
+| `vcs repo-expand-approve` / `repo-expand-reject` | `Approve/RejectRepoQuotaRequest` | **M3**：管理员审批，可用空间不足时拒绝审批 |
 | `vcs pat-create` / `pat-list` / `pat-revoke` | `CreatePat` / `ListPats` / `RevokePat` | **M3**：明文只返回一次，撤销即时生效 |
 | `vcs login --pat` | `Login`（凭证校验段） | **M3**：CI 用令牌登录，不必把密码写进脚本 |
 | `vcs repo-list` | `ListRepos` | **M3**：只列出自己参与的仓库 |
@@ -1024,8 +1042,9 @@ register（免登录，只收用户名/姓名/理由）
 → 注册时弱密码被拒（列出缺哪几类字符）→ 合规密码成功
 → register-approve（管理员，审批后即可登录）
 → login → 成功（角色 writer）
-→ repo-request（申请建库）→ import → RepoNotFound（申请未审批时不可用）
-→ repo-approve（管理员，核定 1 GiB 配额上限）→ 仓库创建 + 申请人自动成为 owner + r0
+→ repo-request（申请建库，不填容量）→ import → RepoNotFound（申请未审批时不可用）
+→ repo-approve（管理员只点通过）→ 仓库创建（固定 10 GiB）+ 申请人自动成为 owner + r0
+→ repo-expand（成员申请扩容，固定 +10 GiB）→ repo-expand-approve（管理员按磁盘余量批准）→ 上限 20 GiB
 → info → admin 尝试读取该仓库 → RepoNotMember（admin 也需被 owner 加为成员）
 → 申请人 import → r1
 → pat-create --scopes read → login --pat（读 OK）

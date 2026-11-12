@@ -320,14 +320,11 @@ enum Cmd {
     },
     /// 测试目录服务连通性（服务账号 bind + 抽样搜索）
     LdapTest,
-    /// 提交仓库创建申请
+    /// 提交仓库创建申请（容量固定 10 GiB，无需填写）
     RepoRequest {
         name: String,
         #[arg(long, default_value = "")]
         reason: String,
-        /// 期望配额（字节，0 表示由管理员核定或继承全局默认）
-        #[arg(long, default_value_t = 0)]
-        quota: u64,
     },
     /// 查看仓库创建申请（管理员看全部，普通用户只看自己的）
     RepoRequestList {
@@ -336,17 +333,39 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// 审批仓库申请（仅管理员）
+    /// 审批仓库申请（仅管理员；容量固定 10 GiB，只决定同意或拒绝）
     RepoApprove {
         request_id: String,
-        /// 核定配额上限（字节，0 表示继承全局默认）
-        #[arg(long, default_value_t = 0)]
-        quota: u64,
         #[arg(long, default_value = "")]
         note: String,
     },
     /// 驳回仓库申请（仅管理员，必须写原因）
     RepoReject {
+        request_id: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// 申请扩容（一次固定 +10 GiB，容量无需填写）
+    RepoExpand {
+        repo: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// 查看扩容申请（管理员看全部，普通用户只看自己的）
+    RepoExpandList {
+        #[arg(long, default_value = "")]
+        state: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// 审批扩容申请（仅管理员；需要数据盘放得下这次增量）
+    RepoExpandApprove {
+        request_id: String,
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+    /// 驳回扩容申请（仅管理员，必须写原因）
+    RepoExpandReject {
         request_id: String,
         #[arg(long)]
         reason: String,
@@ -1346,23 +1365,20 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        Cmd::RepoRequest {
-            name,
-            reason,
-            quota,
-        } => {
+        Cmd::RepoRequest { name, reason } => {
             let store = ServerStore::open(&store_root)?;
             let session = require_session(&store, &store_root)?;
-            let info = store.request_repo(&session, &name, &reason, quota)?;
+            let info = store.request_repo(&session, &name, &reason)?;
             println!(
                 "已提交仓库创建申请：{}（申请号 {}）",
                 info.repo_name, info.request_id
             );
             println!(
-                "状态：待审批，有效期至 {}；审批通过后你会自动成为 owner",
+                "容量：{}（固定，无需填写）；状态：待审批，有效期至 {}",
+                human_bytes(info.requested_quota_bytes),
                 format_time(info.expires_at)
             );
-            println!("查询进度：vcs repo-request-list");
+            println!("审批通过后你会自动成为 owner；查询进度：vcs repo-request-list");
         }
 
         Cmd::RepoRequestList { state, limit } => {
@@ -1392,15 +1408,17 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Cmd::RepoApprove {
-            request_id,
-            quota,
-            note,
-        } => {
+        Cmd::RepoApprove { request_id, note } => {
             let store = ServerStore::open(&store_root)?;
             let session = require_session(&store, &store_root)?;
-            let repo = store.approve_repo_request(&session, &request_id, quota, &note)?;
+            let repo = store.approve_repo_request(&session, &request_id, &note)?;
+            let quota = store.effective_quota(&repo.repo_id)?;
             println!("仓库已创建：{}（{}）", repo.name, repo.repo_id);
+            println!(
+                "生效配额：{}（来源：{}）",
+                human_bytes(quota.bytes),
+                quota_source_label(quota.source)
+            );
             println!("申请人已成为 owner，可直接 import / checkout。");
         }
 
@@ -1409,6 +1427,77 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let session = require_session(&store, &store_root)?;
             store.reject_repo_request(&session, &request_id, &reason)?;
             println!("已驳回仓库申请 {request_id}");
+        }
+
+        Cmd::RepoExpand { repo, reason } => {
+            let store = ServerStore::open(&store_root)?;
+            let session = require_session(&store, &store_root)?;
+            let info = store.request_repo_expansion(&session, &repo, &reason)?;
+            println!(
+                "已提交扩容申请：{}（申请号 {}）",
+                info.repo_name, info.request_id
+            );
+            println!(
+                "上限 {} → {}（+{}，固定增量）；有效期至 {}",
+                human_bytes(info.quota_before_bytes),
+                human_bytes(info.target_bytes()),
+                human_bytes(info.increment_bytes),
+                format_time(info.expires_at)
+            );
+            println!("查询进度：vcs repo-expand-list");
+        }
+
+        Cmd::RepoExpandList { state, limit } => {
+            let store = ServerStore::open(&store_root)?;
+            let session = require_session(&store, &store_root)?;
+            let filter = parse_creation_filter(&state)?;
+            let list = store.list_repo_quota_requests(&session, filter, limit)?;
+            if list.is_empty() {
+                println!("没有符合条件的扩容申请");
+                return Ok(());
+            }
+            let capacity = store.storage_capacity()?;
+            println!(
+                "数据盘：可用 {} / 共 {}",
+                human_bytes(capacity.available_bytes),
+                human_bytes(capacity.total_bytes)
+            );
+            println!("申请号              仓库名            上限变化                     状态        提交时间");
+            for r in list {
+                println!(
+                    "{:<18} {:<16} {:<28} {:<10} {}",
+                    r.request_id,
+                    r.repo_name,
+                    format!(
+                        "{} → {}",
+                        human_bytes(r.quota_before_bytes),
+                        human_bytes(r.target_bytes())
+                    ),
+                    creation_state_label(r.state),
+                    format_time(r.submitted_at)
+                );
+                if let Some(note) = r.decision_note {
+                    println!("    审批意见：{note}");
+                }
+            }
+        }
+
+        Cmd::RepoExpandApprove { request_id, note } => {
+            let store = ServerStore::open(&store_root)?;
+            let session = require_session(&store, &store_root)?;
+            let effective = store.approve_repo_quota_request(&session, &request_id, &note)?;
+            println!(
+                "扩容已通过，生效配额：{}（来源：{}）",
+                human_bytes(effective.bytes),
+                quota_source_label(effective.source)
+            );
+        }
+
+        Cmd::RepoExpandReject { request_id, reason } => {
+            let store = ServerStore::open(&store_root)?;
+            let session = require_session(&store, &store_root)?;
+            store.reject_repo_quota_request(&session, &request_id, &reason)?;
+            println!("已驳回扩容申请 {request_id}");
         }
 
         Cmd::RepoList => {

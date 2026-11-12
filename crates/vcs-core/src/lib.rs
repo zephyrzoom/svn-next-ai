@@ -130,6 +130,18 @@ pub const CAS_LAYOUT: &str = "SHARED_CAS";
 /// 软阈值从未参与过任何判定，多一个输入框只会让审批人猜。
 pub const FALLBACK_QUOTA_BYTES: u64 = 100 * 1024 * 1024 * 1024; // 100 GiB
 
+/// 新建仓库的初始配额。
+///
+/// 建库申请是「要一个仓库」，不是「谈一个数字」：申请人不用填容量，审批人也不用
+/// 核定容量，通过即按这条固定值落库。要更多空间走扩容申请（见下）。
+pub const REPO_INITIAL_QUOTA_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
+
+/// 每次扩容申请的固定增量。
+///
+/// 扩容申请同样不填数字：一次申请就是「再加一条固定份额」，管理员只决定批不批。
+/// 固定步长让「批了什么」在审批台上是同一件事，也让磁盘余量评估有唯一口径。
+pub const REPO_QUOTA_EXPANSION_STEP_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaSource {
     RepoOverride,

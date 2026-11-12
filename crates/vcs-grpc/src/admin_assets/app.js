@@ -159,6 +159,7 @@ async function loadOverview() {
     ['仓库', data.repos, `其中 ${data.active_repos} 个启用`],
     ['待审批注册', data.pending_registrations, '需要管理员处理', data.pending_registrations > 0],
     ['待审批建库', data.pending_repo_requests, '需要管理员处理', data.pending_repo_requests > 0],
+    ['待审批扩容', data.pending_quota_requests, '每次 +10 GiB', data.pending_quota_requests > 0],
     ['CAS 对象', data.objects, humanBytes(data.object_bytes)],
     ['待转正清理', data.purged_pending, '宽限期内的回收站记录'],
   ];
@@ -170,6 +171,7 @@ async function loadOverview() {
   const todo = [];
   if (data.pending_registrations) todo.push(`${data.pending_registrations} 条注册申请待审批`);
   if (data.pending_repo_requests) todo.push(`${data.pending_repo_requests} 条建库申请待审批`);
+  if (data.pending_quota_requests) todo.push(`${data.pending_quota_requests} 条扩容申请待审批`);
   $('todo').innerHTML = todo.length
     ? todo.map((text) => `<span class="pill">${esc(text)}</span>`).join('')
     : empty('当前没有待办事项');
@@ -180,8 +182,10 @@ $('refresh-overview').addEventListener('click', () => void act(loadOverview));
 /* ---------------- 审批台 ---------------- */
 
 async function loadApprovals() {
-  const [regs, reqs] = await Promise.all([
-    get('/registrations?state=pending'), get('/repo-requests?state=pending'),
+  const [regs, reqs, expansions] = await Promise.all([
+    get('/registrations?state=pending'),
+    get('/repo-requests?state=pending'),
+    get('/repo-expansions?state=pending'),
   ]);
   $('reg-list').innerHTML = regs.items.length ? regs.items.map((r) => `
     <div class="list-item" data-id="${esc(r.request_id)}">
@@ -202,15 +206,31 @@ async function loadApprovals() {
     <div class="list-item" data-id="${esc(r.request_id)}">
       <div>
         <div class="title">${esc(r.repo_name)} ${stateBadge(r.state)}</div>
-        <div class="meta">申请人 ${esc(r.requester_user_id)} · 申请配额 ${esc(humanBytes(r.requested_quota_bytes))} · ${esc(fmtTime(r.submitted_at))}<br />理由：${esc(r.reason || '—')}</div>
+        <div class="meta">申请人 ${esc(r.requester_user_id)} · 默认容量 ${esc(humanBytes(r.requested_quota_bytes))} · ${esc(fmtTime(r.submitted_at))}<br />理由：${esc(r.reason || '—')}</div>
       </div>
       <div class="actions">
-        <input data-field="quota" type="number" min="0" placeholder="配额上限（字节）" title="配额上限（字节，0 或留空=继承全局默认）" />
         <input data-field="note" placeholder="审批意见" />
         <button class="mini primary" data-action="approve-req">通过</button>
         <button class="mini danger" data-action="reject-req">拒绝</button>
       </div>
     </div>`).join('') : empty('没有待审批的建库申请');
+
+  const disk = expansions.storage || {};
+  $('storage-note').textContent = disk.total_bytes
+    ? `磁盘可用 ${humanBytes(disk.available_bytes)} / 共 ${humanBytes(disk.total_bytes)}`
+    : '';
+  $('expansion-list').innerHTML = expansions.items.length ? expansions.items.map((r) => `
+    <div class="list-item" data-id="${esc(r.request_id)}">
+      <div>
+        <div class="title">${esc(r.repo_name || r.repo_id)} ${stateBadge(r.state)}</div>
+        <div class="meta">申请人 ${esc(r.requester_user_id)} · 上限 ${esc(humanBytes(r.quota_before_bytes))} → ${esc(humanBytes(r.target_quota_bytes))}（+${esc(humanBytes(r.increment_bytes))}） · ${esc(fmtTime(r.submitted_at))}<br />说明：${esc(r.reason || '—')}</div>
+      </div>
+      <div class="actions">
+        <input data-field="note" placeholder="审批意见" />
+        <button class="mini primary" data-action="approve-expansion">通过</button>
+        <button class="mini danger" data-action="reject-expansion">拒绝</button>
+      </div>
+    </div>`).join('') : empty('没有待审批的扩容申请');
 }
 
 function field(row, name) {
@@ -245,15 +265,35 @@ $('req-list').addEventListener('click', (event) => {
   void act(async () => {
     if (button.dataset.action === 'approve-req') {
       await post(`/repo-requests/${encodeURIComponent(id)}/approve`, {
-        quota_bytes: Number(field(row, 'quota')) || 0,
         note: field(row, 'note'),
       });
-      toast('建库申请已通过，仓库已创建');
+      toast('建库申请已通过，仓库已按 10 GiB 初始容量创建');
     } else {
       const reason = window.prompt('拒绝原因（必填）', '');
       if (!reason) return;
       await post(`/repo-requests/${encodeURIComponent(id)}/reject`, { reason });
       toast('已拒绝该申请');
+    }
+    await loadApprovals();
+  });
+});
+
+$('expansion-list').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-action]');
+  if (!button) return;
+  const row = button.closest('.list-item');
+  const id = row.dataset.id;
+  void act(async () => {
+    if (button.dataset.action === 'approve-expansion') {
+      await post(`/repo-expansions/${encodeURIComponent(id)}/approve`, {
+        note: field(row, 'note'),
+      });
+      toast('扩容申请已通过，仓库上限已增加 10 GiB');
+    } else {
+      const reason = window.prompt('拒绝原因（必填）', '');
+      if (!reason) return;
+      await post(`/repo-expansions/${encodeURIComponent(id)}/reject`, { reason });
+      toast('已拒绝该扩容申请');
     }
     await loadApprovals();
   });

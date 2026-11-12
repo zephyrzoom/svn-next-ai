@@ -2419,12 +2419,14 @@ name = "vcs-server"
 version = "0.1.0"
 dependencies = [
  "ldap3",
+ "libc",
  "regex",
  "rusqlite",
  "serde",
  "serde_json",
  "vcs-core",
  "vcs-proto",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
