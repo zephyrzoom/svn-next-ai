@@ -14,242 +14,184 @@
       <div class="brand">svn-next</div>
       <div class="conn">
         <input id="target" value="127.0.0.1:50051" spellcheck="false" title="服务端地址" />
+        <select id="auth-source" title="身份来源">
+          <option value="LOCAL">本地账号</option>
+          <option value="LDAP">LDAP 目录</option>
+        </select>
         <input id="username" placeholder="用户名" spellcheck="false" />
         <input id="password" type="password" placeholder="密码" />
         <button id="connect" class="primary">连接</button>
         <span id="who" class="who"></span>
+        <button id="disconnect" class="ghost hidden">断开连接</button>
       </div>
     </header>
 
-    <div class="authbar">
-      <span class="muted">还没有账号？</span>
-      <button id="toggle-register" class="ghost">申请注册</button>
-      <span class="muted">已通过审批？</span>
-      <button id="toggle-setpw" class="ghost">用一次性链接设置密码</button>
-      <button id="disconnect" class="ghost hidden">断开连接</button>
-    </div>
-
-    <div id="register-form" class="inline-form hidden">
-      <input id="reg-username" placeholder="用户名（小写字母/数字/_- .）" spellcheck="false" />
-      <input id="reg-name" placeholder="姓名" spellcheck="false" />
-      <input id="reg-reason" placeholder="申请理由（可选）" spellcheck="false" />
-      <button id="do-register" class="primary">提交申请</button>
-    </div>
-
-    <div id="setpw-form" class="inline-form hidden">
-      <input id="setpw-token" placeholder="一次性 token（vcs_setup_…）" spellcheck="false" />
-      <input id="setpw-password" type="password" placeholder="新密码（≥8 位，含大小写/数字/特殊字符）" />
-      <button id="do-setpw" class="primary">设置密码</button>
-    </div>
-
     <div id="banner" class="banner hidden"></div>
 
-    <main class="layout">
-      <div class="sidebar">
-      <section class="panel">
-        <div class="panel-head">
-          <h2>仓库</h2>
-          <button id="refresh-repos" class="ghost" title="刷新">刷新</button>
+    <div class="shell" id="shell">
+      <nav class="nav" id="nav">
+        <div class="nav-title">导航</div>
+        <button class="nav-item" data-view="workcopy">工作副本</button>
+        <button class="nav-item" data-view="repos">仓库</button>
+        <button class="nav-item active" data-view="account">账号</button>
+        <div class="nav-foot">
+          桌面端用于日常仓库使用。<br />管理与审批请访问服务端 Web 管理端。
         </div>
-        <ul id="repos" class="list"></ul>
-        <div class="row" id="repo-create-row">
-          <input id="new-repo" placeholder="新仓库名（小写字母/数字/-）" spellcheck="false" />
-          <button id="create-repo">直通新建</button>
-        </div>
-        <div class="stack" id="repo-request-row">
-          <input id="request-repo" placeholder="仓库名（小写字母/数字/-）" spellcheck="false" />
-          <input id="request-reason" placeholder="用途说明（审批时会看）" spellcheck="false" />
-          <button id="do-request">提交建库申请</button>
-        </div>
-        <p class="hint" id="repo-hint">
-          管理员可用「直通新建」；普通用户的建库申请需要管理员在审批台处理。
-        </p>
-      </section>
+      </nav>
 
-      <section class="panel" id="members-panel">
-        <div class="panel-head">
-          <h2>成员</h2>
-          <span id="members-repo" class="muted"></span>
-        </div>
-        <ul id="members" class="list members"></ul>
-        <div class="row">
-          <input id="member-query" placeholder="按用户名 / 姓名找人" spellcheck="false" />
-          <button id="search-users" class="ghost">搜索</button>
-        </div>
-        <ul id="member-candidates" class="list candidates"></ul>
-        <p class="hint">
-          owner 可管理全部成员；maintainer 只能增删 writer / reader。改动立刻生效：
-          被移除或降为只读的成员，手上的提交会话会同时作废。
-        </p>
-      </section>
-
-      <section class="panel" id="space-panel">
-        <div class="panel-head">
-          <h2>空间</h2>
-          <span id="space-repo" class="muted"></span>
-          <button id="open-quota" class="ghost">配额…</button>
-          <button id="refresh-space" class="ghost">刷新</button>
-        </div>
-        <div class="quota">
-          <div class="bar"><div id="quota-fill"></div></div>
-          <div class="meta" id="quota-text">选择仓库后加载</div>
-        </div>
-        <ul id="purge-candidates" class="list candidates"></ul>
-        <p class="hint">
-          「可释放」只算被该目录独占的内容（含只属于它的历史版本），所以可能大于
-          「当前」——后者是 HEAD 里这些文件的字节数。清理前请先用「预估所选」确认。
-        </p>
-        <div class="row">
-          <button id="estimate" class="ghost">预估所选</button>
-          <button id="purge" class="primary">清理所选</button>
-        </div>
-        <label class="check">
-          <input type="checkbox" id="purge-immediate" checked />
-          立即释放（跳过 7 天宽限期）
-        </label>
-        <div class="meta" id="space-result"></div>
-
-        <h3 class="sub">回收站</h3>
-        <ul id="purged" class="list purged"></ul>
-        <p class="hint">
-          撤销会把内容恢复成一次新提交，并让 GC 不再跳过这些路径。内容若已被物理回收，
-          撤销会直接失败——历史不会凭空长回来。
-        </p>
-
-        <h3 class="sub">保留策略</h3>
-        <ul id="policies" class="list purged"></ul>
-        <div class="stack">
-          <input id="policy-pattern" placeholder="目录名正则，如 ^20\\d{4}$" spellcheck="false" />
-          <div class="row">
-            <input id="policy-keep" type="number" min="0" placeholder="保留个数" />
-            <input id="policy-bytes" type="number" min="0" placeholder="字节上限" />
-            <input id="policy-age" type="number" min="0" placeholder="天数" />
-          </div>
-          <label class="check">
-            <input type="checkbox" id="policy-execute" />
-            允许自动删除（不勾选则为仅预览）
-          </label>
-          <button id="save-policy">保存策略</button>
-        </div>
-        <div class="row">
-          <button id="preview-retention" class="ghost">评估（预览）</button>
-          <button id="apply-retention" class="primary">执行清理</button>
-        </div>
-        <p class="hint">
-          keep_months / 字节上限 / 天数 三者任一被违反就会成为清理候选；目录按名称倒序当作
-          「从新到旧」。「仅预览」的策略即使点「执行清理」也会被服务端拒绝。
-        </p>
-      </section>
-      </div>
-
-      <section class="panel grow">
-        <div class="panel-head">
-          <h2>工作副本</h2>
-          <span id="wc-path" class="muted"></span>
-        </div>
-        <div class="row">
-          <input id="dir" placeholder="检出目录（绝对路径）" spellcheck="false" />
-          <button id="pick-dir" class="ghost">选择…</button>
-          <button id="checkout" class="primary">检出</button>
-          <button id="update">更新</button>
-        </div>
-
-        <div class="split">
-          <div class="col">
-            <div class="panel-head">
-              <h3>变更</h3>
-              <button id="revert" class="ghost" title="丢弃所有本地改动">全部还原</button>
-              <button id="refresh-status" class="ghost">重新扫描</button>
-            </div>
-            <ul id="changes" class="list changes"></ul>
-
-            <div class="panel-head">
-              <h3>提交</h3>
-            </div>
-            <textarea id="message" rows="2" placeholder="提交信息"></textarea>
-            <button id="commit" class="primary">提交</button>
+      <main class="content" id="content">
+        <!-- 视图：工作副本 -->
+        <section class="view hidden" id="view-workcopy" data-view="workcopy">
+          <div class="view-head">
+            <h1>工作副本</h1>
+            <span id="wc-path" class="muted"></span>
           </div>
 
-          <div class="col">
-            <div class="panel-head">
-              <h3>差异</h3>
-              <span id="diff-path" class="muted"></span>
+          <div class="card">
+            <div class="card-head"><h2>检出与更新</h2></div>
+            <div class="row">
+              <input id="dir" placeholder="检出目录（绝对路径）" spellcheck="false" />
+              <button id="pick-dir" class="ghost">选择…</button>
+              <button id="checkout" class="primary">检出</button>
+              <button id="update">更新</button>
             </div>
-            <pre id="diff" class="diff">点击左侧变更查看差异</pre>
+            <p class="hint">先在「仓库」里选中一个仓库，再填写本地目录执行检出。</p>
+          </div>
 
-            <div id="conflict-editor" class="conflict hidden">
-              <div class="conflict-grid">
-                <div>
-                  <h4>基线（base）</h4>
-                  <pre id="conflict-base" class="diff small"></pre>
-                </div>
-                <div>
-                  <h4>我的（mine）</h4>
-                  <pre id="conflict-mine" class="diff small"></pre>
-                </div>
-                <div>
-                  <h4>服务端（theirs）</h4>
-                  <pre id="conflict-theirs" class="diff small"></pre>
-                </div>
+          <div class="split">
+            <div class="card col">
+              <div class="card-head">
+                <h2>变更</h2>
+                <button id="revert" class="ghost" title="丢弃所有本地改动">全部还原</button>
+                <button id="refresh-status" class="ghost">重新扫描</button>
               </div>
-              <textarea id="conflict-result" rows="6" placeholder="在这里写合并结果（默认填我的内容）"></textarea>
-              <div class="row">
-                <button id="take-mine" class="ghost">保留我的</button>
-                <button id="take-theirs" class="ghost">采用服务端</button>
-                <button id="save-merge" class="primary">保存合并结果</button>
-                <button id="delete-file" class="ghost">删除文件</button>
+              <ul id="changes" class="list changes"></ul>
+
+              <div class="card-head"><h2>提交</h2></div>
+              <textarea id="message" rows="2" placeholder="提交信息"></textarea>
+              <button id="commit" class="primary">提交</button>
+            </div>
+
+            <div class="card col">
+              <div class="card-head">
+                <h2>差异</h2>
+                <span id="diff-path" class="muted"></span>
+              </div>
+              <pre id="diff" class="diff">点击左侧变更查看差异</pre>
+
+              <div id="conflict-editor" class="conflict hidden">
+                <div class="conflict-grid">
+                  <div>
+                    <h4>基线（base）</h4>
+                    <pre id="conflict-base" class="diff small"></pre>
+                  </div>
+                  <div>
+                    <h4>我的（mine）</h4>
+                    <pre id="conflict-mine" class="diff small"></pre>
+                  </div>
+                  <div>
+                    <h4>服务端（theirs）</h4>
+                    <pre id="conflict-theirs" class="diff small"></pre>
+                  </div>
+                </div>
+                <textarea id="conflict-result" rows="6" placeholder="在这里写合并结果（默认填我的内容）"></textarea>
+                <div class="row">
+                  <button id="take-mine" class="ghost">保留我的</button>
+                  <button id="take-theirs" class="ghost">采用服务端</button>
+                  <button id="save-merge" class="primary">保存合并结果</button>
+                  <button id="delete-file" class="ghost">删除文件</button>
+                </div>
               </div>
             </div>
           </div>
-        </div>
 
-        <div class="panel-head">
-          <h3>历史</h3>
-          <button id="refresh-log" class="ghost">刷新</button>
-        </div>
-        <ul id="log" class="list log"></ul>
-      </section>
-    </main>
+          <div class="card">
+            <div class="card-head">
+              <h2>提交历史</h2>
+              <button id="refresh-log" class="ghost">刷新</button>
+            </div>
+            <ul id="log" class="list log"></ul>
+          </div>
+        </section>
 
-    <div id="quota-modal" class="modal hidden">
-      <div class="modal-box">
-        <div class="panel-head">
-          <h2>配额设置</h2>
-          <button id="close-quota" class="ghost">关闭</button>
-        </div>
+        <!-- 视图：仓库 -->
+        <section class="view hidden" id="view-repos" data-view="repos">
+          <div class="view-head">
+            <h1>仓库</h1>
+            <p class="view-sub">查看可用仓库与容量，并提交建库申请。</p>
+          </div>
 
-        <h3 class="sub">全局默认</h3>
-        <div class="row">
-          <input id="default-soft" type="number" min="0" placeholder="软上限（字节，0=未配置）" />
-          <input id="default-hard" type="number" min="0" placeholder="硬上限（字节，0=未配置）" />
-          <button id="save-defaults" class="primary">保存</button>
-        </div>
-        <p class="hint" id="defaults-text">仅管理员可改；所有未单独核定的仓库继承这里的值。</p>
+          <div class="split">
+            <div class="card col">
+              <div class="card-head">
+                <h2>可用仓库</h2>
+                <button id="refresh-repos" class="ghost">刷新</button>
+              </div>
+              <ul id="repos" class="list"></ul>
+            </div>
 
-        <h3 class="sub">本仓库配额</h3>
-        <div class="row">
-          <input id="repo-soft" type="number" min="0" placeholder="软上限（0=继承）" />
-          <input id="repo-hard" type="number" min="0" placeholder="硬上限（0=继承）" />
-          <button id="save-repo-quota" class="primary">保存</button>
-          <button id="inherit-repo-quota" class="ghost">恢复继承</button>
-        </div>
-        <p class="hint" id="repo-quota-text">加载中…</p>
-      </div>
+            <div class="card col">
+              <div class="card-head">
+                <h2>容量</h2>
+                <span id="quota-repo" class="muted"></span>
+              </div>
+              <div class="quota">
+                <div class="bar"><div id="quota-fill"></div></div>
+                <div class="meta" id="quota-text">选择仓库后加载</div>
+              </div>
+
+              <div class="card-head"><h2>申请建库</h2></div>
+              <div class="stack" id="repo-request-row">
+                <input id="request-repo" placeholder="仓库名（小写字母/数字/-）" spellcheck="false" />
+                <input id="request-reason" placeholder="用途说明（审批时会看）" spellcheck="false" />
+                <button id="do-request" class="primary">提交建库申请</button>
+              </div>
+              <p class="hint">提交后由管理员在服务端 Web 管理端审批；审批通过会自动出现在左侧列表里。</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- 视图：账号（未登录时默认） -->
+        <section class="view" id="view-account" data-view="account">
+          <div class="view-head">
+            <h1>账号</h1>
+            <p class="view-sub">连接服务端并使用仓库前，先准备好账号。</p>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h2>自助开通</h2></div>
+            <p class="hint">还没有账号可以申请注册；拿到一次性链接后在这里设置密码。</p>
+            <div class="row">
+              <button id="toggle-register" class="ghost">申请注册</button>
+              <button id="toggle-setpw" class="ghost">用一次性链接设置密码</button>
+            </div>
+
+            <div id="register-form" class="inline-form hidden">
+              <input id="reg-username" placeholder="用户名（小写字母/数字/_- .）" spellcheck="false" />
+              <input id="reg-name" placeholder="姓名" spellcheck="false" />
+              <input id="reg-reason" placeholder="申请理由（可选）" spellcheck="false" />
+              <button id="do-register" class="primary">提交申请</button>
+            </div>
+
+            <div id="setpw-form" class="inline-form hidden">
+              <input id="setpw-token" placeholder="一次性 token（vcs_setup_…）" spellcheck="false" />
+              <input id="setpw-password" type="password" placeholder="新密码（≥8 位，含大小写/数字/特殊字符）" />
+              <button id="do-setpw" class="primary">设置密码</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h2>连接说明</h2></div>
+            <ul class="notes">
+              <li>在右上角填写服务端地址、身份来源、用户名与密码后点「连接」。</li>
+              <li>连接成功后可在「仓库」里查看可用仓库与容量、提交建库申请，在「工作副本」里检出与提交。</li>
+              <li class="em">管理与审批请访问服务端 Web 管理端；桌面端只用于日常仓库使用。</li>
+            </ul>
+            <p class="hint" id="repo-hint">连接信息会保存在本地；系统支持时凭证会加密存储。</p>
+          </div>
+        </section>
+      </main>
     </div>
-
-    <section class="panel admin-panel hidden" id="admin-panel">
-      <div class="panel-head">
-        <h2>审批台</h2>
-        <button id="refresh-admin" class="ghost">刷新</button>
-      </div>
-      <h3 class="sub">注册申请</h3>
-      <ul id="reg-list" class="list"></ul>
-      <h3 class="sub">建库申请</h3>
-      <ul id="repo-req-list" class="list"></ul>
-      <p class="hint">
-        通过注册后会拿到一次性设置密码 token，请直接转交申请人；它只显示这一次。
-      </p>
-    </section>
 
     <script src="app.js"></script>
   </body>

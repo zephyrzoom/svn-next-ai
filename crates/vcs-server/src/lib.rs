@@ -23,13 +23,21 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use vcs_core::auth::{self, Claims, TokenSigner};
 use vcs_core::hash::hash_bytes;
 use vcs_core::tree::{self, FlatEntry};
 use vcs_core::{
     self as core_types, to_hex, ChangeKind, EffectiveQuota, EntryKind, Error, ErrorCode,
     FileObjectStore, Hash, ObjectStore, RepoMemberRole, RepoStatus, Result, Role,
+};
+
+mod admin;
+pub use admin::{AdminOverview, AdminUser};
+mod ldap;
+pub use ldap::{
+    authenticate_ldap, test_ldap_connection, DirectoryUser, LdapPublicConfig, LdapSettings,
+    LdapTestOutcome, TlsMode,
 };
 
 const SERVER_SCHEMA: &str = include_str!("../../../schema/server.sql");
@@ -354,6 +362,17 @@ pub struct ApprovedRegistration {
     pub setup_token_expires_at: i64,
 }
 
+/// 自助注册的结果。
+///
+/// `first_user` 非空表示**这是全库第一个账号**：服务端在同一事务里把它
+/// 自动批准为管理员，并把一次性设置密码 token 直接交回申请人，不必等
+/// （也没有）管理员审批。后续注册仍是普通的 PENDING 申请。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterOutcome {
+    pub info: RegistrationInfo,
+    pub first_user: Option<ApprovedRegistration>,
+}
+
 /// 一条仓库创建申请。与 `RepoCreationInfo` 对应。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoRequestInfo {
@@ -410,6 +429,8 @@ pub struct ServerStore {
     conn: Connection,
     objects: FileObjectStore,
     signer: TokenSigner,
+    /// 与 JWT 同源的主机密钥，另用于加密 LDAP bind 密码（域分隔见 auth::seal_secret）。
+    secret: Vec<u8>,
 }
 
 impl ServerStore {
@@ -430,12 +451,14 @@ impl ServerStore {
         conn.execute_batch(SERVER_SCHEMA)
             .map_err(|e| Error::new(ErrorCode::IoError, format!("初始化 server.db 失败：{e}")))?;
 
-        let signer = TokenSigner::new(load_or_create_secret(&root)?);
+        let secret = load_or_create_secret(&root)?;
+        let signer = TokenSigner::new(secret.clone());
         Ok(Self {
             root,
             conn,
             objects,
             signer,
+            secret,
         })
     }
 
@@ -458,17 +481,40 @@ impl ServerStore {
         Ok(count > 0)
     }
 
-    /// 引导管理员：仅在用户表为空时可用，密码策略与登录同源校验。
+    /// 是否存在**真正能登录**的管理员。
+    ///
+    /// 首位注册者虽然已被自动批准为 ACTIVE admin，但在设置密码前无法登录，
+    /// 因此不算数：万一一次性 token 丢失或过期，运维仍可用 `init-admin`
+    /// 在本机救援，不至于全库锁死。
+    fn has_usable_admin(&self) -> Result<bool> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM users
+                 WHERE role = 'admin' AND status = 'active'
+                   AND (source = 'ldap' OR password_hash IS NOT NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db("统计可用管理员失败"))?;
+        Ok(count > 0)
+    }
+
+    /// 引导管理员（空库）或救援首位注册者（已存在但从未激活）。
+    ///
+    /// 只允许在「没有可用管理员」时执行：既保留原来「只能初始化一次」的语义，
+    /// 又给首位用户丢 token 的场景留一条本机恢复路径。CLI 走的是本地直连
+    /// 存储，本来就是部署时的最高权限通道。
     pub fn bootstrap_admin(
         &self,
         username: &str,
         display_name: &str,
         password: &str,
     ) -> Result<UserInfo> {
-        if self.has_any_user()? {
+        if self.has_usable_admin()? {
             return Err(Error::new(
                 ErrorCode::PermissionDenied,
-                "已存在用户，bootstrap 只能在空库执行一次",
+                "已存在可登录的管理员，bootstrap 只用于首次初始化或首位账号救援",
             ));
         }
         validate_username(username)?;
@@ -482,6 +528,45 @@ impl ServerStore {
                 format!("密码不满足策略：{}", describe_password_issues(&issues)),
             ));
         }
+
+        // 同名账号已存在：说明这是首位注册者 / 一次失败的引导，直接重置口令并提权。
+        let existing: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT user_id, source FROM users WHERE username = ?1",
+                params![username],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(db("查询用户失败"))?;
+        if let Some((user_id, source)) = existing {
+            if source != "local" {
+                return Err(Error::new(
+                    ErrorCode::PermissionDenied,
+                    "该用户名属于目录账号，不能重置本地口令；请用 init-admin 另建管理员",
+                ));
+            }
+            let hash = auth::hash_password(password)?;
+            let now = now_secs();
+            self.conn
+                .execute(
+                    "UPDATE users SET password_hash = ?2, display_name = ?3, status = 'active',
+                                      role = 'admin', token_version = token_version + 1,
+                                      approved_at = ?4
+                     WHERE user_id = ?1",
+                    params![user_id, hash, display_name.trim(), now],
+                )
+                .map_err(db("救援管理员账号失败"))?;
+            self.audit("", &user_id, "user.bootstrap_rescue", username, None)?;
+            return Ok(UserInfo {
+                user_id,
+                username: username.to_string(),
+                display_name: display_name.trim().to_string(),
+                role: Role::Admin,
+                status: core_types::AccountStatus::Active,
+            });
+        }
+
         let hash = auth::hash_password(password)?;
         let user_id = new_id("u");
         let now = now_secs();
@@ -490,7 +575,7 @@ impl ServerStore {
                 "INSERT INTO users (user_id, username, display_name, source, status, role,
                                     password_hash, token_version, created_at, approved_at)
                  VALUES (?1, ?2, ?3, 'local', 'active', 'admin', ?4, 1, ?5, ?5)",
-                params![user_id, username, display_name, hash, now],
+                params![user_id, username, display_name.trim(), hash, now],
             )
             .map_err(db("创建引导管理员失败"))?;
         self.audit("", &user_id, "user.bootstrap", username, None)?;
@@ -498,7 +583,7 @@ impl ServerStore {
         Ok(UserInfo {
             user_id,
             username: username.to_string(),
-            display_name: display_name.to_string(),
+            display_name: display_name.trim().to_string(),
             role: Role::Admin,
             status: core_types::AccountStatus::Active,
         })
@@ -842,7 +927,13 @@ impl ServerStore {
         role: RepoMemberRole,
     ) -> Result<()> {
         let repo = self.find_repo(name_or_id)?;
-        let actor_role = self.member_role(&repo.repo_id, &actor.user_id)?;
+        // 内置 Web 管理后台用 system 身份代理已鉴权的管理员，可管理任意仓库的成员；
+        // 外部会话拿不到 system 身份，成员门依旧严格。
+        let actor_role = if actor.is_system() {
+            RepoMemberRole::Owner
+        } else {
+            self.member_role(&repo.repo_id, &actor.user_id)?
+        };
         if !actor_role.can_manage_members() {
             return Err(Error::new(
                 ErrorCode::RepoMemberForbidden,
@@ -916,7 +1007,13 @@ impl ServerStore {
     /// 校验也能兜住结果，但那要等用户点了提交才失败，体验很差。
     pub fn remove_member(&self, actor: &Session, name_or_id: &str, username: &str) -> Result<()> {
         let repo = self.find_repo(name_or_id)?;
-        let actor_role = self.member_role(&repo.repo_id, &actor.user_id)?;
+        // 内置 Web 管理后台用 system 身份代理已鉴权的管理员，可管理任意仓库的成员；
+        // 外部会话拿不到 system 身份，成员门依旧严格。
+        let actor_role = if actor.is_system() {
+            RepoMemberRole::Owner
+        } else {
+            self.member_role(&repo.repo_id, &actor.user_id)?
+        };
         if !actor_role.can_manage_members() {
             return Err(Error::new(
                 ErrorCode::RepoMemberForbidden,
@@ -976,7 +1073,13 @@ impl ServerStore {
         role: RepoMemberRole,
     ) -> Result<MemberInfo> {
         let repo = self.find_repo(name_or_id)?;
-        let actor_role = self.member_role(&repo.repo_id, &actor.user_id)?;
+        // 内置 Web 管理后台用 system 身份代理已鉴权的管理员，可管理任意仓库的成员；
+        // 外部会话拿不到 system 身份，成员门依旧严格。
+        let actor_role = if actor.is_system() {
+            RepoMemberRole::Owner
+        } else {
+            self.member_role(&repo.repo_id, &actor.user_id)?
+        };
         if !actor_role.can_manage_members() {
             return Err(Error::new(
                 ErrorCode::RepoMemberForbidden,
@@ -1181,8 +1284,10 @@ impl ServerStore {
 
     pub fn list_members(&self, actor: &Session, name_or_id: &str) -> Result<Vec<MemberInfo>> {
         let repo = self.find_repo(name_or_id)?;
-        // 成员门：连成员名单都不给非成员看。
-        self.member_role(&repo.repo_id, &actor.user_id)?;
+        // 成员门：连成员名单都不给非成员看；system 身份仅由内置管理后台使用。
+        if !actor.is_system() {
+            self.member_role(&repo.repo_id, &actor.user_id)?;
+        }
         let mut stmt = self
             .conn
             .prepare(
@@ -2345,15 +2450,340 @@ impl ServerStore {
         actor.require(SCOPE_ADMIN, action)
     }
 
+    /// 供 gRPC 层「先鉴权、再把网络操作丢进 spawn_blocking」时使用。
+    pub fn require_admin_action(&self, actor: &Session, action: &str) -> Result<()> {
+        self.require_admin(actor, action)
+    }
+
+    // ---------------- 目录认证（LDAP / AD） ----------------
+
+    /// 读取完整目录配置（含解密后的服务账号密码）。**仅供服务端内部使用**。
+    pub fn ldap_config(&self) -> Result<Option<LdapSettings>> {
+        let row: Option<LdapConfigRow> = self
+            .conn
+            .query_row(
+                "SELECT host, port, tls_mode, base_dn, bind_dn, bind_password_enc,
+                        user_filter, group_filter, attr_username, attr_display_name, enabled
+                 FROM ldap_config WHERE config_id = 'default'",
+                [],
+                |r| {
+                    Ok(LdapConfigRow {
+                        host: r.get(0)?,
+                        port: r.get(1)?,
+                        tls_mode: r.get(2)?,
+                        base_dn: r.get(3)?,
+                        bind_dn: r.get(4)?,
+                        bind_password_enc: r.get(5)?,
+                        user_filter: r.get(6)?,
+                        group_filter: r.get(7)?,
+                        attr_username: r.get(8)?,
+                        attr_display_name: r.get(9)?,
+                        enabled: r.get(10)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db("读取 LDAP 配置失败"))?;
+        let Some(row) = row else { return Ok(None) };
+        let password = String::from_utf8(auth::open_secret(&self.secret, &row.bind_password_enc)?)
+            .map_err(|_| Error::new(ErrorCode::IoError, "LDAP bind 密码不是合法 UTF-8"))?;
+        Ok(Some(LdapSettings {
+            host: row.host,
+            port: row.port as u16,
+            tls_mode: TlsMode::parse(&row.tls_mode)?,
+            base_dn: row.base_dn,
+            bind_dn: row.bind_dn,
+            bind_password: password,
+            user_filter: row.user_filter,
+            group_filter: row.group_filter.unwrap_or_default(),
+            attr_username: row.attr_username,
+            attr_display_name: row.attr_display_name,
+            enabled: row.enabled != 0,
+            group_roles: self.ldap_group_roles()?,
+        }))
+    }
+
+    pub fn ldap_group_roles(&self) -> Result<Vec<(String, Role)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT group_dn, role FROM ldap_group_roles ORDER BY group_dn")
+            .map_err(db("查询 LDAP 组映射失败"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(db("查询 LDAP 组映射失败"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (dn, role) = row.map_err(db("解析 LDAP 组映射失败"))?;
+            out.push((dn, parse_role(&role)?));
+        }
+        Ok(out)
+    }
+
+    /// 管理界面用的配置视图：`settings.bind_password` 恒为空串。
+    /// `actor = None` 是本机 CLI 通道。
+    pub fn ldap_config_public(&self, actor: Option<&Session>) -> Result<Option<LdapPublicConfig>> {
+        if let Some(session) = actor {
+            self.require_admin(session, "查看 LDAP 配置")?;
+        }
+        let Some(mut settings) = self.ldap_config()? else {
+            return Ok(None);
+        };
+        let bind_password_set = !settings.bind_password.is_empty();
+        settings.bind_password.clear();
+        Ok(Some(LdapPublicConfig {
+            settings,
+            bind_password_set,
+        }))
+    }
+
+    /// 保存目录配置。`actor = None` 是本机 CLI 通道（部署时还没有任何管理员），
+    /// 走 gRPC 则必须是管理员；bind 密码加密后落库，明文从不写入数据库。
+    pub fn set_ldap_config(&self, actor: Option<&Session>, cfg: &LdapSettings) -> Result<()> {
+        if let Some(session) = actor {
+            self.require_admin(session, "修改 LDAP 配置")?;
+        }
+        cfg.validate()?;
+        let enc = auth::seal_secret(&self.secret, cfg.bind_password.as_bytes())?;
+        let now = now_secs();
+        let actor_id = actor.map(|s| s.user_id.as_str()).unwrap_or("cli");
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(db("开启 LDAP 配置事务失败"))?;
+        tx.execute(
+            "INSERT INTO ldap_config
+               (config_id, host, port, tls_mode, base_dn, bind_dn, bind_password_enc,
+                user_filter, group_filter, attr_username, attr_display_name, enabled,
+                updated_at, updated_by)
+             VALUES ('default', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(config_id) DO UPDATE SET
+                host = excluded.host, port = excluded.port, tls_mode = excluded.tls_mode,
+                base_dn = excluded.base_dn, bind_dn = excluded.bind_dn,
+                bind_password_enc = excluded.bind_password_enc,
+                user_filter = excluded.user_filter, group_filter = excluded.group_filter,
+                attr_username = excluded.attr_username,
+                attr_display_name = excluded.attr_display_name,
+                enabled = excluded.enabled, updated_at = excluded.updated_at,
+                updated_by = excluded.updated_by",
+            params![
+                cfg.host,
+                cfg.port as i64,
+                cfg.tls_mode.as_str(),
+                cfg.base_dn,
+                cfg.bind_dn,
+                enc,
+                cfg.user_filter,
+                cfg.group_filter,
+                cfg.attr_username,
+                cfg.attr_display_name,
+                i64::from(cfg.enabled),
+                now,
+                actor_id
+            ],
+        )
+        .map_err(db("写入 LDAP 配置失败"))?;
+        // 组映射整体替换：配置界面每次提交的是完整列表，避免留下幽灵规则。
+        tx.execute("DELETE FROM ldap_group_roles", [])
+            .map_err(db("清空 LDAP 组映射失败"))?;
+        for (dn, role) in &cfg.group_roles {
+            tx.execute(
+                "INSERT INTO ldap_group_roles (group_dn, role, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(group_dn) DO UPDATE SET role = excluded.role,
+                                                     updated_at = excluded.updated_at",
+                params![dn, role_to_str(*role), now],
+            )
+            .map_err(db("写入 LDAP 组映射失败"))?;
+        }
+        write_audit(
+            &tx,
+            "",
+            actor_id,
+            "ldap.config.update",
+            &cfg.host,
+            Some(&format!(
+                "{{\"enabled\":{},\"tls_mode\":\"{}\",\"groups\":{}}}",
+                cfg.enabled,
+                cfg.tls_mode.as_str(),
+                cfg.group_roles.len()
+            )),
+            now,
+        )?;
+        tx.commit().map_err(db("提交 LDAP 配置失败"))?;
+        Ok(())
+    }
+
+    /// 连通性测试：只连目录、不做任何本地账号变更。
+    pub fn test_ldap_config(
+        &self,
+        actor: Option<&Session>,
+        cfg: &LdapSettings,
+    ) -> Result<LdapTestOutcome> {
+        if let Some(session) = actor {
+            self.require_admin(session, "测试 LDAP 连接")?;
+        }
+        test_ldap_connection(cfg)
+    }
+
+    /// 目录组 → 初始角色：命中多条取最高，没命中一律只读。
+    fn role_for_groups(&self, tx: &Connection, groups: &[String]) -> Result<Role> {
+        let mut stmt = tx
+            .prepare("SELECT group_dn, role FROM ldap_group_roles")
+            .map_err(db("查询 LDAP 组映射失败"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(db("查询 LDAP 组映射失败"))?;
+        let mut best = Role::Readonly;
+        for row in rows {
+            let (dn, role) = row.map_err(db("解析 LDAP 组映射失败"))?;
+            if groups.iter().any(|g| g.eq_ignore_ascii_case(&dn)) {
+                let candidate = parse_role(&role)?;
+                if role_rank(candidate) > role_rank(best) {
+                    best = candidate;
+                }
+            }
+        }
+        Ok(best)
+    }
+
+    /// 目录认证**成功之后**的本地落库：JIT 建号（或更新映射）+ 签发 JWT。
+    ///
+    /// `profile` 由目录层二次 bind 验证过才传进来；本方法不碰网络，便于测试。
+    /// 与自助注册共用 [`first_user_slot`]：两条入口谁先到，谁成为第一个管理员，
+    /// 之后所有人都按普通规则处理。
+    pub fn login_ldap(&self, profile: &DirectoryUser) -> Result<(String, UserInfo)> {
+        validate_username(&profile.username)?;
+        let display_name = profile.display_name.trim();
+        if display_name.is_empty() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "目录账号缺少姓名属性，无法创建本地映射",
+            ));
+        }
+        let now = now_secs();
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(db("开启目录登录事务失败"))?;
+
+        let existing: Option<(String, String, String, String, i64)> = tx
+            .query_row(
+                "SELECT user_id, source, status, role, token_version
+                 FROM users WHERE username = ?1",
+                params![profile.username],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()
+            .map_err(db("查询目录账号映射失败"))?;
+
+        let (user_id, role, token_version, created) = match existing {
+            Some((user_id, source, status, role, token_version)) => {
+                if source != "ldap" {
+                    return Err(Error::new(
+                        ErrorCode::RegistrationExists,
+                        "该用户名已被本地账号占用，请改用本地登录",
+                    ));
+                }
+                if status != "active" {
+                    return Err(Error::new(
+                        ErrorCode::AccountDisabled,
+                        "该目录账号在本地已被禁用",
+                    ));
+                }
+                // 角色以本地为准：目录组变动不该把引导管理员悄悄降级。
+                tx.execute(
+                    "UPDATE users SET display_name = ?2, ldap_dn = ?3, last_login_at = ?4
+                     WHERE user_id = ?1",
+                    params![user_id, display_name, profile.dn, now],
+                )
+                .map_err(db("更新目录账号映射失败"))?;
+                (user_id, parse_role(&role)?, token_version, false)
+            }
+            None => {
+                let first = first_user_slot(&tx)?;
+                let role = if first {
+                    Role::Admin
+                } else {
+                    self.role_for_groups(&tx, &profile.groups)?
+                };
+                let user_id = new_id("u");
+                tx.execute(
+                    "INSERT INTO users (user_id, username, display_name, source, status, role,
+                                        password_hash, ldap_dn, token_version, created_at, approved_at)
+                     VALUES (?1, ?2, ?3, 'ldap', 'active', ?4, NULL, ?5, 1, ?6, ?6)",
+                    params![
+                        user_id,
+                        profile.username,
+                        display_name,
+                        role_to_str(role),
+                        profile.dn,
+                        now
+                    ],
+                )
+                .map_err(|e| {
+                    map_unique_as(e, ErrorCode::RegistrationExists, "用户名已被占用")
+                })?;
+                write_audit(
+                    &tx,
+                    "",
+                    &user_id,
+                    if first {
+                        "user.first_admin.ldap"
+                    } else {
+                        "user.ldap.jit"
+                    },
+                    &profile.username,
+                    Some(&format!(
+                        "{{\"role\":\"{}\",\"first_user\":{first}}}",
+                        role_to_str(role)
+                    )),
+                    now,
+                )?;
+                (user_id, role, 1, true)
+            }
+        };
+
+        let token = self.signer.sign(
+            &user_id,
+            &profile.username,
+            role_to_str(role),
+            token_version,
+            now,
+        )?;
+        write_audit(
+            &tx,
+            "",
+            &user_id,
+            "user.login_ldap",
+            &profile.username,
+            Some(&format!("{{\"created\":{created}}}")),
+            now,
+        )?;
+        tx.commit().map_err(db("提交目录登录事务失败"))?;
+
+        Ok((
+            token,
+            UserInfo {
+                user_id,
+                username: profile.username.clone(),
+                display_name: display_name.to_string(),
+                role,
+                status: core_types::AccountStatus::Active,
+            },
+        ))
+    }
+
     /// 自助注册（免认证）。只收用户名、姓名与理由，**不收密码**。
     ///
-    /// 未激活的账号不该持有任何可用凭证，所以密码要等审批通过后拿一次性 token 来设置。
+    /// 两条分支共用同一个 `IMMEDIATE` 事务：
+    ///   - **全库第一个账号**：自动批准为管理员，一次性设置密码 token 直接交回本人；
+    ///   - 其余：仍是 PENDING 申请，等管理员审批。
+    ///
+    /// 首位判定放在写事务内（见 [`first_user_slot`]），CLI 与 gRPC 即使跨进程
+    /// 同时引导，也只有一个请求能拿到管理员名额。
     pub fn register(
         &self,
         username: &str,
         display_name: &str,
         reason: &str,
-    ) -> Result<RegistrationInfo> {
+    ) -> Result<RegisterOutcome> {
         validate_username(username)?;
         let display_name = display_name.trim();
         if display_name.is_empty() || display_name.chars().count() > 30 {
@@ -2411,50 +2841,116 @@ impl ServerStore {
         let user_id = new_id("usr");
         let request_id = new_id("reg");
         let expires_at = now + REGISTRATION_TTL_SECONDS;
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(db("开启事务失败"))?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(db("开启注册事务失败"))?;
+
+        // 首位用户在这一刻「占住」名额：账号直接 ACTIVE + admin，申请单直接 approved。
+        // 密码仍然不收，靠一次性 token 完成激活，未激活账号不持有任何可用凭证。
+        let first = first_user_slot(&tx)?;
+        let mut first_user = None;
+        let mut setup_token_hash: Option<String> = None;
+        let mut setup_expires: Option<i64> = None;
+        let (status, role, request_state, decided_by, decision_note) = if first {
+            let setup_token = format!("{SETUP_PREFIX}{}", auth::random_token(24));
+            let token_hash = to_hex(&auth::token_digest(&setup_token));
+            let token_expires = now + SETUP_TOKEN_TTL_SECONDS;
+            first_user = Some(ApprovedRegistration {
+                user_id: user_id.clone(),
+                setup_token,
+                setup_token_expires_at: token_expires,
+            });
+            setup_token_hash = Some(token_hash);
+            setup_expires = Some(token_expires);
+            (
+                "active",
+                "admin",
+                "approved",
+                Some("system"),
+                Some("系统自动批准：全库第一个账号"),
+            )
+        } else {
+            ("pending", "readonly", "pending", None, None)
+        };
+
         tx.execute(
             "INSERT INTO users (user_id, username, display_name, source, status, role,
-                                password_hash, token_version, created_at)
-             VALUES (?1, ?2, ?3, 'local', 'pending', 'readonly', NULL, 1, ?4)",
-            params![user_id, username, display_name, now],
+                                password_hash, token_version, created_at, approved_at)
+             VALUES (?1, ?2, ?3, 'local', ?4, ?5, NULL, 1, ?6, ?7)",
+            params![
+                user_id,
+                username,
+                display_name,
+                status,
+                role,
+                now,
+                if first { Some(now) } else { None }
+            ],
         )
         .map_err(|e| map_unique_as(e, ErrorCode::RegistrationExists, "用户名已被占用"))?;
         tx.execute(
             "INSERT INTO registration_requests
-               (request_id, username, display_name, reason, status, submitted_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
-            params![request_id, username, display_name, reason, now, expires_at],
+               (request_id, username, display_name, reason, status, submitted_at, expires_at,
+                decided_at, decided_by, decision_note, setup_token_hash, setup_token_expires)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                request_id,
+                username,
+                display_name,
+                if reason.is_empty() {
+                    None
+                } else {
+                    Some(reason)
+                },
+                request_state,
+                now,
+                expires_at,
+                if first { Some(now) } else { None },
+                decided_by,
+                decision_note,
+                setup_token_hash,
+                setup_expires
+            ],
         )
         .map_err(db("写入注册申请失败"))?;
         write_audit(
             &tx,
             "",
             &user_id,
-            "user.register",
+            if first {
+                "user.first_admin.register"
+            } else {
+                "user.register"
+            },
             username,
-            Some(&format!("{{\"request_id\":\"{request_id}\"}}")),
+            Some(&format!(
+                "{{\"request_id\":\"{request_id}\",\"first_user\":{first}}}"
+            )),
             now,
         )?;
         tx.commit().map_err(db("提交注册事务失败"))?;
 
-        Ok(RegistrationInfo {
-            request_id,
-            username: username.to_string(),
-            display_name: display_name.to_string(),
-            reason: if reason.is_empty() {
-                None
-            } else {
-                Some(reason.to_string())
+        Ok(RegisterOutcome {
+            info: RegistrationInfo {
+                request_id,
+                username: username.to_string(),
+                display_name: display_name.to_string(),
+                reason: if reason.is_empty() {
+                    None
+                } else {
+                    Some(reason.to_string())
+                },
+                state: if first {
+                    core_types::RegistrationStatus::Approved
+                } else {
+                    core_types::RegistrationStatus::Pending
+                },
+                submitted_at: now,
+                decided_at: if first { Some(now) } else { None },
+                decided_by: decided_by.map(str::to_string),
+                decision_note: decision_note.map(str::to_string),
+                expires_at,
             },
-            state: core_types::RegistrationStatus::Pending,
-            submitted_at: now,
-            decided_at: None,
-            decided_by: None,
-            decision_note: None,
-            expires_at,
+            first_user,
         })
     }
 
@@ -4263,7 +4759,7 @@ impl ServerStore {
 
     /// 后台维护：转正到期的清理标记，然后跑一次全库 GC。
     ///
-    /// 这是 `vcs-grpc` 的定时任务调用的入口——不需要 session，因为它没有调用者。
+    /// 这是 `vcs serve` 的定时任务调用的入口——不需要 session，因为它没有调用者。
     /// GC 是全局的（共享 CAS），所以只需一轮；`repo_count` 仅用于日志。
     pub fn run_maintenance(&self) -> Result<MaintenanceReport> {
         // 先执行保留策略：它会产生删除提交，随后同一轮的转正 + GC 就能接上。
@@ -4705,6 +5201,21 @@ struct SetupTokenRow {
     expires: Option<i64>,
     used_at: Option<i64>,
     status: String,
+}
+
+/// `ldap_config` 表的一行（bind 密码仍是密文）。
+struct LdapConfigRow {
+    host: String,
+    port: i64,
+    tls_mode: String,
+    base_dn: String,
+    bind_dn: String,
+    bind_password_enc: String,
+    user_filter: String,
+    group_filter: Option<String>,
+    attr_username: String,
+    attr_display_name: String,
+    enabled: i64,
 }
 
 /// 仓库申请查询的中间结构（12 个字段，用元组会被 clippy 判为过于复杂）。
@@ -5220,6 +5731,38 @@ fn db(action: &'static str) -> impl Fn(rusqlite::Error) -> Error {
 }
 
 // ---------------- 用户体系常量 ----------------
+
+/// 「全库第一个账号」的引导名额，**必须在 `BEGIN IMMEDIATE` 事务内判定**。
+///
+/// 自助注册与 LDAP 首次登录共用这一处：谁先在事务里看到空用户表，谁拿走
+/// 管理员名额，另一条入口立刻退化为普通流程。除了用户表，还检查引导审计
+/// 记录——即便有人手工删掉首个用户，也不能让第二个来抢注的人再拿一次管理员。
+fn first_user_slot(tx: &Connection) -> Result<bool> {
+    let users: i64 = tx
+        .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+        .map_err(db("统计用户失败"))?;
+    if users > 0 {
+        return Ok(false);
+    }
+    let claimed: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE action IN
+             ('user.bootstrap', 'user.bootstrap_rescue',
+              'user.first_admin.register', 'user.first_admin.ldap')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db("查询引导记录失败"))?;
+    Ok(claimed == 0)
+}
+
+fn role_rank(role: Role) -> u8 {
+    match role {
+        Role::Readonly => 1,
+        Role::Writer => 2,
+        Role::Admin => 3,
+    }
+}
 
 /// PAT 前缀：`authenticate` 靠它区分 JWT 与访问令牌，不必试错解析。
 const PAT_PREFIX: &str = "vcs_pat_";

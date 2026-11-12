@@ -58,7 +58,7 @@ function waitForServer(child) {
     let buffer = '';
     child.stdout.on('data', (chunk) => {
       buffer += chunk.toString();
-      if (buffer.includes('vcs-grpc 已启动')) {
+      if (buffer.includes('vcs serve 已启动')) {
         clearTimeout(timer);
         resolve();
       }
@@ -89,9 +89,12 @@ async function main() {
   if (login.status !== 0) fail(`CLI 登录失败：${login.stderr || login.stdout}`);
 
   step(`启动 gRPC 服务 ${TARGET}`);
-  const server = spawn(path.join(BIN, 'vcs-grpc'), ['--root', STORE, '--listen', TARGET], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  const server = spawn(
+    path.join(BIN, 'vcs'),
+    // 冒烟只验 gRPC / CLI 链路；关掉内置 Web 管理端，避免占用固定 8080 端口。
+    ['serve', '--store', STORE, '--listen', TARGET, '--no-admin'],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  );
   await waitForServer(server);
 
   const { VcsClient } = require('../dist/main/client.js');
@@ -258,6 +261,9 @@ async function main() {
     step('注册 → 审批 → 设密码：非管理员也能自己开通');
     const registered = await client.register('bob', '李波', '一起维护月度报表');
     console.log(`  已提交注册申请 ${registered.requestId}`);
+    // 这个库启动时已用 init-admin 建过管理员，所以 bob 不是首位用户，必须走审批。
+    if (registered.autoApproved) fail('已有管理员时注册不应被自动批准');
+    if (registered.passwordSetupToken) fail('非首位注册不应返回一次性设置密码 token');
     const pending = await client.listRegistrations(1);
     if (!pending.some((item) => item.username === 'bob')) fail('审批台里看不到 bob 的申请');
     const approved = await client.approveRegistration(registered.requestId, 2);

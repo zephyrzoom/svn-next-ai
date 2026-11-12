@@ -12,9 +12,10 @@ import type { ConflictChoice } from './wc';
  * 类型化 API 调用。渲染进程开着 sandbox + contextIsolation，即使页面被注入脚本，
  * 也拿不到文件系统与 token。
  *
- * M4 第一步只接线「单人提交闭环」：
- *   连接 → 仓库列表/新建 → 检出 → 状态 → 离线 diff → 提交 → 历史。
- * 审批台、成员管理、空间面板等通道仍是 `notWired` 占位，等对应界面一起做。
+ * 桌面端定位：只做「仓库使用」的客户端 —— 连接、仓库列表/选择、工作副本的
+ * 检出/状态/差异/冲突/提交/更新/还原/历史，以及账号自助注册、设置密码、提交
+ * 建库申请。管理与审批（成员、配额、空间治理、目录配置、审批台等）统一由服务端
+ * vcs serve 内置的 Web 管理端承载，桌面端不再暴露这些通道。
  */
 
 /** 统一返回信封：业务错误带 proto 的 ErrorCode，渲染进程据此决定提示还是跳登录。 */
@@ -55,27 +56,45 @@ function createWindow(): void {
       sandbox: true,
     },
   });
-  void win.loadFile(path.join(__dirname, '../renderer/index.html'));
+  // 静态资源由 `npm run build` 同步到 dist/renderer/。万一缺失，别只留一个白窗口：
+  // 把路径和原因直接弹出来，方便定位是没构建还是文件被清掉了。
+  const page = path.join(__dirname, '../renderer/index.html');
+  void win.loadFile(page).catch((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`界面加载失败：${page} — ${message}`);
+    void dialog.showErrorBox(
+      '界面加载失败',
+      `无法加载界面文件：\n${page}\n\n请先执行 npm run build（会把 src/renderer 同步到 dist/renderer）。\n\n${message}`,
+    );
+  });
 }
 
-const NOT_WIRED = '该功能尚未接线（M4 后续里程碑）';
+const NOT_WIRED = '该功能在桌面端不可用，请使用服务端 Web 管理端';
 
 function notWired(): Promise<never> {
   return Promise.reject(new Error(NOT_WIRED));
 }
 
-// ---------------- 单人提交闭环 ----------------
+// ---------------- 连接与仓库使用 ----------------
 
-ipcMain.handle('vcs:connect', (_event, target: string, username: string, password: string) =>
-  wrap<{ user: UserInfo }>(async () => {
-    client?.close();
-    const next = new VcsClient(target);
-    const user = await next.login(username, password);
-    client = next;
-    // 登录成功才写入本地设置：凭证用 safeStorage 加密，不落明文。
-    if (next.tokenValue) saveLogin(target, user.username, next.tokenValue);
-    return { user };
-  }),
+ipcMain.handle(
+  'vcs:connect',
+  (
+    _event,
+    target: string,
+    username: string,
+    password: string,
+    source: 'LOCAL' | 'LDAP' = 'LOCAL',
+  ) =>
+    wrap<{ user: UserInfo }>(async () => {
+      client?.close();
+      const next = new VcsClient(target);
+      const user = await next.login(username, password, source);
+      client = next;
+      // 登录成功才写入本地设置：凭证用 safeStorage 加密，不落明文。
+      if (next.tokenValue) saveLogin(target, user.username, next.tokenValue);
+      return { user };
+    }),
 );
 
 /** 上次的连接信息（不含凭证），用于把登录框填好。 */
@@ -119,10 +138,6 @@ ipcMain.handle('vcs:disconnect', () =>
 
 ipcMain.handle('vcs:listRepos', () =>
   wrap(async () => requireClient().listRepos()),
-);
-
-ipcMain.handle('vcs:createRepo', (_event, name: string) =>
-  wrap(async () => requireClient().createRepo(name)),
 );
 
 ipcMain.handle('vcs:pickDir', () =>
@@ -185,7 +200,7 @@ ipcMain.handle('vcs:log', (_event, repoId: string, limit = 20) =>
   wrap(async () => requireClient().getLog(repoId, limit)),
 );
 
-// ---------------- 注册、审批台、建库申请 ----------------
+// ---------------- 账号自助与建库申请 ----------------
 
 /** 免认证接口（注册、设置密码）用一个临时连接，不污染当前登录态。 */
 async function withTemp<T>(target: string, run: (client: VcsClient) => Promise<T>): Promise<T> {
@@ -209,141 +224,18 @@ ipcMain.handle(
     wrap(async () => withTemp(target, (client) => client.setPassword(token, password))),
 );
 
-ipcMain.handle('vcs:listRegistrations', (_event, state = 0) =>
-  wrap(async () => requireClient().listRegistrations(state)),
-);
-
-ipcMain.handle('vcs:approveRegistration', (_event, requestId: string, role: number) =>
-  wrap(async () => requireClient().approveRegistration(requestId, role)),
-);
-
-ipcMain.handle('vcs:rejectRegistration', (_event, requestId: string, reason: string) =>
-  wrap(async () => requireClient().rejectRegistration(requestId, reason)),
-);
-
 ipcMain.handle('vcs:requestRepo', (_event, name: string, reason: string, quota = 0) =>
   wrap(async () => requireClient().requestRepo(name, reason, quota)),
 );
 
-ipcMain.handle('vcs:listRepoCreations', (_event, state = 0) =>
-  wrap(async () => requireClient().listRepoCreations(state)),
-);
-
-ipcMain.handle(
-  'vcs:approveRepoCreation',
-  (_event, requestId: string, soft: number, hard: number, note: string) =>
-    wrap(async () => requireClient().approveRepoCreation(requestId, soft, hard, note)),
-);
-
-ipcMain.handle('vcs:rejectRepoCreation', (_event, requestId: string, reason: string) =>
-  wrap(async () => requireClient().rejectRepoCreation(requestId, reason)),
-);
-
-// ---------------- 成员管理 ----------------
-
-ipcMain.handle('vcs:listMembers', (_event, repoId: string) =>
-  wrap(async () => requireClient().listMembers(repoId)),
-);
-
-ipcMain.handle('vcs:addMember', (_event, repoId: string, userId: string, role: number) =>
-  wrap(async () => requireClient().addMember(repoId, userId, role)),
-);
-
-ipcMain.handle('vcs:setMemberRole', (_event, repoId: string, userId: string, role: number) =>
-  wrap(async () => requireClient().setMemberRole(repoId, userId, role)),
-);
-
-ipcMain.handle('vcs:removeMember', (_event, repoId: string, userId: string) =>
-  wrap(async () => requireClient().removeMember(repoId, userId)),
-);
-
-ipcMain.handle('vcs:searchUsers', (_event, query: string, limit = 20) =>
-  wrap(async () => requireClient().searchUsers(query, limit)),
-);
-
-// ---------------- 容量治理 ----------------
+// ---------------- 只读容量 ----------------
 
 ipcMain.handle('vcs:getQuota', (_event, repoId: string) =>
   wrap(async () => requireClient().getQuota(repoId)),
 );
 
-ipcMain.handle('vcs:listPurgeCandidates', (_event, repoId: string, limit = 10) =>
-  wrap(async () => requireClient().listPurgeCandidates(repoId, limit)),
-);
-
-ipcMain.handle('vcs:estimatePurge', (_event, repoId: string, paths: string[]) =>
-  wrap(async () => requireClient().estimatePurge(repoId, paths)),
-);
-
-ipcMain.handle(
-  'vcs:purge',
-  (_event, repoId: string, paths: string[], immediate: boolean, reason: string) =>
-    wrap(async () => requireClient().purge(repoId, paths, immediate, reason)),
-);
-
-ipcMain.handle('vcs:getGcStatus', (_event, repoId: string, jobId: string) =>
-  wrap(async () => requireClient().getGcStatus(repoId, jobId)),
-);
-
-ipcMain.handle('vcs:listPurgedPaths', (_event, repoId: string) =>
-  wrap(async () => requireClient().listPurgedPaths(repoId)),
-);
-
-ipcMain.handle('vcs:revertPurge', (_event, repoId: string, purgeId: string) =>
-  wrap(async () => requireClient().revertPurge(repoId, purgeId)),
-);
-
-ipcMain.handle('vcs:getQuotaDefaults', () =>
-  wrap(async () => requireClient().getQuotaDefaults()),
-);
-
-ipcMain.handle('vcs:updateQuotaDefaults', (_event, softBytes: number, hardBytes: number) =>
-  wrap(async () => requireClient().updateQuotaDefaults(softBytes, hardBytes)),
-);
-
-ipcMain.handle('vcs:getRepoQuota', (_event, repoId: string) =>
-  wrap(async () => requireClient().getRepoQuota(repoId)),
-);
-
-ipcMain.handle(
-  'vcs:setRepoQuota',
-  (_event, repoId: string, softBytes: number, hardBytes: number, inherit: boolean) =>
-    wrap(async () => requireClient().setRepoQuota(repoId, softBytes, hardBytes, inherit)),
-);
-
-ipcMain.handle('vcs:listRetentionPolicies', (_event, repoId: string) =>
-  wrap(async () => requireClient().listRetentionPolicies(repoId)),
-);
-
-ipcMain.handle(
-  'vcs:upsertRetentionPolicy',
-  (
-    _event,
-    repoId: string,
-    policy: {
-      policyId?: string;
-      pathPattern: string;
-      keepMonths: number;
-      maxBytes: number;
-      maxAgeDays: number;
-      enabled: boolean;
-      dryRun: boolean;
-    },
-  ) => wrap(async () => requireClient().upsertRetentionPolicy(repoId, policy)),
-);
-
-ipcMain.handle('vcs:deleteRetentionPolicy', (_event, repoId: string, policyId: string) =>
-  wrap(async () => requireClient().deleteRetentionPolicy(repoId, policyId)),
-);
-
-ipcMain.handle(
-  'vcs:applyRetention',
-  (_event, repoId: string, dryRun: boolean, immediate: boolean) =>
-    wrap(async () => requireClient().applyRetention(repoId, dryRun, immediate)),
-);
-
-// ---------------- 未接线（后续里程碑） ----------------
-
+// ---------------- 预留占位通道 ----------------
+// 桌面端不调用；保留仅为维持既有 IPC 契约，实现仍是 notWired。
 ipcMain.handle('vcs:getHead', notWired);
 ipcMain.handle('vcs:getRegistration', notWired);
 ipcMain.handle('vcs:getRepoCreation', notWired);

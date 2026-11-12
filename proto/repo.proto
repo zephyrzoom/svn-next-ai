@@ -550,6 +550,7 @@ message LoginResponse {
 }
 
 // 免认证接口：提交申请，账号处于 PENDING，不能登录。
+// 例外：全库第一个账号（注册或 LDAP 首次登录）自动成为管理员，见 §8.1 引导规则。
 message RegisterRequest {
   string username = 1;
   string display_name = 2;  // 姓名
@@ -561,6 +562,12 @@ message RegisterResponse {
   Status status = 1;
   string request_id = 2;
   RegistrationStatus state = 3;
+  // 首位注册者会被自动批准为管理员，直接把一次性设置密码 token 交回本人，
+  // 不必（也没有人能）走管理员审批。非首位用户这三个字段为空 / 默认值。
+  string password_setup_token = 4;
+  int64 setup_token_expires_at = 5;
+  bool auto_approved = 6;
+  Role granted_role = 7;
 }
 
 message RegistrationInfo {
@@ -689,11 +696,18 @@ message RevokePatResponse {
   Status status = 1;
 }
 
+// 目录组 → 全局角色。只在 JIT 建号时决定初始角色，已有账号的角色以本地为准，
+// 避免目录侧组调整意外把引导管理员降级。
+message GroupRole {
+  string group_dn = 1;
+  Role role = 2;
+}
+
 // 读取时不含 bind 密码；写入时单独传入并加密落库。
 message LdapConfig {
   string host = 1;
   uint32 port = 2;
-  string tls_mode = 3;
+  string tls_mode = 3;                 // ldaps / starttls，禁止明文 bind
   string base_dn = 4;
   string bind_dn = 5;
   string user_filter = 6;
@@ -702,6 +716,7 @@ message LdapConfig {
   reserved 9;                      // 原 attr_email 已移除，编号不复用
   string attr_display_name = 10;  // 姓名
   bool enabled = 11;
+  repeated GroupRole group_roles = 12;
 }
 
 message GetLdapConfigRequest {}
@@ -709,6 +724,8 @@ message GetLdapConfigRequest {}
 message GetLdapConfigResponse {
   Status status = 1;
   LdapConfig config = 2;
+  // 已保存过服务账号密码：前端据此显示「留空表示不修改」而不是空白输入框。
+  bool bind_password_set = 3;
 }
 
 message UpdateLdapConfigRequest {

@@ -191,6 +191,90 @@ fn unauth(msg: &str) -> Error {
     Error::new(ErrorCode::Unauthenticated, msg)
 }
 
+// ---------------- 服务端敏感配置加密 ----------------
+
+/// 域分隔前缀：同一个 `server.secret` 同时用于 JWT、keystream 与 MAC，
+/// 加前缀避免不同用途产生可利用的关联。
+const SEAL_STREAM_DOMAIN: &[u8] = b"vcs/secret-box/stream/v1";
+const SEAL_MAC_DOMAIN: &[u8] = b"vcs/secret-box/mac/v1";
+
+/// 生成定长 keystream：HMAC-SHA256(key, domain || nonce || counter) 分块。
+fn seal_keystream(key: &[u8], nonce: &[u8], len: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(len);
+    let mut counter: u32 = 0;
+    while out.len() < len {
+        let mut mac = HmacSha256::new_from_slice(key)
+            .map_err(|_| Error::new(ErrorCode::IoError, "加密密钥长度不合法"))?;
+        mac.update(SEAL_STREAM_DOMAIN);
+        mac.update(nonce);
+        mac.update(&counter.to_be_bytes());
+        out.extend_from_slice(&mac.finalize().into_bytes());
+        counter = counter
+            .checked_add(1)
+            .ok_or_else(|| Error::new(ErrorCode::IoError, "加密数据过长"))?;
+    }
+    out.truncate(len);
+    Ok(out)
+}
+
+fn seal_mac(key: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    let mut mac = HmacSha256::new_from_slice(key)
+        .map_err(|_| Error::new(ErrorCode::IoError, "加密密钥长度不合法"))?;
+    mac.update(SEAL_MAC_DOMAIN);
+    mac.update(nonce);
+    mac.update(ciphertext);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+/// 加密服务端保存的小段敏感数据（LDAP 服务账号 bind 密码）。
+///
+/// 格式是 base64url(`nonce[16] || mac[32] || ciphertext`)：先加密后认证，
+/// 解密时先验 MAC 再解 XOR，**密文被篡改不会解出「看起来能用」的明文**。
+/// 这不是通用加密库，只用于本机配置文件里的一小段口令；密钥来自 0600 的
+/// `server.secret`，与 JWT 签名密钥同源但做了域分隔。
+pub fn seal_secret(key: &[u8], plaintext: &[u8]) -> Result<String> {
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|e| Error::new(ErrorCode::IoError, format!("取加密随机数失败：{e}")))?;
+    let stream = seal_keystream(key, &nonce, plaintext.len())?;
+    let ciphertext: Vec<u8> = plaintext
+        .iter()
+        .zip(stream.iter())
+        .map(|(p, k)| p ^ k)
+        .collect();
+    let mac = seal_mac(key, &nonce, &ciphertext)?;
+    let mut blob = Vec::with_capacity(nonce.len() + mac.len() + ciphertext.len());
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&mac);
+    blob.extend_from_slice(&ciphertext);
+    Ok(URL_SAFE_NO_PAD.encode(blob))
+}
+
+/// 解密 `seal_secret` 的产物；密文、MAC 或密钥不对一律报错，绝不返回部分明文。
+pub fn open_secret(key: &[u8], encoded: &str) -> Result<Vec<u8>> {
+    let blob = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| Error::new(ErrorCode::IoError, "敏感配置不是合法 base64url"))?;
+    if blob.len() < 48 {
+        return Err(Error::new(ErrorCode::IoError, "敏感配置长度不合法"));
+    }
+    let (nonce, rest) = blob.split_at(16);
+    let (mac, ciphertext) = rest.split_at(32);
+    let expected = seal_mac(key, nonce, ciphertext)?;
+    if !constant_time_eq(&expected, mac) {
+        return Err(Error::new(
+            ErrorCode::IoError,
+            "敏感配置校验失败：密钥不匹配或内容被篡改",
+        ));
+    }
+    let stream = seal_keystream(key, nonce, ciphertext.len())?;
+    Ok(ciphertext
+        .iter()
+        .zip(stream.iter())
+        .map(|(c, k)| c ^ k)
+        .collect())
+}
+
 // ---------------- 一次性 token ----------------
 
 /// 生成 32 字节随机串（base64url）。用于一次性设置密码 token 与 PAT 明文。
@@ -285,5 +369,34 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.len(), 43); // 32 字节 base64url 无填充
         assert_ne!(token_digest(&a), token_digest(&b));
+    }
+
+    #[test]
+    fn secret_box_roundtrip_and_tamper_detection() {
+        let key = b"server-secret-from-0600-file";
+        let sealed = seal_secret(key, "bind-password-中文".as_bytes()).unwrap();
+        assert!(!sealed.contains("bind-password"));
+        assert_eq!(
+            open_secret(key, &sealed).unwrap(),
+            "bind-password-中文".as_bytes()
+        );
+
+        // 换个密文字节：必须先被 MAC 拦下，不能解出「差不多对」的口令。
+        let mut blob = URL_SAFE_NO_PAD.decode(&sealed).unwrap();
+        *blob.last_mut().unwrap() ^= 0x01;
+        let tampered = URL_SAFE_NO_PAD.encode(blob);
+        assert!(open_secret(key, &tampered).is_err());
+        // 换密钥同样失败。
+        assert!(open_secret(b"another-key", &sealed).is_err());
+        assert!(open_secret(key, "not-base64!!").is_err());
+    }
+
+    #[test]
+    fn secret_box_uses_a_fresh_nonce() {
+        let key = b"k";
+        assert_ne!(
+            seal_secret(key, b"same").unwrap(),
+            seal_secret(key, b"same").unwrap()
+        );
     }
 }

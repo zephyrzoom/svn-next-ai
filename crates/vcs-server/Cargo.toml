@@ -7,6 +7,9 @@ rust-version.workspace = true
 description = "svn-next 服务端：本地共享 CAS + SQLite 元数据的存储与业务层"
 
 [dependencies]
+# 目录认证：只用同步接口 + rustls（纯 Rust TLS，跨平台一致），不引入 OpenSSL。
+# 连接由 gRPC 层放进 spawn_blocking，避免在 async runtime 里嵌套 tokio runtime。
+ldap3 = { version = "0.11.5", default-features = false, features = ["sync", "tls-rustls"] }
 # 保留策略的 path_pattern 是正则（设计 9.7），用成熟实现而不是自造匹配器。
 regex = "1"
 vcs-core.workspace = true

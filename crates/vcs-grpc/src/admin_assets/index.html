@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>svn-next 管理端</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="login" class="login-wrap">
+      <form id="login-form" class="login-card">
+        <div class="login-brand">svn-next</div>
+        <h1>Web 管理端</h1>
+        <p class="muted">用管理员账号登录。客户端的日常仓库操作请回到桌面端。</p>
+        <label>身份来源
+          <select id="login-source">
+            <option value="LOCAL">本地账号</option>
+            <option value="LDAP">LDAP 目录</option>
+          </select>
+        </label>
+        <label>用户名<input id="login-username" autocomplete="username" spellcheck="false" /></label>
+        <label>密码<input id="login-password" type="password" autocomplete="current-password" /></label>
+        <button class="primary" type="submit">登录</button>
+        <p id="login-error" class="error hidden"></p>
+        <p class="hint">空库的第一个注册用户 / 第一个 LDAP 登录用户会自动成为管理员。</p>
+      </form>
+    </div>
+
+    <div id="app" class="app hidden">
+      <header class="topbar">
+        <div class="brand">svn-next <span class="tag">管理端</span></div>
+        <div class="topbar-right">
+          <span id="who" class="who"></span>
+          <button id="logout" class="ghost">退出登录</button>
+        </div>
+      </header>
+      <div class="shell">
+        <nav class="nav" id="nav">
+          <div class="nav-group">总览</div>
+          <button class="nav-item active" data-view="overview">概览</button>
+          <button class="nav-item" data-view="approvals">审批台</button>
+          <div class="nav-group">组织</div>
+          <button class="nav-item" data-view="users">用户</button>
+          <button class="nav-item" data-view="repos">仓库</button>
+          <button class="nav-item" data-view="quota">配额</button>
+          <button class="nav-item" data-view="ldap">目录设置</button>
+          <div class="nav-group">治理</div>
+          <button class="nav-item" data-view="space">空间治理</button>
+        </nav>
+        <main class="content">
+          <section class="view" id="view-overview">
+            <div class="page-head"><h2>概览</h2><button id="refresh-overview" class="ghost">刷新</button></div>
+            <div id="stats" class="stats"></div>
+            <div class="card">
+              <h3>待办</h3>
+              <div id="todo" class="todo"></div>
+            </div>
+          </section>
+
+          <section class="view hidden" id="view-approvals">
+            <div class="page-head"><h2>审批台</h2><button id="refresh-approvals" class="ghost">刷新</button></div>
+            <div class="card">
+              <h3>注册申请</h3>
+              <div id="reg-list" class="list"></div>
+            </div>
+            <div class="card">
+              <h3>建库申请</h3>
+              <div id="req-list" class="list"></div>
+            </div>
+            <div id="token-box" class="card hidden">
+              <h3>一次性设置密码 token</h3>
+              <p class="muted">请立即转交申请人，服务端不会再次显示。</p>
+              <code id="token-text" class="token"></code>
+            </div>
+          </section>
+
+          <section class="view hidden" id="view-users">
+            <div class="page-head"><h2>用户</h2><button id="refresh-users" class="ghost">刷新</button></div>
+            <div class="card">
+              <h3>直接建号</h3>
+              <form id="create-user-form" class="form-grid">
+                <label>用户名<input name="username" placeholder="小写字母/数字/_- ." required /></label>
+                <label>姓名<input name="display_name" required /></label>
+                <label>初始密码<input name="password" type="password" required /></label>
+                <label>全局角色<select name="role"><option value="readonly">只读</option><option value="writer">写</option><option value="admin">管理员</option></select></label>
+                <button class="primary" type="submit">创建</button>
+              </form>
+            </div>
+            <div class="card">
+              <h3>全部账号</h3>
+              <div class="table-wrap"><table id="users-table"><thead><tr><th>用户名</th><th>姓名</th><th>来源</th><th>状态</th><th>角色</th><th>最近登录</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+            </div>
+          </section>
+
+          <section class="view hidden" id="view-repos">
+            <div class="page-head"><h2>仓库</h2><button id="refresh-repos" class="ghost">刷新</button></div>
+            <div class="card">
+              <h3>直通新建</h3>
+              <form id="create-repo-form" class="form-grid">
+                <label>仓库名<input name="name" placeholder="小写字母/数字/-" required /></label>
+                <label>软上限（字节）<input name="soft_bytes" type="number" min="0" value="0" /></label>
+                <label>硬上限（字节）<input name="hard_bytes" type="number" min="0" value="0" /></label>
+                <button class="primary" type="submit">创建</button>
+              </form>
+              <p class="hint">配额填 0 表示继承全局默认。</p>
+            </div>
+            <div class="card">
+              <h3>全部仓库</h3>
+              <div class="table-wrap"><table id="repos-table"><thead><tr><th>名称</th><th>版本</th><th>状态</th><th>仓库 ID</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+            </div>
+            <div id="repo-detail" class="card hidden">
+              <div class="page-head"><h3 id="repo-detail-title">仓库详情</h3><button id="close-repo-detail" class="ghost">收起</button></div>
+              <div class="split">
+                <div>
+                  <h4>成员</h4>
+                  <div id="repo-members" class="list compact"></div>
+                  <form id="add-member-form" class="inline-form">
+                    <input name="username" placeholder="用户名" required />
+                    <select name="role"><option value="reader">读</option><option value="writer">写</option><option value="maintainer">维护者</option></select>
+                    <button class="primary" type="submit">添加</button>
+                  </form>
+                </div>
+                <div>
+                  <h4>配额</h4>
+                  <p id="repo-usage" class="muted"></p>
+                  <form id="repo-quota-form" class="form-grid compact-grid">
+                    <label>软上限（字节）<input name="soft_bytes" type="number" min="0" value="0" /></label>
+                    <label>硬上限（字节）<input name="hard_bytes" type="number" min="0" value="0" /></label>
+                    <button class="primary" type="submit">保存</button>
+                    <button id="inherit-quota" class="ghost" type="button">恢复继承</button>
+                  </form>
+                  <h4>启用状态</h4>
+                  <div class="row">
+                    <select id="repo-status-select"><option value="Active">启用</option><option value="Disabled">停用</option><option value="Archived">归档</option></select>
+                    <button id="save-repo-status" class="ghost">应用</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="view hidden" id="view-quota">
+            <div class="page-head"><h2>全局配额</h2><button id="refresh-quota" class="ghost">刷新</button></div>
+            <div class="card">
+              <h3>新仓库默认配额</h3>
+              <p class="muted">单仓库可在「仓库」页单独覆盖；0 表示未配置，由内置兜底接管。</p>
+              <form id="defaults-form" class="form-grid">
+                <label>软上限（字节）<input name="soft_bytes" type="number" min="0" value="0" /></label>
+                <label>硬上限（字节）<input name="hard_bytes" type="number" min="0" value="0" /></label>
+                <button class="primary" type="submit">保存</button>
+              </form>
+              <p id="defaults-note" class="hint"></p>
+            </div>
+          </section>
+
+          <section class="view hidden" id="view-ldap">
+            <div class="page-head"><h2>目录设置（LDAP / AD）</h2><button id="refresh-ldap" class="ghost">刷新</button></div>
+            <div class="card">
+              <form id="ldap-form" class="form-grid">
+                <label>主机<input name="host" placeholder="ldap.example.com" /></label>
+                <label>端口<input name="port" type="number" min="1" value="636" /></label>
+                <label>TLS<select name="tls_mode"><option value="ldaps">LDAPS</option><option value="starttls">StartTLS</option></select></label>
+                <label>启用<select name="enabled"><option value="0">停用</option><option value="1">启用</option></select></label>
+                <label>Base DN<input name="base_dn" /></label>
+                <label>Bind DN<input name="bind_dn" /></label>
+                <label>Bind 密码<input name="bind_password" type="password" placeholder="留空表示沿用" /></label>
+                <label>用户 filter<input name="user_filter" value="(uid={username})" /></label>
+                <label>组 filter（可选）<input name="group_filter" /></label>
+                <label>用户名属性<input name="attr_username" value="uid" /></label>
+                <label>姓名属性<input name="attr_display_name" value="cn" /></label>
+                <label class="wide">组 → 角色（每行 <code>组DN=admin|writer|readonly</code>）<textarea name="group_roles" rows="3"></textarea></label>
+                <div class="row wide">
+                  <button class="primary" type="submit">保存配置</button>
+                  <button id="test-ldap" class="ghost" type="button">测试连接</button>
+                  <span id="ldap-state" class="muted"></span>
+                </div>
+              </form>
+              <p class="hint">仅支持 LDAPS / StartTLS 且校验证书；bind 密码加密落库，读取接口不回传。</p>
+            </div>
+          </section>
+
+          <section class="view hidden" id="view-space">
+            <div class="page-head"><h2>空间治理</h2>
+              <div class="row"><select id="space-repo"></select><button id="refresh-space" class="ghost">加载</button></div>
+            </div>
+            <div class="card">
+              <h3>可清理目录</h3>
+              <div id="candidate-list" class="list compact"></div>
+              <div class="row">
+                <button id="estimate-purge" class="ghost">预估可释放</button>
+                <button id="purge-selected" class="primary">清理所选</button>
+                <label class="check"><input id="purge-immediate" type="checkbox" /> 立即 GC</label>
+                <button id="run-gc" class="ghost">手动 GC</button>
+              </div>
+              <pre id="space-result" class="result"></pre>
+            </div>
+            <div class="card">
+              <h3>回收站</h3>
+              <div id="purged-list" class="list compact"></div>
+            </div>
+            <div class="card">
+              <h3>保留策略</h3>
+              <div id="policy-list" class="list compact"></div>
+              <form id="policy-form" class="form-grid">
+                <label>路径前缀<input name="path_pattern" placeholder="202609/" required /></label>
+                <label>保留月数<input name="keep_months" type="number" min="0" value="0" /></label>
+                <label>最大字节<input name="max_bytes" type="number" min="0" value="0" /></label>
+                <label>最大天数<input name="max_age_days" type="number" min="0" value="0" /></label>
+                <label>启用<select name="enabled"><option value="1">启用</option><option value="0">停用</option></select></label>
+                <label>试运行<select name="dry_run"><option value="1">试运行</option><option value="0">可执行</option></select></label>
+                <button class="primary" type="submit">保存策略</button>
+              </form>
+              <div class="row">
+                <button id="preview-retention" class="ghost">预览执行</button>
+                <button id="apply-retention" class="primary">执行策略</button>
+              </div>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>

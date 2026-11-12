@@ -28,14 +28,18 @@ use std::sync::{Arc, Mutex};
 
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
-use vcs_core::{ChangeKind, EntryKind, ErrorCode, ObjectStore, RepoMemberRole, RepoStatus, Role};
+use vcs_core::{
+    ChangeKind, EntryKind, Error, ErrorCode, ObjectStore, RepoMemberRole, RepoStatus, Role,
+};
 use vcs_proto::vcs::repo::v1 as pb;
 use vcs_proto::vcs::repo::v1::auth_service_server::{AuthService, AuthServiceServer};
 use vcs_proto::vcs::repo::v1::repo_admin_service_server::{
     RepoAdminService, RepoAdminServiceServer,
 };
 use vcs_proto::vcs::repo::v1::repo_service_server::{RepoService, RepoServiceServer};
-use vcs_server::ServerStore;
+use vcs_server::{authenticate_ldap, test_ldap_connection, LdapSettings, ServerStore, TlsMode};
+
+mod admin;
 
 pub type Store = Arc<Mutex<ServerStore>>;
 
@@ -408,6 +412,91 @@ fn batches(objects: Vec<pb::Object>) -> Vec<pb::ObjectBatch> {
 
 // ---------------- AuthService ----------------
 
+/// 内部配置 → proto。bind 密码刻意不在 `LdapConfig` 里，回传永远不含明文。
+fn ldap_settings_to_pb(cfg: &LdapSettings) -> pb::LdapConfig {
+    pb::LdapConfig {
+        host: cfg.host.clone(),
+        port: u32::from(cfg.port),
+        tls_mode: cfg.tls_mode.as_str().into(),
+        base_dn: cfg.base_dn.clone(),
+        bind_dn: cfg.bind_dn.clone(),
+        user_filter: cfg.user_filter.clone(),
+        group_filter: cfg.group_filter.clone(),
+        attr_username: cfg.attr_username.clone(),
+        attr_display_name: cfg.attr_display_name.clone(),
+        enabled: cfg.enabled,
+        group_roles: cfg
+            .group_roles
+            .iter()
+            .map(|(dn, role)| pb::GroupRole {
+                group_dn: dn.clone(),
+                role: role_to_pb(*role),
+            })
+            .collect(),
+    }
+}
+
+fn pb_to_ldap_settings(
+    cfg: &pb::LdapConfig,
+    bind_password: String,
+) -> std::result::Result<LdapSettings, Error> {
+    let mut group_roles = Vec::with_capacity(cfg.group_roles.len());
+    for entry in &cfg.group_roles {
+        let role = match pb::Role::try_from(entry.role).unwrap_or(pb::Role::Unspecified) {
+            pb::Role::Admin => Role::Admin,
+            pb::Role::Writer => Role::Writer,
+            pb::Role::Readonly => Role::Readonly,
+            _ => {
+                return Err(Error::new(
+                    ErrorCode::InvalidArgument,
+                    format!("组 {} 映射了未知角色", entry.group_dn),
+                ))
+            }
+        };
+        group_roles.push((entry.group_dn.clone(), role));
+    }
+    Ok(LdapSettings {
+        host: cfg.host.clone(),
+        port: cfg.port as u16,
+        tls_mode: TlsMode::parse(&cfg.tls_mode)?,
+        base_dn: cfg.base_dn.clone(),
+        bind_dn: cfg.bind_dn.clone(),
+        bind_password,
+        user_filter: if cfg.user_filter.is_empty() {
+            "(uid={username})".into()
+        } else {
+            cfg.user_filter.clone()
+        },
+        group_filter: cfg.group_filter.clone(),
+        attr_username: if cfg.attr_username.is_empty() {
+            "uid".into()
+        } else {
+            cfg.attr_username.clone()
+        },
+        attr_display_name: if cfg.attr_display_name.is_empty() {
+            "cn".into()
+        } else {
+            cfg.attr_display_name.clone()
+        },
+        enabled: cfg.enabled,
+        group_roles,
+    })
+}
+
+/// bind 密码留空表示「沿用已保存的」，避免前端为了改一个开关重新明文传一遍口令。
+fn resolve_bind_password(
+    store: &ServerStore,
+    supplied: &str,
+) -> std::result::Result<String, Error> {
+    if !supplied.is_empty() {
+        return Ok(supplied.to_string());
+    }
+    Ok(store
+        .ldap_config()?
+        .map(|cfg| cfg.bind_password)
+        .unwrap_or_default())
+}
+
 pub struct AuthApi {
     api: Api,
 }
@@ -416,6 +505,82 @@ impl AuthApi {
     pub fn new(store: Store) -> Self {
         Self {
             api: Api::new(store),
+        }
+    }
+
+    /// 目录登录：配置读取 → 阻塞线程里做 bind → 回到存储层 JIT 建号并签发 JWT。
+    ///
+    /// 目录服务不可用时只影响这一条请求，本地账号登录路径完全不受影响。
+    async fn login_with_ldap(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<Response<pb::LoginResponse>, Status> {
+        let cfg = {
+            let store = self.api.store();
+            match store.ldap_config() {
+                Ok(cfg) => cfg,
+                Err(err) => {
+                    return Ok(Response::new(pb::LoginResponse {
+                        status: Some(status_err(&err)),
+                        ..Default::default()
+                    }))
+                }
+            }
+        };
+        let Some(cfg) = cfg.filter(|c| c.enabled) else {
+            return Ok(Response::new(pb::LoginResponse {
+                status: Some(pb::Status {
+                    code: pb::ErrorCode::LdapUnavailable as i32,
+                    message: "LDAP 登录尚未配置或未启用，请先让管理员配置目录服务".into(),
+                    quota: None,
+                    candidates: Vec::new(),
+                }),
+                ..Default::default()
+            }));
+        };
+
+        let user = username.to_string();
+        let pass = password.to_string();
+        // ldap3 的同步接口会自建 tokio runtime，绝不能在 async 线程里直接调用。
+        let profile = match tokio::task::spawn_blocking(move || {
+            authenticate_ldap(&cfg, &user, &pass)
+        })
+        .await
+        {
+            Ok(Ok(profile)) => profile,
+            Ok(Err(err)) => {
+                return Ok(Response::new(pb::LoginResponse {
+                    status: Some(status_err(&err)),
+                    ..Default::default()
+                }))
+            }
+            Err(join) => {
+                return Ok(Response::new(pb::LoginResponse {
+                    status: Some(pb::Status {
+                        code: pb::ErrorCode::LdapUnavailable as i32,
+                        message: format!("目录认证任务异常：{join}"),
+                        quota: None,
+                        candidates: Vec::new(),
+                    }),
+                    ..Default::default()
+                }))
+            }
+        };
+
+        let store = self.api.store();
+        match store.login_ldap(&profile) {
+            Ok((token, user)) => Ok(Response::new(pb::LoginResponse {
+                status: Some(status_ok()),
+                access_token: token,
+                refresh_token: String::new(),
+                expires_at: now_secs() + vcs_core::auth::DEFAULT_TOKEN_TTL_SECONDS,
+                user: Some(user_to_pb(&user)),
+            })),
+            Err(err) => Ok(Response::new(pb::LoginResponse {
+                status: Some(status_err(&err)),
+                ..Default::default()
+            })),
         }
     }
 }
@@ -428,16 +593,7 @@ impl AuthService for AuthApi {
     ) -> Result<Response<pb::LoginResponse>, Status> {
         let req = request.into_inner();
         if req.source == pb::AuthSource::Ldap as i32 {
-            // LDAP 尚未实现，但必须明确告知「不支持」，绝不能让客户端误以为密码错。
-            return Ok(Response::new(pb::LoginResponse {
-                status: Some(pb::Status {
-                    code: pb::ErrorCode::LdapUnavailable as i32,
-                    message: "LDAP 登录尚未接入，请使用本地账号".into(),
-                    quota: None,
-                    candidates: Vec::new(),
-                }),
-                ..Default::default()
-            }));
+            return self.login_with_ldap(&req.username, &req.password).await;
         }
         let now = now_secs();
         match self.api.store().login(&req.username, &req.password) {
@@ -465,11 +621,29 @@ impl AuthService for AuthApi {
             .store()
             .register(&req.username, &req.display_name, &req.reason)
         {
-            Ok(info) => Ok(Response::new(pb::RegisterResponse {
-                status: Some(status_ok()),
-                request_id: info.request_id,
-                state: reg_status_to_pb(info.state),
-            })),
+            Ok(outcome) => {
+                // 首位用户：自动批准为管理员，token 只在这一次响应里出现。
+                let first = outcome.first_user;
+                Ok(Response::new(pb::RegisterResponse {
+                    status: Some(status_ok()),
+                    request_id: outcome.info.request_id,
+                    state: reg_status_to_pb(outcome.info.state),
+                    password_setup_token: first
+                        .as_ref()
+                        .map(|f| f.setup_token.clone())
+                        .unwrap_or_default(),
+                    setup_token_expires_at: first
+                        .as_ref()
+                        .map(|f| f.setup_token_expires_at)
+                        .unwrap_or_default(),
+                    auto_approved: first.is_some(),
+                    granted_role: if first.is_some() {
+                        pb::Role::Admin as i32
+                    } else {
+                        pb::Role::Unspecified as i32
+                    },
+                }))
+            }
             Err(err) => Ok(Response::new(pb::RegisterResponse {
                 status: Some(status_err(&err)),
                 ..Default::default()
@@ -706,23 +880,132 @@ impl AuthService for AuthApi {
 
     async fn get_ldap_config(
         &self,
-        _request: Request<pb::GetLdapConfigRequest>,
+        request: Request<pb::GetLdapConfigRequest>,
     ) -> Result<Response<pb::GetLdapConfigResponse>, Status> {
-        unimplemented("GetLdapConfig（LDAP 尚未接入）")
+        let session = self.api.session(&request)?;
+        let result = self.api.store().ldap_config_public(Some(&session));
+        match result {
+            Ok(public) => {
+                let (config, bind_password_set) = match public {
+                    Some(p) => (ldap_settings_to_pb(&p.settings), p.bind_password_set),
+                    None => (ldap_settings_to_pb(&LdapSettings::default()), false),
+                };
+                Ok(Response::new(pb::GetLdapConfigResponse {
+                    status: Some(status_ok()),
+                    config: Some(config),
+                    bind_password_set,
+                }))
+            }
+            Err(err) => Ok(Response::new(pb::GetLdapConfigResponse {
+                status: Some(status_err(&err)),
+                config: None,
+                bind_password_set: false,
+            })),
+        }
     }
 
     async fn update_ldap_config(
         &self,
-        _request: Request<pb::UpdateLdapConfigRequest>,
+        request: Request<pb::UpdateLdapConfigRequest>,
     ) -> Result<Response<pb::UpdateLdapConfigResponse>, Status> {
-        unimplemented("UpdateLdapConfig（LDAP 尚未接入）")
+        let session = self.api.session(&request)?;
+        let req = request.into_inner();
+        let cfg = req
+            .config
+            .ok_or_else(|| Status::invalid_argument("缺少 LDAP 配置"))?;
+        let password = {
+            let store = self.api.store();
+            match resolve_bind_password(&store, &req.bind_password) {
+                Ok(p) => p,
+                Err(err) => {
+                    return Ok(Response::new(pb::UpdateLdapConfigResponse {
+                        status: Some(status_err(&err)),
+                    }))
+                }
+            }
+        };
+        let settings = match pb_to_ldap_settings(&cfg, password) {
+            Ok(s) => s,
+            Err(err) => {
+                return Ok(Response::new(pb::UpdateLdapConfigResponse {
+                    status: Some(status_err(&err)),
+                }))
+            }
+        };
+        match self.api.store().set_ldap_config(Some(&session), &settings) {
+            Ok(()) => Ok(Response::new(pb::UpdateLdapConfigResponse {
+                status: Some(status_ok()),
+            })),
+            Err(err) => Ok(Response::new(pb::UpdateLdapConfigResponse {
+                status: Some(status_err(&err)),
+            })),
+        }
     }
 
     async fn test_ldap_connection(
         &self,
-        _request: Request<pb::TestLdapConnectionRequest>,
+        request: Request<pb::TestLdapConnectionRequest>,
     ) -> Result<Response<pb::TestLdapConnectionResponse>, Status> {
-        unimplemented("TestLdapConnection（LDAP 尚未接入）")
+        let session = self.api.session(&request)?;
+        let req = request.into_inner();
+        let cfg = req
+            .config
+            .ok_or_else(|| Status::invalid_argument("缺少 LDAP 配置"))?;
+        let (password, authz) = {
+            let store = self.api.store();
+            let authz = store.require_admin_action(&session, "测试 LDAP 连接");
+            (resolve_bind_password(&store, &req.bind_password), authz)
+        };
+        if let Err(err) = authz {
+            return Ok(Response::new(pb::TestLdapConnectionResponse {
+                status: Some(status_err(&err)),
+                bound_dn: String::new(),
+                user_count_sample: 0,
+            }));
+        }
+        let password = match password {
+            Ok(p) => p,
+            Err(err) => {
+                return Ok(Response::new(pb::TestLdapConnectionResponse {
+                    status: Some(status_err(&err)),
+                    bound_dn: String::new(),
+                    user_count_sample: 0,
+                }))
+            }
+        };
+        let settings = match pb_to_ldap_settings(&cfg, password) {
+            Ok(s) => s,
+            Err(err) => {
+                return Ok(Response::new(pb::TestLdapConnectionResponse {
+                    status: Some(status_err(&err)),
+                    bound_dn: String::new(),
+                    user_count_sample: 0,
+                }))
+            }
+        };
+        let outcome = tokio::task::spawn_blocking(move || test_ldap_connection(&settings)).await;
+        match outcome {
+            Ok(Ok(out)) => Ok(Response::new(pb::TestLdapConnectionResponse {
+                status: Some(status_ok()),
+                bound_dn: out.bound_dn,
+                user_count_sample: out.user_count_sample,
+            })),
+            Ok(Err(err)) => Ok(Response::new(pb::TestLdapConnectionResponse {
+                status: Some(status_err(&err)),
+                bound_dn: String::new(),
+                user_count_sample: 0,
+            })),
+            Err(join) => Ok(Response::new(pb::TestLdapConnectionResponse {
+                status: Some(pb::Status {
+                    code: pb::ErrorCode::LdapUnavailable as i32,
+                    message: format!("目录测试任务异常：{join}"),
+                    quota: None,
+                    candidates: Vec::new(),
+                }),
+                bound_dn: String::new(),
+                user_count_sample: 0,
+            })),
+        }
     }
 
     async fn set_user_status(
@@ -2118,19 +2401,34 @@ type RepoAdminApi = AdminApi;
 pub struct ServeConfig {
     pub root: PathBuf,
     pub listen: SocketAddr,
+    /// 内置 Web 管理端监听地址；`None` 表示不启动（`--no-admin`）。
+    pub admin_listen: Option<SocketAddr>,
     /// 后台维护间隔（秒）。0 表示不启动定时任务，需要手工 `vcs gc`。
     pub maintenance_interval_secs: u64,
 }
 
-/// 启动 gRPC 服务，直到进程退出。
+/// 启动 gRPC 服务与内置 Web 管理端，直到任一服务退出。
 pub async fn serve(config: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let store = ServerStore::open(&config.root)?;
     let store: Store = Arc::new(Mutex::new(store));
+    // 先绑定管理端：端口占用要立刻失败，不能留下「gRPC 起来了但管理页面没起来」的半残状态。
+    let admin_listener = match config.admin_listen {
+        Some(addr) => Some(
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(|e| format!("Web 管理端无法监听 {addr}：{e}"))?,
+        ),
+        None => None,
+    };
     println!(
-        "vcs-grpc 已启动：{}（存储根目录 {}）",
+        "vcs serve 已启动：{}（存储根目录 {}）",
         config.listen,
         config.root.display()
     );
+    match config.admin_listen {
+        Some(addr) => println!("Web 管理端已启动：http://{addr}"),
+        None => println!("Web 管理端：已关闭（--no-admin）"),
+    }
     if config.maintenance_interval_secs > 0 {
         println!(
             "后台维护：每 {} 秒一次（转正到期清理 + 全库 GC）",
@@ -2140,7 +2438,19 @@ pub async fn serve(config: ServeConfig) -> Result<(), Box<dyn std::error::Error>
     } else {
         println!("后台维护：已关闭（需要手工执行 vcs gc）");
     }
-    router(store).serve(config.listen).await?;
+    let grpc = router(store.clone()).serve(config.listen);
+    match admin_listener {
+        Some(listener) => {
+            let http = admin::serve_with_listener(store.clone(), listener);
+            let mut grpc = std::pin::pin!(grpc);
+            let mut http = std::pin::pin!(http);
+            tokio::select! {
+                result = &mut grpc => result?,
+                result = &mut http => result.map_err(|e| e.to_string())?,
+            }
+        }
+        None => grpc.await?,
+    }
     Ok(())
 }
 

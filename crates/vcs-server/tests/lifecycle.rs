@@ -931,15 +931,19 @@ fn registration_needs_approval_and_password_setup_before_login() {
     let reg = store
         .register("bob", "李波", "需要一个账号归档月度报表")
         .unwrap();
-    assert_eq!(reg.username, "bob");
-    assert!(matches!(reg.state, vcs_core::RegistrationStatus::Pending));
+    assert_eq!(reg.info.username, "bob");
+    assert_eq!(reg.first_user, None, "库里已有管理员，不应再自动批准");
+    assert!(matches!(
+        reg.info.state,
+        vcs_core::RegistrationStatus::Pending
+    ));
 
     // 未审批：不能登录，且错误码要能让客户端显示「等待审批」。
     let err = store.login("bob", PASSWORD).unwrap_err();
     assert_eq!(err.code, ErrorCode::AccountPending);
 
     let approved = store
-        .approve_registration(&alice, &reg.request_id, Role::Writer)
+        .approve_registration(&alice, &reg.info.request_id, Role::Writer)
         .unwrap();
     // 审批通过但还没设密码：仍然不能登录，且不是「密码错」。
     let err = store.login("bob", PASSWORD).unwrap_err();
@@ -972,18 +976,18 @@ fn registration_rejects_duplicates_and_empty_reasons() {
 
     let reg = store.register("carol", "王佳", "申请").unwrap();
     let err = store
-        .reject_registration(&alice, &reg.request_id, "   ")
+        .reject_registration(&alice, &reg.info.request_id, "   ")
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidArgument, "驳回必须写原因");
 
     store
-        .reject_registration(&alice, &reg.request_id, "用途不明确")
+        .reject_registration(&alice, &reg.info.request_id, "用途不明确")
         .unwrap();
     let err = store.login("carol", PASSWORD).unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidCredentials);
     // 已处理的申请不能重复处理。
     let err = store
-        .reject_registration(&alice, &reg.request_id, "再拒一次")
+        .reject_registration(&alice, &reg.info.request_id, "再拒一次")
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::ApprovalNotFound);
 }
@@ -1003,7 +1007,7 @@ fn only_admins_can_see_or_approve_registrations() {
     let err = store.list_registrations(&dave, None, 10).unwrap_err();
     assert_eq!(err.code, ErrorCode::PermissionDenied);
     let err = store
-        .approve_registration(&dave, &reg.request_id, Role::Writer)
+        .approve_registration(&dave, &reg.info.request_id, Role::Writer)
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::PermissionDenied);
 
@@ -1019,7 +1023,7 @@ fn setup_token_is_single_use_and_password_policy_is_enforced() {
     let alice = admin(&store);
     let reg = store.register("frank", "孙飞", "申请").unwrap();
     let approved = store
-        .approve_registration(&alice, &reg.request_id, Role::Readonly)
+        .approve_registration(&alice, &reg.info.request_id, Role::Readonly)
         .unwrap();
 
     // 服务端是安全边界：不合规的密码必须被拒，并列出缺什么。
@@ -1890,4 +1894,193 @@ fn system_session_cannot_be_authenticated() {
         .files_at(&vcs_server::Session::system(), &repo.repo_id, None)
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::RepoDisabled);
+}
+
+// ---------------- 首位用户引导（注册 / LDAP 共用名额） ----------------
+
+fn dir_user(username: &str, groups: &[&str]) -> vcs_server::DirectoryUser {
+    vcs_server::DirectoryUser {
+        username: username.into(),
+        display_name: format!("{username} 姓名"),
+        dn: format!("uid={username},dc=example,dc=com"),
+        groups: groups.iter().map(|s| (*s).to_string()).collect(),
+    }
+}
+
+fn ldap_fixture() -> vcs_server::LdapSettings {
+    vcs_server::LdapSettings {
+        host: "ldap.example.com".into(),
+        base_dn: "dc=example,dc=com".into(),
+        bind_dn: "cn=readonly,dc=example,dc=com".into(),
+        bind_password: "BindPass1!".into(),
+        enabled: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn first_registration_is_automatically_an_admin() {
+    let sb = Sandbox::new("first-register");
+    let store = sb.store();
+
+    let reg = store.register("alice", "张爱丽", "我是第一个用户").unwrap();
+    assert!(matches!(
+        reg.info.state,
+        vcs_core::RegistrationStatus::Approved
+    ));
+    let first = reg.first_user.clone().expect("首个注册应自动批准");
+    assert!(first.setup_token.starts_with("vcs_setup_"));
+    // 没设密码前不能登录，但账号已经是 ACTIVE + admin。
+    assert_eq!(
+        store.login("alice", PASSWORD).unwrap_err().code,
+        ErrorCode::AccountPending
+    );
+
+    store.set_password(&first.setup_token, PASSWORD).unwrap();
+    let (token, user) = store.login("alice", PASSWORD).unwrap();
+    assert_eq!(user.role, Role::Admin);
+    let session = store.authenticate(&token).unwrap();
+    assert_eq!(session.role, Role::Admin);
+
+    // 自动批准过的申请不能被重复审批，也不能再给同一账号发第二张 token。
+    let err = store
+        .approve_registration(&session, &reg.info.request_id, Role::Writer)
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::ApprovalNotFound);
+
+    // 第二个人仍是普通待审批申请，绝不会自动拿到管理员。
+    let second = store.register("bob", "李波", "申请").unwrap();
+    assert!(matches!(
+        second.info.state,
+        vcs_core::RegistrationStatus::Pending
+    ));
+    assert!(second.first_user.is_none());
+    assert_eq!(
+        store.login("bob", PASSWORD).unwrap_err().code,
+        ErrorCode::AccountPending
+    );
+}
+
+#[test]
+fn bootstrap_can_rescue_first_user_with_a_lost_setup_token() {
+    let sb = Sandbox::new("first-rescue");
+    let store = sb.store();
+    let reg = store.register("alice", "张爱丽", "").unwrap();
+    assert!(reg.first_user.is_some());
+
+    // token 丢了：本机运维用同名 init-admin 重置口令，不必重装整个库。
+    let user = store.bootstrap_admin("alice", "张爱丽", PASSWORD).unwrap();
+    assert_eq!(user.role, Role::Admin);
+    let (_, logged) = store.login("alice", PASSWORD).unwrap();
+    assert_eq!(logged.role, Role::Admin);
+
+    // 一旦有可登录管理员，bootstrap 必须重新关上。
+    let err = store
+        .bootstrap_admin("mallory", "攻击者", PASSWORD)
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::PermissionDenied);
+}
+
+#[test]
+fn first_ldap_login_is_admin_and_group_mapping_only_applies_to_new_users() {
+    let sb = Sandbox::new("first-ldap");
+    let store = sb.store();
+    let mut cfg = ldap_fixture();
+    cfg.group_roles = vec![("cn=writers,dc=example,dc=com".into(), Role::Writer)];
+    store.set_ldap_config(None, &cfg).unwrap();
+
+    // 目录里第一个登录的人：无论属于哪个组，都是管理员。
+    let (token, first) = store.login_ldap(&dir_user("alice", &[])).unwrap();
+    assert_eq!(first.role, Role::Admin);
+    assert_eq!(store.authenticate(&token).unwrap().role, Role::Admin);
+
+    // 之后 JIT 建号按组映射给初始角色；没命中的一律只读。
+    let (_, writer) = store
+        .login_ldap(&dir_user("bob", &["cn=writers,dc=example,dc=com"]))
+        .unwrap();
+    assert_eq!(writer.role, Role::Writer);
+    let (_, reader) = store.login_ldap(&dir_user("carol", &[])).unwrap();
+    assert_eq!(reader.role, Role::Readonly);
+
+    // 已有账号再次登录只刷新姓名 / DN，组变动不会把引导管理员降级。
+    let (_, again) = store
+        .login_ldap(&dir_user("alice", &["cn=writers,dc=example,dc=com"]))
+        .unwrap();
+    assert_eq!(again.role, Role::Admin);
+
+    // 目录账号不存本地口令：本地登录会明确提示走目录登录。
+    let err = store.login("alice", PASSWORD).unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidCredentials);
+}
+
+#[test]
+fn registration_and_ldap_share_a_single_first_user_slot() {
+    // 注册先占了名额：之后第一个 LDAP 用户必须按普通规则（只读）建号。
+    let sb = Sandbox::new("first-slot-register");
+    let store = sb.store();
+    store.register("alice", "张爱丽", "").unwrap();
+    let (_, via_ldap) = store.login_ldap(&dir_user("bob", &[])).unwrap();
+    assert_eq!(via_ldap.role, Role::Readonly);
+
+    // 反过来：LDAP 先登录成管理员，之后注册的人只能等审批。
+    let sb = Sandbox::new("first-slot-ldap");
+    let store = sb.store();
+    let (_, admin) = store.login_ldap(&dir_user("alice", &[])).unwrap();
+    assert_eq!(admin.role, Role::Admin);
+    let reg = store.register("bob", "李波", "申请").unwrap();
+    assert!(reg.first_user.is_none());
+    assert!(matches!(
+        reg.info.state,
+        vcs_core::RegistrationStatus::Pending
+    ));
+}
+
+#[test]
+fn ldap_bind_password_never_touches_disk_or_the_public_config_in_cleartext() {
+    let sb = Sandbox::new("ldap-secret");
+    let store = sb.store();
+    let cfg = ldap_fixture();
+    store.set_ldap_config(None, &cfg).unwrap();
+
+    let db = fs::read(sb.root.join("store/server.db")).unwrap();
+    let needle = cfg.bind_password.as_bytes();
+    assert!(
+        !db.windows(needle.len()).any(|w| w == needle),
+        "server.db 里出现了明文 bind 密码"
+    );
+
+    let public = store.ldap_config_public(None).unwrap().unwrap();
+    assert!(public.settings.bind_password.is_empty());
+    assert!(public.bind_password_set);
+    assert_eq!(public.settings.host, cfg.host);
+    assert_eq!(
+        store.ldap_config().unwrap().unwrap().bind_password,
+        cfg.bind_password,
+        "内部读取应能解密还原"
+    );
+}
+
+#[test]
+fn ldap_config_requires_admin_when_called_over_the_network_path() {
+    let sb = Sandbox::new("ldap-authz");
+    let store = sb.store();
+    let alice = admin(&store);
+    store
+        .create_user(&alice, "dave", "赵大", PASSWORD, Role::Writer)
+        .unwrap();
+    let (token, _) = store.login("dave", PASSWORD).unwrap();
+    let dave = store.authenticate(&token).unwrap();
+
+    let cfg = ldap_fixture();
+    assert_eq!(
+        store.set_ldap_config(Some(&dave), &cfg).unwrap_err().code,
+        ErrorCode::PermissionDenied
+    );
+    assert_eq!(
+        store.ldap_config_public(Some(&dave)).unwrap_err().code,
+        ErrorCode::PermissionDenied
+    );
+    // 本机运维通道（actor=None）不受影响。
+    store.set_ldap_config(None, &cfg).unwrap();
+    assert!(store.ldap_config_public(Some(&alice)).unwrap().is_some());
 }

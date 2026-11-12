@@ -4,16 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "svn-next gRPC 服务层：把 ServerStore 包成 vcs.repo.v1 三个 service"
+description = "svn-next gRPC 服务层：把 ServerStore 包成 vcs.repo.v1 三个 service（由 vcs serve 调用）"
 
 [dependencies]
 tonic = "0.12"
+axum = "0.7"
+serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 tokio-stream = "0.1"
 vcs-core.workspace = true
 vcs-proto.workspace = true
 vcs-server.workspace = true
-clap = { version = "4", features = ["derive", "env"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -1,8 +1,12 @@
-//! svn-next CLI —— M1/M2 验收用客户端。
+//! svn-next 唯一的可执行文件：本地客户端 + 服务端入口。
 //!
-//! 这一版故意直接打开服务端存储目录（本地直连），目标是先把**版本语义**跑对：
-//! 检出、提交、离线状态比对、离线 diff、日志。等语义稳定后再套上 gRPC 与 Electron，
-//! 避免「传输层 bug」和「语义 bug」混在一起排查。
+//! 部署时只分发 `vcs` 一个二进制，用子命令区分角色：
+//!   vcs <客户端命令>     本地直连存储目录（init-admin / import / commit / …）
+//!   vcs serve            常驻 gRPC 服务（原 `vcs-grpc` 二进制）
+//!   vcs server info      一次性查看存储目录概况（原 `vcs-server` 二进制）
+//!
+//! 客户端命令故意直接打开服务端存储目录（本地直连），目标是先把**版本语义**跑对：
+//! 检出、提交、离线状态比对、离线 diff、日志，避免「传输层 bug」和「语义 bug」混在一起排查。
 //!
 //! 已具备的能力都对应 proto 里的正式接口，命令名与 RPC 一一对应：
 //!   init-admin → BootstrapAdmin       login → Login
@@ -11,18 +15,25 @@
 //!   log → GetLog                      status / diff / revert → 纯本地，不访问服务端
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use vcs_core::{hash_bytes, ChangeKind, ObjectStore, WorkingCopy};
-use vcs_server::{PendingChange, ServerStore, Session};
+use vcs_server::{
+    authenticate_ldap, test_ldap_connection, PendingChange, ServerStore, Session, TlsMode,
+};
 
 #[derive(Parser)]
-#[command(name = "vcs", version, about = "svn-next 命令行客户端（M1）")]
+#[command(
+    name = "vcs",
+    version,
+    about = "svn-next 命令行：本地客户端 + 服务端（serve / server）"
+)]
 struct Cli {
-    /// 服务端存储目录
+    /// 服务端存储目录（所有子命令共用）
     #[arg(long, global = true, env = "VCS_STORE", default_value = ".vcs-server")]
     store: PathBuf,
 
@@ -32,6 +43,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// 启动 gRPC 服务 + 内置 Web 管理端（常驻进程）
+    Serve {
+        /// 监听地址。默认只绑本机；对外提供服务请显式指定 0.0.0.0 并自行加 TLS 网关。
+        #[arg(long, env = "VCS_LISTEN", default_value = "127.0.0.1:50051")]
+        listen: SocketAddr,
+        /// Web 管理端监听地址（浏览器访问）。默认只绑本机。
+        #[arg(long, env = "VCS_ADMIN_LISTEN", default_value = "127.0.0.1:8080")]
+        admin_listen: SocketAddr,
+        /// 关闭内置 Web 管理端（只跑 gRPC，便于测试或最小化部署）。
+        #[arg(long, env = "VCS_NO_ADMIN", default_value_t = false, action = clap::ArgAction::SetTrue)]
+        no_admin: bool,
+        /// 后台维护间隔（秒）：转正到期清理 + 全库 GC。0 表示关闭，只能手工 vcs gc。
+        #[arg(long, env = "VCS_MAINTENANCE_INTERVAL", default_value_t = 300)]
+        maintenance_interval: u64,
+    },
+    /// 服务端存储运维（一次性命令，不常驻）
+    Server {
+        #[command(subcommand)]
+        cmd: ServerCmd,
+    },
     /// 引导管理员账号（仅限空库，执行一次）
     InitAdmin {
         #[arg(long)]
@@ -52,6 +83,9 @@ enum Cmd {
         /// 用已有 PAT 登录（CI 场景，避免把密码写进脚本）
         #[arg(long)]
         pat: Option<String>,
+        /// 用目录账号登录（需先在服务端配置 LDAP）
+        #[arg(long)]
+        ldap: bool,
     },
     /// 清除本地缓存的 token
     Logout,
@@ -257,6 +291,42 @@ enum Cmd {
         #[arg(long)]
         password: Option<String>,
     },
+    /// 查看目录服务配置（不回显 bind 密码）
+    LdapShow,
+    /// 配置目录服务（本机运维通道，无需登录；留空的字段沿用已有配置）
+    LdapConfig {
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        /// ldaps / starttls，禁止明文
+        #[arg(long)]
+        tls_mode: Option<String>,
+        #[arg(long)]
+        base_dn: Option<String>,
+        #[arg(long)]
+        bind_dn: Option<String>,
+        /// 留空表示沿用已保存的密码
+        #[arg(long)]
+        bind_password: Option<String>,
+        #[arg(long)]
+        user_filter: Option<String>,
+        #[arg(long)]
+        group_filter: Option<String>,
+        #[arg(long)]
+        attr_username: Option<String>,
+        #[arg(long)]
+        attr_display_name: Option<String>,
+        /// 组 → 角色，形如 "cn=admins,dc=example,dc=com=admin"，可重复
+        #[arg(long)]
+        group_role: Vec<String>,
+        #[arg(long)]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+    },
+    /// 测试目录服务连通性（服务账号 bind + 抽样搜索）
+    LdapTest,
     /// 提交仓库创建申请
     RepoRequest {
         name: String,
@@ -344,6 +414,62 @@ enum Cmd {
     PatRevoke { token_id: String },
 }
 
+#[derive(Subcommand)]
+enum ServerCmd {
+    /// 显示存储目录统计（布局、对象数、压缩后大小、是否已初始化）
+    Info,
+}
+
+/// 启动常驻服务。CLI 本身是同步的，这里临时建一个多线程 tokio runtime，
+/// 把 `vcs_grpc::serve` 一直跑到进程退出（gRPC 与 Web 管理端共用它）。
+fn serve(
+    root: PathBuf,
+    listen: SocketAddr,
+    admin_listen: Option<SocketAddr>,
+    maintenance_interval_secs: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(vcs_grpc::serve(vcs_grpc::ServeConfig {
+        root,
+        listen,
+        admin_listen,
+        maintenance_interval_secs,
+    }))
+}
+
+/// 一次性查看存储目录概况（原 `vcs-server info`）。
+fn store_info(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let store = ServerStore::open(root)?;
+    let objects = store.objects();
+    let hashes = objects.list_hashes()?;
+    let stored: u64 = hashes
+        .iter()
+        .map(|h| objects.stored_size(h).unwrap_or(0))
+        .sum();
+
+    println!("vcs {} (服务端存储)", env!("CARGO_PKG_VERSION"));
+    println!("root      : {}", store.root().display());
+    println!("protocol  : proto/repo.proto (vcs.repo.v1)");
+    println!("schema    : schema/server.sql");
+    println!(
+        "layout    : {}（objects/ 全局去重，压缩后 {} 字节）",
+        vcs_core::CAS_LAYOUT,
+        stored
+    );
+    println!("objects   : {} 个", hashes.len());
+    println!(
+        "users     : {}",
+        if store.has_any_user()? {
+            "已初始化"
+        } else {
+            "未初始化（需 init-admin）"
+        }
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
@@ -359,6 +485,20 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let store_root = cli.store.clone();
 
     match cli.cmd {
+        Cmd::Serve {
+            listen,
+            admin_listen,
+            no_admin,
+            maintenance_interval,
+        } => {
+            let admin = if no_admin { None } else { Some(admin_listen) };
+            serve(store_root, listen, admin, maintenance_interval)?;
+        }
+
+        Cmd::Server { cmd } => match cmd {
+            ServerCmd::Info => store_info(&store_root)?,
+        },
+
         Cmd::InitAdmin {
             username,
             name,
@@ -378,6 +518,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             username,
             password,
             pat,
+            ldap,
         } => {
             let store = ServerStore::open(&store_root)?;
             if let Some(pat) = pat {
@@ -396,7 +537,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Some(p) => p,
                 None => prompt("密码：")?,
             };
-            let (token, user) = store.login(&username, &password)?;
+            let (token, user) = if ldap {
+                let cfg = store.ldap_config()?.filter(|c| c.enabled).ok_or(
+                    "LDAP 登录尚未配置或未启用；先在服务器本机执行 vcs ldap-config --enable ...",
+                )?;
+                let profile = authenticate_ldap(&cfg, &username, &password)?;
+                store.login_ldap(&profile)?
+            } else {
+                store.login(&username, &password)?
+            };
             save_token(&store_root, &token, &user.username)?;
             println!(
                 "登录成功：{}（{}，角色 {}）",
@@ -1031,13 +1180,26 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             reason,
         } => {
             let store = ServerStore::open(&store_root)?;
-            let info = store.register(&username, &name, &reason)?;
+            let outcome = store.register(&username, &name, &reason)?;
+            let info = &outcome.info;
             println!(
                 "已提交注册申请：{}（申请号 {}）",
                 info.username, info.request_id
             );
-            println!("状态：待审批，有效期至 {}", format_time(info.expires_at));
-            println!("审批通过后管理员会给你一个一次性链接，用它设置密码才能登录。");
+            if let Some(first) = &outcome.first_user {
+                println!("这是全库第一个账号，已自动批准为管理员，无需等待审批。");
+                println!(
+                    "一次性设置密码 token（明文只显示这一次）：{}",
+                    first.setup_token
+                );
+                println!(
+                    "有效期至 {}；执行：vcs set-password --token <token> --password '<新密码>'",
+                    format_time(first.setup_token_expires_at)
+                );
+            } else {
+                println!("状态：待审批，有效期至 {}", format_time(info.expires_at));
+                println!("审批通过后管理员会给你一个一次性链接，用它设置密码才能登录。");
+            }
         }
 
         Cmd::RegisterList { state, limit } => {
@@ -1098,6 +1260,125 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             store.set_password(&token, &password)?;
             println!("密码已设置，现在可以登录了：vcs login --username <用户名>");
+        }
+
+        Cmd::LdapShow => {
+            let store = ServerStore::open(&store_root)?;
+            let Some(public) = store.ldap_config_public(None)? else {
+                println!("尚未配置 LDAP；在服务器本机执行 vcs ldap-config --help 查看参数。");
+                return Ok(());
+            };
+            let c = &public.settings;
+            println!(
+                "启用：{}    地址：{}    TLS：{}",
+                c.enabled,
+                c.url(),
+                c.tls_mode.as_str()
+            );
+            println!("base DN：{}", c.base_dn);
+            println!(
+                "bind DN：{}（密码{}）",
+                c.bind_dn,
+                if public.bind_password_set {
+                    "已设置"
+                } else {
+                    "未设置"
+                }
+            );
+            println!(
+                "用户 filter：{}    组 filter：{}",
+                c.user_filter, c.group_filter
+            );
+            println!(
+                "属性：用户名={}  姓名={}",
+                c.attr_username, c.attr_display_name
+            );
+            if c.group_roles.is_empty() {
+                println!("组 → 角色映射：无（JIT 用户默认 readonly）");
+            } else {
+                println!("组 → 角色映射：");
+                for (dn, role) in &c.group_roles {
+                    println!("  {dn} → {}", role_label(*role));
+                }
+            }
+        }
+
+        Cmd::LdapConfig {
+            host,
+            port,
+            tls_mode,
+            base_dn,
+            bind_dn,
+            bind_password,
+            user_filter,
+            group_filter,
+            attr_username,
+            attr_display_name,
+            group_role,
+            enable,
+            disable,
+        } => {
+            if enable && disable {
+                return Err("--enable 与 --disable 不能同时使用".into());
+            }
+            let store = ServerStore::open(&store_root)?;
+            let mut cfg = store.ldap_config()?.unwrap_or_default();
+            if let Some(v) = host {
+                cfg.host = v;
+            }
+            if let Some(v) = port {
+                cfg.port = v;
+            }
+            if let Some(v) = tls_mode {
+                cfg.tls_mode = TlsMode::parse(&v)?;
+            }
+            if let Some(v) = base_dn {
+                cfg.base_dn = v;
+            }
+            if let Some(v) = bind_dn {
+                cfg.bind_dn = v;
+            }
+            if let Some(v) = bind_password {
+                cfg.bind_password = v;
+            }
+            if let Some(v) = user_filter {
+                cfg.user_filter = v;
+            }
+            if let Some(v) = group_filter {
+                cfg.group_filter = v;
+            }
+            if let Some(v) = attr_username {
+                cfg.attr_username = v;
+            }
+            if let Some(v) = attr_display_name {
+                cfg.attr_display_name = v;
+            }
+            if !group_role.is_empty() {
+                let mut parsed = Vec::with_capacity(group_role.len());
+                for entry in &group_role {
+                    parsed.push(parse_group_role_entry(entry)?);
+                }
+                cfg.group_roles = parsed;
+            }
+            if enable {
+                cfg.enabled = true;
+            }
+            if disable {
+                cfg.enabled = false;
+            }
+            store.set_ldap_config(None, &cfg)?;
+            println!("已保存目录配置：{}（启用：{}）", cfg.url(), cfg.enabled);
+            println!("bind 密码已加密落库、不会回显；可执行 vcs ldap-test 验证连通性。");
+        }
+
+        Cmd::LdapTest => {
+            let store = ServerStore::open(&store_root)?;
+            let cfg = store.ldap_config()?.ok_or("尚未配置 LDAP")?;
+            let out = test_ldap_connection(&cfg)?;
+            println!(
+                "目录连接成功：bind DN = {}，抽样条目 {} 个",
+                out.bound_dn, out.user_count_sample
+            );
         }
 
         Cmd::RepoRequest {
@@ -1433,6 +1714,16 @@ fn role_label(role: vcs_core::Role) -> &'static str {
         vcs_core::Role::Writer => "writer",
         vcs_core::Role::Readonly => "readonly",
     }
+}
+
+fn parse_group_role_entry(
+    value: &str,
+) -> Result<(String, vcs_core::Role), Box<dyn std::error::Error>> {
+    // DN 里本身带 '='，所以从最后一个 '=' 切角色名。
+    let (dn, role) = value
+        .rsplit_once('=')
+        .ok_or("组映射格式应为 <group_dn>=<admin|writer|readonly>")?;
+    Ok((dn.to_string(), parse_global_role(role)?))
 }
 
 fn parse_global_role(value: &str) -> Result<vcs_core::Role, Box<dyn std::error::Error>> {

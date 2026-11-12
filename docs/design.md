@@ -211,30 +211,37 @@ FinalizeCommit(session_id)
               │                          ↑
               ├─ reject ──→ REJECTED      └─ 一次性 token 设置初始密码
               └─ 超期 ────→ EXPIRED
-LDAP 首次登录成功 ─────────────────→ ACTIVE（免审批，见第 15 章收口说明）
+空库首个注册 ──自动批准为 admin────────→ ACTIVE（token 随注册响应返回本人）
+LDAP 首次登录成功 ─────────────────────→ ACTIVE（免审批；首个目录用户自动 admin）
 ```
 
 - `PENDING` / `REJECTED` / `EXPIRED` / `DISABLED` 一律不可登录，返回 `ERROR_CODE_ACCOUNT_PENDING` 等明确错误码，客户端给友好提示而不是反复报「密码错误」。
 - 审批通过时分配角色（默认只读，管理员可指定），并生成一次性 `password_setup_token`；**注册表单不收集密码**，避免未激活账号持有可用凭证。
-- **Bootstrap 管理员是部署前置条件**：首次部署时通过环境变量或 CLI 创建首个管理员，否则无人能审批注册与仓库申请。
+- **首位用户引导（本轮定稿）**：全库第一个账号自动成为 `admin`，无需审批、无需预置 bootstrap 管理员。注册与 LDAP 首次登录共用 `first_user_slot()`：在 `BEGIN IMMEDIATE` 写事务内判定「用户表为空且没有引导审计记录」，谁先提交谁拿走名额，跨 CLI / gRPC 进程互斥。引导记录落 `audit_log`（`user.first_admin.register` / `user.first_admin.ldap`），即便删掉首用户也不会让第二个人再抢注。
+- 首位注册者仍然**不收集密码**：申请单直接 `approved`，`password_setup_token` 随 `RegisterResponse` 一次性返回（CLI 打印、桌面端自动填入设置密码框）；`SetPassword` 复核密码策略后账号才能真正登录。
+- `init-admin` 降级为「可选的预置管理员 + 首位账号救援」：只在没有可登录管理员时可用；同名本地账号尚未激活时重置口令并提权，避免一次性 token 丢失导致全库锁死。
 
 ### 8.2 自助注册与审批
 
 - `Register` 为**免认证**接口，只提交 `username`、`display_name`（姓名）与申请理由；校验用户名唯一性，与已有 LDAP 账号重名时返回明确冲突错误。不收集邮箱等其它资料。
+- **空库首个 `Register` 自动批准为 `admin`**，响应里多带 `auto_approved` / `password_setup_token` / `setup_token_expires_at` / `granted_role`；第二个起仍回到 PENDING 审批链路。判定与 LDAP JIT 共用同一个事务名额（见 8.1）。
 - 管理员用 `ListRegistrations` / `ApproveRegistration` / `RejectRegistration` 处理，拒绝必须填写原因；全部写入 `audit_log`。
 - 审批通过后由管理员转交一次性设置密码链接，客户端调用 `SetPassword` 完成激活；「我的申请」页可查状态。
 - 防刷：按 IP / 用户名限流，可选验证码；申请默认 7 天有效，超期自动 `EXPIRED`。
 
-### 8.3 LDAP 登录
+### 8.3 LDAP 登录（已接入）
 
-流程：服务账号 bind → 按 `user_filter` 搜索用户 DN → 用该 DN 与用户密码再次 bind 校验 → 查组 → 映射角色 → 签发 JWT。
+流程：服务账号 bind → 按 `user_filter` 搜索用户 DN → 查组 → 用该 DN 与用户密码再次 bind 校验 → JIT 建号 / 更新映射 → 签发 JWT。
 
-- 用户名在拼入 filter 前必须做 LDAP 转义，防 LDAP 注入。
-- 必须 LDAPS 或 StartTLS 并校验证书，禁止明文 bind；配置连接超时与连接池；服务账号只读、最小权限。
-- `ldap_config.bind_password_enc` 用主密钥加密存储，读取接口不回传明文；`TestLdapConnection` 供管理员验证配置。
-- **降级策略**：LDAP 不可用时，本地管理员与本地账号仍能登录，避免全员锁死；LDAP 登录返回 `ERROR_CODE_LDAP_UNAVAILABLE`，绝不退化成「校验通过」。
-- **首次登录免审批（已定稿）**：LDAP 用户不走自助注册审批，bind 成功即 JIT 创建 `ACTIVE` 本地映射并写审计；其组 → 角色映射由 `ldap_group_roles` 配置。
+- **分层**：目录协议在 `vcs-server/src/ldap.rs`（只管连接与 bind，不碰数据库），业务在 `ServerStore::login_ldap()`（只接收已验证的 `DirectoryUser`）。gRPC 把同步 bind 放进 `spawn_blocking`，因为 `ldap3` 的同步接口会自建 tokio runtime，不能在 async 线程里直接调用。这样集成测试可以注入假 `DirectoryUser`，不必真的起目录服务。
+- 依赖 `ldap3 0.11`（`sync` + `tls-rustls`，纯 Rust TLS，跨平台一致）；默认用系统根证书校验，**从不调用 `set_no_tls_verify`**；连接与单次操作超时各 5 秒。连接池暂未做，每次登录一条连接。
+- 用户名在拼入 filter 前按 RFC 4515 转义（`* ( ) \ NUL` 与非 ASCII 字节），防 LDAP 注入；`group_filter` 另外支持 `{dn}` 占位符。
+- 必须 LDAPS 或 StartTLS，禁止明文 bind；服务账号只读、最小权限。
+- `ldap_config.bind_password_enc` 用 `vcs_core::auth::seal_secret` 加密（HMAC-SHA256 keystream + encrypt-then-MAC，密钥取自 `server.secret` 并做域分隔），读取接口 `LdapPublicConfig` 恒不回传明文；`UpdateLdapConfig` 的 `bind_password` 留空表示沿用已存密码；`TestLdapConnection` 供管理员验证配置。
+- **降级策略**：LDAP 不可用时，本地管理员与本地账号仍能登录，避免全员锁死；LDAP 登录返回 `ERROR_CODE_LDAP_UNAVAILABLE`，绝不退化成「校验通过」。用户不存在与口令错误统一返回 `INVALID_CREDENTIALS`，不泄露账号是否存在。
+- **首次登录免审批（已定稿）**：LDAP 用户不走自助注册审批，bind 成功即 JIT 创建 `ACTIVE` 本地映射并写审计。**首个目录用户自动成为 `admin`**（与注册共用引导名额）；之后的组 → 角色映射由 `ldap_group_roles` 配置，命中多条取最高、未命中 `readonly`，且**只在 JIT 建号时生效**——已有账号角色以本地为准，避免目录侧组调整把引导管理员悄悄降级。
 - 目录侧只读取用户名（`attr_username`）与姓名（`attr_display_name`），不再读取邮箱属性；LDAP 账号不受 8.4 的本地密码策略约束，密码由目录服务自行管理。
+- 仍待补：目录连接池、嵌套组解析、真机目录集成测试。当前自动化覆盖 filter 转义、配置校验、故障降级，以及注入 `DirectoryUser` 的 JIT / 首位规则 / gRPC 端到端首用户注册。
 
 ### 8.4 Token、凭证与密码策略
 
@@ -470,10 +477,10 @@ svn-next-ai/
 │   │   ├── wc.rs                工作副本：检出、离线 status / diff、pristine 缓存
 │   │   └── lib.rs               领域类型、ObjectStore 契约、错误码、配额解析
 │   ├── vcs-proto/               build.rs 用 tonic-build + protoc-bin-vendored 生成 gRPC
-│   ├── vcs-server/              lib（ServerStore 业务层）+ bin `vcs-server`（存储运维）
-│   ├── vcs-grpc/                网络层：三个 service 的实现 + bin `vcs-grpc`（长期运行）
+│   ├── vcs-server/              lib（ServerStore 业务层），无独立 bin
+│   ├── vcs-grpc/                网络层 lib：三个 service 的实现 + serve()，无独立 bin
 │   ├── vcs-napi/                Node 原生模块：把 vcs-core 的工作副本语义交给 Electron
-│   └── vcs-cli/                 二进制名 `vcs`，语义验证客户端（本地直连）
+│   └── vcs-cli/                 唯一二进制 `vcs`：客户端命令 + `serve` + `server info`
 ├── desktop/                     Electron 客户端
 │   ├── src/main/client.ts       gRPC 传输层（@grpc/grpc-js + proto-loader）
 │   ├── src/main/wc.ts           工作副本 → napi 的类型化包装（不实现任何语义）
@@ -514,21 +521,26 @@ M0 阶段 Rust workspace 保持零外部依赖、可离线 `cargo check`；M1 �
 <server-root>/tmp/            原子写入暂存区，启动时清理 .part 残留
 ```
 
-M1 只有本地直连形态（CLI 直接打开这个目录），目的是先把版本语义跑对；M3 起多了一个长期运行的服务进程：
+M1 只有本地直连形态（CLI 直接打开这个目录），目的是先把版本语义跑对；M3 起多了 gRPC 网络入口。两者（以及运维工具）打开的是同一个存储根目录。
+
+原先是三个独立二进制 `vcs` / `vcs-grpc` / `vcs-server`，部署时要分发三份、还容易把 `--root` 与 `--store` 指到不同目录。现合并为**唯一可执行文件 `vcs`**，用子命令区分：
 
 ```bash
-vcs-grpc --root /srv/vcs --listen 127.0.0.1:50051   # 默认只绑本机
-vcs-server --root /srv/vcs info                     # 运维：看布局、对象数、字节数
+vcs --store /srv/vcs serve --listen 127.0.0.1:50051   # 常驻 gRPC 服务，默认只绑本机
+vcs --store /srv/vcs server info                      # 一次性运维：看布局、对象数、字节数
+vcs --store /srv/vcs import reports ./src -m "初始导入"  # 本地直连的客户端命令
 ```
 
-两者打开同一个存储根目录：`vcs-grpc` 是网络入口，`vcs-server` 是一次性运维工具，`vcs` CLI 仍是本地直连的语义验证客户端。对外暴露公网请在前面加 TLS 网关（gRPC over TLS 或反向代理），本阶段不做内置 TLS。
+`--store` 是全局参数（环境变量 `VCS_STORE`），所有子命令共用，从根上消除了目录错配。业务层仍在 `vcs-server` lib、网络层仍在 `vcs-grpc` lib，只是不再各自带 bin；`vcs serve` 在 `vcs-cli` 里建 tokio runtime 后调 `vcs_grpc::serve`。对外暴露公网请在前面加 TLS 网关（gRPC over TLS 或反向代理），本阶段不做内置 TLS。
 
 ### 11.3 CLI 命令（M1 + M2 + M3）
 
 | 命令 | 对应 gRPC | 说明 |
 | --- | --- | --- |
-| `vcs init-admin` | `BootstrapAdmin` | 仅空库可执行一次 |
-| `vcs login` / `logout` | `Login` | token 缓存于 `~/.vcs/credentials.json`，0600 |
+| `vcs serve` | 承载三个 service | 常驻服务；`--listen` / `--maintenance-interval` 只对该子命令生效 |
+| `vcs server info` | 无（本地运维） | 一次性打印存储布局、对象数、压缩后大小、是否已初始化 |
+| `vcs init-admin` | `BootstrapAdmin` | 可选：没有可登录管理员时预置 / 救援管理员；已有管理员则拒绝 |
+| `vcs login` / `logout` | `Login` | token 缓存于 `~/.vcs/credentials.json`，0600；`--ldap` 走目录 bind |
 | `vcs repo-create` | `CreateRepoDirect` | 管理员直通建库，写审计 |
 | `vcs user-create` | `ApproveRegistration` 建号段 | 管理员建 ACTIVE 账号 |
 | `vcs member-add` / `member-list` | `AddRepoMember` / `ListRepoMembers` | 按角色矩阵校验 |
@@ -547,9 +559,11 @@ vcs-server --root /srv/vcs info                     # 运维：看布局、对�
 | `vcs purged` / `unpurge` | `ListPurgedPaths` / `RevertPurge` | **M4**：回收站列表与撤销清理（内容已回收则明确失败） |
 | `vcs retention-list` / `retention-set` / `retention-rm` | `List/Upsert/DeleteRetentionPolicy` | **M4**：按目录正则配置保留策略（默认仅预览） |
 | `vcs retention-apply` | `ApplyRetention` | **M4**：评估并清理；`--dry-run` 只报告 |
-| `vcs maintenance` | 无（系统任务，无 RPC） | **M4**：手工触发「转正到期清理 + 全库 GC」，与 `vcs-grpc` 定时任务同一入口 |
+| `vcs maintenance` | 无（系统任务，无 RPC） | **M4**：手工触发「转正到期清理 + 全库 GC」，与 `vcs serve` 定时任务同一入口 |
 | `vcs candidates` | `ListPurgeCandidates` | **M2**：按独占大小排序的可清理目录 |
-| `vcs register` | `Register` | **M3**：免登录自助注册（只收用户名/姓名/理由，不收密码） |
+| `vcs register` | `Register` | **M3**：免登录自助注册（只收用户名/姓名/理由，不收密码）；**空库首个账号自动批准为 admin 并返回一次性 token** |
+| `vcs ldap-config` / `ldap-show` / `ldap-test` | 本机运维（无 RPC） | 加密保存目录配置 / 回显（不含密码）/ 测试服务账号 bind |
+| `get` / `update` / `test` LDAP 配置 RPC | `GetLdapConfig` / `UpdateLdapConfig` / `TestLdapConnection` | 仅管理员；桌面端「目录设置」走这三个接口 |
 | `vcs register-list` | `ListRegistrations` | **M3**：管理员查看申请（可按状态过滤） |
 | `vcs register-approve` | `ApproveRegistration` | **M3**：通过审批并输出一次性设密码 token |
 | `vcs register-reject` | `RejectRegistration` | **M3**：驳回，必须写原因 |
@@ -571,7 +585,7 @@ vcs-server --root /srv/vcs info                     # 运维：看布局、对�
 | M0 | proto 契约、server/wc schema、workspace 与 Electron 骨架、CI | 契约评审通过；`cargo check` 通过；proto 语法校验通过 | ✅ 完成 |
 | M1 | 只读闭环：管理员直通创建仓库 + `import`（本地目录）、`checkout`、`log`、离线 `status/diff`；**bootstrap 管理员 + 本地登录 + JWT 校验** | CLI 可用管理员账号完成检出与状态比对 | ✅ 完成（另加：成员门、两级配额预检、gRPC 代码生成、13 个服务端集成测试） |
 | M2 | 写闭环：`commit` / `update` / `revert` / 冲突元数据；**GC 基础**（可达性标记、独占大小、dry-run） | 真实仓库跑通提交更新闭环；`EstimatePurge` 预估值与实际释放量误差可解释 | ✅ 完成（COW 树变更、两阶段提交、冲突三哈希、路径裁剪 + 标记清扫 GC；93 个测试） |
-| M3 | 工程化：**LDAP 登录 + 自助注册审批 + 仓库创建审批 + 成员门与 owner 成员管理 + 全局/单仓库配额配置 + PAT**、组角色映射、ACL 与锁、配额预检、一键 `Purge`、大文件分块续传、GC、备份 | 注册与仓库申请两条审批链路均跑通；非成员无法检出/提交；改全局默认后继承仓库立即按新阈值预检、单仓库覆盖优先 | 进行中：**自助注册 + 审批 + 一次性设密码 + 仓库申请审批 + PAT（含 scope 收窄）+ gRPC 服务层 + 成员/配额/仓库状态治理已落地**；LDAP、ACL、锁待做 |
+| M3 | 工程化：**LDAP 登录 + 自助注册审批 + 仓库创建审批 + 成员门与 owner 成员管理 + 全局/单仓库配额配置 + PAT**、组角色映射、ACL 与锁、配额预检、一键 `Purge`、大文件分块续传、GC、备份 | 注册与仓库申请两条审批链路均跑通；非成员无法检出/提交；改全局默认后继承仓库立即按新阈值预检、单仓库覆盖优先 | 进行中：**自助注册（含首位用户自动管理员）+ 审批 + 一次性设密码 + LDAP 登录 / JIT 建号 / 组角色映射 / 三个配置 RPC + 仓库申请审批 + PAT（含 scope 收窄）+ gRPC 服务层 + 成员/配额/仓库状态治理已落地**；ACL、锁、目录连接池待做 |
 | M4 | Electron GUI：登录/注册、新建仓库向导与审批台（用户 + 仓库）、仓库设置页成员管理、admin 配额配置页、空间面板、检出向导、变更列表、diff、提交、历史、三栏冲突、打包自动更新 | 三平台安装包可用 | 进行中：**提交 / 更新 / 冲突三栏合并 + 注册审批 + 建库审批 + 成员管理 + 空间治理 / 回收站 / 保留策略（含自动执行）/ 配额设置 + 后台维护 + 打包（本地 + GitHub Actions 三平台未签名）已落地**（工作副本走 napi 复用 `vcs-core`）；代码签名与自动更新按「内部试用」定位暂不做 |
 | M5 | 可选 AI 辅助：提交信息生成、变更摘要、冲突解释，服务端可插拔接口 | 不侵入核心协议 | 待开始 |
 
@@ -586,7 +600,8 @@ CLI 先行、GUI 后置，目的是先用最低成本验证版本语义是否正
 - 密码策略单测：长度边界（7 / 8 位）、四类字符各自缺失、特殊字符集合（ASCII 标点计入，空格与非 ASCII 不计入）、客户端与服务端共用同一份校验函数。
 - 仓库审批集成测试：`PENDING` 申请无 `repo_id` 且任何 `RepoService` 调用返回 `REPO_NOT_FOUND`；审批事务原子性（`repos` + owner 成员记录 + 申请状态 + 审计同时成功或同时回滚）；重复审批幂等；`DISABLED` / `ARCHIVED` 仓库拒绝读写。
 - 成员门集成测试：非成员调用 `RepoService` 一律 `REPO_NOT_MEMBER`；`reader` 提交被拒；owner 不可移除或降级；`maintainer` 不能增删 `maintainer`；成员被移除后未完成的 `BeginCommit` 在 `FinalizeCommit` 被拒；`ListRepos` 不列出非成员仓库。
-- LDAP 集成测试使用模拟目录（mock bind / 组查询），覆盖 filter 转义防注入、证书校验、LDAP 不可用时本地管理员仍可登录。
+- 首位用户引导专项：空库首个注册自动批准为 admin、第二个仍 PENDING；首个 LDAP 登录为 admin、之后按组映射；两条入口共用名额（注册先 / LDAP 先各一条）；引导审计记录防止删号重抢；`init-admin` 救援未激活的首位账号；gRPC 端到端验证 `RegisterResponse` 新字段与「未配置目录时返回 `LDAP_UNAVAILABLE`」。
+- LDAP 单测覆盖 filter 转义防注入、TLS URL 生成、配置校验、bind 密码加密落库（明文不落盘 / 不回传）、故障降级；真机目录集成测试（mock bind / 组查询）与连接池仍待补。
 - JWT 即时失效：禁用用户或改角色后旧 token 被拒；PAT 明文只返回一次、只存哈希、撤销立即生效。
 - GC 专项：构造共享对象、裁剪路径、验证「共享对象不被误删」与「独占对象全部回收」。
 - 配额层级单测与集成：继承 / 覆盖 / 兜底三种来源、软阈值 85% 推导、非法配置校验；改全局默认后继承仓库的 `BeginCommit` 立即按新硬阈值拒绝，单仓库覆盖不受全局默认变化影响。
@@ -604,8 +619,9 @@ CLI 先行、GUI 后置，目的是先用最低成本验证版本语义是否正
 | 备份中残留已清理数据 | 敏感场景启用加密擦除；归档场景在文档中明确告知 |
 | SQLite 单机写并发 | `BEGIN IMMEDIATE` + 单写者；WAL 模式提升读并发 |
 | LDAP 服务不可用 | 本地管理员与本地账号可独立登录；LDAP 请求返回 `LDAP_UNAVAILABLE`，绝不降级为「校验通过」 |
-| LDAP 注入 / 明文 bind | 用户名拼入 filter 前转义；强制 LDAPS/StartTLS 与证书校验；服务账号只读最小权限；连接超时与池化 |
-| 自助注册被刷 / 审批积压 | 注册接口按 IP 与用户名限流、可选验证码；申请 7 天过期；管理员审批台与待办提醒；bootstrap 管理员列为部署前置条件 |
+| LDAP 注入 / 明文 bind | 用户名拼入 filter 前按 RFC 4515 转义；强制 LDAPS/StartTLS 与证书校验；服务账号只读最小权限；连接与操作各 5 秒超时（连接池待补） |
+| 首位用户名额被抢注 | `BEGIN IMMEDIATE` 事务内原子判定 + 引导审计记录，跨 CLI / gRPC 进程互斥；名额只发一次，删号也不会重发；部署方可先用 `init-admin` 预置管理员关闭这个入口 |
+| 自助注册被刷 / 审批积压 | 注册接口按 IP 与用户名限流、可选验证码；申请 7 天过期；管理员审批台与待办提醒；首位账号自动批准后即由本人承担审批 |
 | 仓库审批积压导致无法开通 | 申请 7 天过期 + 管理员待办提醒；全局 `admin` 可用 `CreateRepoDirect` 应急直通并写审计；审批台按提交时间排序 |
 | 审批与目录创建不一致 | 先幂等创建 `objects/` 再提交事务，失败保持 `PENDING` 可重试；孤儿目录由 GC 清理；启动时扫描并修复不一致状态 |
 | 弱密码 / 客户端校验被绕过 | 密码策略在 `vcs-core` 单一实现；服务端 `SetPassword` 强制再校验并返回 `PASSWORD_POLICY_VIOLATION`；客户端校验仅作实时提示 |
@@ -634,7 +650,8 @@ CLI 先行、GUI 后置，目的是先用最低成本验证版本语义是否正
 | **客户端绑定方式** | **napi-rs 原生模块**，不采用 sidecar 进程 |
 | **分支与标签** | **不提供**。无 `branch` / `tag` / `ref`，也不用目录约定模拟；单一线性主干，版本定位只用 `rN` |
 | **认证方式** | **内建 `AuthService`**：LDAP（LDAPS / StartTLS）+ 本地账号，不以外部 OIDC 为主入口 |
-| **自助注册** | **需要管理员审批**：`PENDING → ACTIVE`（或 `REJECTED` / `EXPIRED`），审批通过后用一次性 token 设置初始密码 |
+| **自助注册** | **除全库首位用户外需管理员审批**：`PENDING → ACTIVE`（或 `REJECTED` / `EXPIRED`），审批通过后用一次性 token 设置初始密码 |
+| **首位管理员** | **第一个注册或第一个 LDAP 登录成功的用户自动成为 `admin`**，免审批，两条入口共用同一事务名额且只发一次；`init-admin` 降级为可选预置 / 救援通道 |
 | **仓库创建** | **用户申请 + 管理员审批**：`PENDING → APPROVED` 后才分配 `repo_id`、创建 CAS 目录并置为 `ACTIVE`；未审批不可检出或提交 |
 | **用户字段** | **仅用户名、密码、姓名三项**；不收集邮箱、手机号等其它资料 |
 | **密码策略** | **≥ 8 位且同时含数字 / 大写 / 小写 / 特殊字符**；`vcs-core` 单一实现，服务端 `SetPassword` 强制校验，LDAP 账号豁免 |
@@ -709,7 +726,7 @@ CLI 先行、GUI 后置，目的是先用最低成本验证版本语义是否正
 
 | 决策 | 结论与理由 |
 | --- | --- |
-| 网络层单独成 `vcs-grpc` crate，不塞进 `vcs-server` | `vcs-server` 是业务库 + 运维 bin，`vcs-grpc` 是长期运行进程。若塞在一起，运维工具会拖上 tonic/tokio 全套依赖，而且 bin 与 lib 会互相反向依赖（同一 package 里 bin 无法依赖自己新加的 service 库）。 |
+| 网络层单独成 `vcs-grpc` crate，不塞进 `vcs-server` | 两者都保持为纯 lib：`vcs-server` 是业务库，`vcs-grpc` 是网络层。若塞在一起，业务库会拖上 tonic/tokio 全套依赖，而且 bin 与 lib 会互相反向依赖（同一 package 里 bin 无法依赖自己新加的 service 库）。后来合并单二进制时由 `vcs-cli` 同时链接二者：`vcs serve` 提供常驻入口，存储运维改为 `vcs server info`，依赖方向依然单向。 |
 | 业务错误放响应体，只有认证失败与未实现走 gRPC 状态码 | proto 每个响应都带 `Status`，客户端按 `ErrorCode` 分支即可。把 `QUOTA_EXCEEDED` 塞进 `tonic::Status` 会让客户端只能解析错误串，且丢了随状态返回的 `candidates`。 |
 | **错误码必须显式 match，不能 `code as i32`** | Rust 侧 `ErrorCode` 没有显式判别值、`Ok` 是 0，而 proto 的 0 是 `UNSPECIFIED`、`OK` 是 1。直接 `as i32` 会让 36 个错误码整体错一位——客户端把「配额超限」当「入参非法」。改成穷尽 match 后新增变体会编译失败，强制回来对齐。 |
 | `Arc<Mutex<ServerStore>>` 串行化，不用连接池 | `rusqlite::Connection` 是 `Send` 不是 `Sync`，而 tonic handler 要 `&self` 跨线程。SQLite 本来就单写入者，单机形态用一把锁最简单；换连接池 + `spawn_blocking` 是 M4 之后的并发优化。 |
@@ -717,7 +734,7 @@ CLI 先行、GUI 后置，目的是先用最低成本验证版本语义是否正
 | `match self.api.store().xxx()` 是自死锁陷阱 | 探针表达式里的临时 guard 会活到整个 match 结束，arm 里再锁一次就是不可重入锁自锁。写完 `add_member` 后网络测试直接挂住，改为「先收进变量再 match」。 |
 | `GetTree` 目前返回扁平全量 | proto 的 `Depth` 语义（立即子项 / 稀疏）需要客户端配合，M4 检出向导才真正用得上；现阶段把完整相对路径放进 `name` 字段，配合 `Checkout` 的对象流已够用，遇到非 `INFINITY` 直接返回 `INVALID_ARGUMENT` 而不是假装支持。 |
 | `Change` 的条目类型借 `props` 承载 | proto 的 `Change` 没有 entry_kind 字段（M0 定稿时只有普通文件）。符号链接必须原样带过去，否则提交后退化成普通文件；约定 `props == b"symlink"`，加字段属于破坏契约的改动，留到确有需要时再做。 |
-| 未实现的方法一律 `UNIMPLEMENTED` | `Lock`/`Unlock`、`RefreshToken`、`Logout`、LDAP 三项、`SetUserStatus`/`SetUserRole`、`SetRepoStatus`、`RemoveMember`/`SetMemberRole`、`SetRepoQuota` 都明确报错。宁可客户端收到「未实现」，也不能悄悄返回成功——那会让 GUI 以为操作生效了。 |
+| 未实现的方法一律 `UNIMPLEMENTED` | 当时 `Lock`/`Unlock`、`RefreshToken`、`Logout`、LDAP 三项、`SetUserStatus`/`SetUserRole`、`SetRepoStatus`、`RemoveMember`/`SetMemberRole`、`SetRepoQuota` 都明确报错；后续逐步补齐——**LDAP 三项已实现**，成员/配额/仓库状态方法也已落地（见 §21）。宁可客户端收到「未实现」，也不能悄悄返回成功——那会让 GUI 以为操作生效了。 |
 | `GetHead` / `GetRepo` 也走成员门 | 非成员连 head 与仓库名都不该知道。设计 8.9 的「ListRepos 不列出非成员仓库」是同一口径。 |
 
 ### M3 第三阶段：成员 / 配额 / 仓库状态的决策（2026-11-10）
@@ -742,7 +759,7 @@ CLI 先行、GUI 后置，目的是先用最低成本验证版本语义是否正
 | 主进程是唯一发起网络与文件操作的地方 | 渲染进程 `sandbox: true` + `contextIsolation: true` + CSP `script-src 'self'`，即使页面被注入脚本也拿不到 token 与磁盘。所有 IPC 返回统一 `Envelope<T>`，业务错误带 proto 的 `ErrorCode`，界面按码决定「提示」还是「让我重新登录」。 |
 | 客户端也做一次 out-of-date 检查 | 服务端会拦，但客户端先拦能给出可操作的提示（「请先更新再提交」）。这是 UX，不是安全边界——服务端严格校验一次都没省。 |
 | 提交前重读内容并校验哈希 | 扫描与推送之间用户可能又改了文件。`localChanges` 给出哈希后，提交前再读一次并比对，不一致直接拒绝重来，避免提交出「内容与地址不符」的对象。 |
-| 端到端冒烟而不是只 typecheck | `npm run typecheck` 只能证明类型对；gRPC 流式调用、proto-loader 的字段映射、路径处理只能真跑。冒烟脚本起真实 `vcs-grpc`、真实建库检出提交，并校验服务端对象内容与本地一致。 |
+| 端到端冒烟而不是只 typecheck | `npm run typecheck` 只能证明类型对；gRPC 流式调用、proto-loader 的字段映射、路径处理只能真跑。冒烟脚本起真实 `vcs serve`、真实建库检出提交，并校验服务端对象内容与本地一致。 |
 
 ### M4 第二步：napi 工作副本与更新闭环的决策（2026-11-10）
 
@@ -1034,7 +1051,7 @@ register（免登录，只收用户名/姓名/理由）
 
 ### 19.4 本阶段未覆盖
 
-- **LDAP 登录与组角色映射**（需要 mock 目录，单独一轮）；
+- **LDAP 登录与组角色映射**：当时列为「需要 mock 目录，单独一轮」；2026-11-12 已接入，见 §33（真机 mock 目录集成测试仍待补）；
 - **gRPC 服务层**：`ServerStore` 仍未挂 tonic，Electron 的 IPC 还是占位；审批台目前只有 CLI 形态；
 - **ACL（路径级权限）与锁**；
 - 注册防刷（IP / 用户名限流、验证码）；
@@ -1061,7 +1078,7 @@ register（免登录，只收用户名/姓名/理由）
 | `RepoService` | GetHead、GetRevision、GetTree、GetLog、Checkout（服务端流）、Update、FetchObjects（双向流）、BeginCommit、PushObjects（客户端流）、FinalizeCommit、AbortCommit、GetQuota、ListPurgeCandidates、EstimatePurge、Purge、GetGcStatus |
 | `RepoAdminService` | RequestRepo、GetRepoCreation、ListRepoCreations、ApproveRepoCreation、RejectRepoCreation、CreateRepoDirect、ListRepos、GetRepo、ListMembers、AddMember、SearchUsers、GetQuotaDefaults、UpdateQuotaDefaults、GetRepoQuota |
 
-明确返回 `UNIMPLEMENTED` 的：Lock/Unlock、RefreshToken、Logout、GetLdapConfig/UpdateLdapConfig/TestLdapConnection、SetUserStatus/SetUserRole。
+明确返回 `UNIMPLEMENTED` 的（当时清单，LDAP 三项的后续补齐见 §33）：Lock/Unlock、RefreshToken、Logout、GetLdapConfig/UpdateLdapConfig/TestLdapConnection、SetUserStatus/SetUserRole。
 
 （`SetRepoStatus` / `RemoveMember` / `SetMemberRole` / `SetRepoQuota` 已在 M3 第三阶段补齐，见 §21。）
 
@@ -1109,7 +1126,7 @@ register（免登录，只收用户名/姓名/理由）
 | 层 | 内容 |
 | --- | --- |
 | `ServerStore` | `remove_member`、`set_member_role`、`set_repo_quota`、`set_repo_status`、`head_info`、`username_by_id`、`abort_sessions_of` |
-| gRPC | `RemoveMember`、`SetMemberRole`、`SetRepoQuota`、`SetRepoStatus`（`UNIMPLEMENTED` 只剩 Lock/Unlock、RefreshToken、Logout、LDAP 三项、SetUserStatus/SetUserRole） |
+| gRPC | `RemoveMember`、`SetMemberRole`、`SetRepoQuota`、`SetRepoStatus`（当时 `UNIMPLEMENTED` 剩 Lock/Unlock、RefreshToken、Logout、LDAP 三项、SetUserStatus/SetUserRole；**LDAP 三项已于 2026-11-12 补齐，见 §33**） |
 | CLI | `repo-list`、`member-remove`、`member-set-role`、`repo-quota`、`repo-status` |
 
 ### 21.3 关键观测
@@ -1128,7 +1145,7 @@ register（免登录，只收用户名/姓名/理由）
 
 ### 21.4 剩余（M3 收尾项）
 
-- **LDAP 登录与组角色映射**（`AuthService` 三个 LDAP 方法仍是 `UNIMPLEMENTED`）；
+- ✅ **LDAP 登录与组角色映射**：2026-11-12 已接入（并同时实现首位用户引导），见 §33；
 - **ACL（路径级权限）与锁**（`Lock`/`Unlock` 仍是 `UNIMPLEMENTED`）；
 - `SetUserStatus` / `SetUserRole` / `RefreshToken` / `Logout`；
 - 注册防刷、审计查询接口（目前审计只写不读）。
@@ -1141,14 +1158,14 @@ register（免登录，只收用户名/姓名/理由）
 | --- | --- |
 | `cargo fmt` / `clippy -D warnings` / `cargo test --workspace` | 通过，**114 个测试全绿**（本轮未改 Rust 业务代码） |
 | `desktop`: `npm run typecheck` | 通过 |
-| `desktop`: `npm run smoke` | 通过（起真实 `vcs-grpc`，走真实 HTTP/2 与真实文件系统） |
+| `desktop`: `npm run smoke` | 通过（起真实 `vcs serve`，走真实 HTTP/2 与真实文件系统） |
 | 原生模块 | `cargo build -p vcs-napi` 零警告；`wc` 相关行为全部来自 `vcs-core`（114 个 Rust 测试覆盖） |
 | CI | `desktop` job：构建 Rust 二进制 → npm install → typecheck → 闭环冒烟（冒烟内含 `build:native`） |
 
 ### 22.2 冒烟覆盖的链路
 
 ```
-bootstrap 管理员（CLI 直连存储根）→ 启动 vcs-grpc（真实端口）
+bootstrap 管理员（CLI 直连存储根）→ 启动 vcs serve（真实端口）
 → 登录（JWT）→ 创建仓库（管理员直通）
 → 检出 r0（GetTree + Checkout 对象流 → napi 写 wc.db 与 pristine；校验归属）
 → 写入 202610/summary.txt → 状态 ADD → 离线 diff（+十月汇总 / +第二行）
@@ -1475,7 +1492,7 @@ svn-next.app/Contents/Resources/app/
 | 层 | 内容 |
 | --- | --- |
 | `vcs-server` | `run_maintenance`（转正到期清理 + 全库 GC）、`promote_pending_purges` 抽出、`set_repo_grace_days`、`purge` 改为按 `repos.grace_days` 计算宽限期 |
-| `vcs-grpc` | `ServeConfig.maintenance_interval_secs`，`--maintenance-interval`（默认 300 秒，0 关闭）；定时器在 `spawn_blocking` 里跑维护 |
+| `vcs-grpc` | `ServeConfig.maintenance_interval_secs`，由 `vcs serve --maintenance-interval` 传入（默认 300 秒，0 关闭）；定时器在 `spawn_blocking` 里跑维护 |
 | CLI | `vcs maintenance`：手工触发一次，输出转正条数 / 清扫对象数 / 释放字节 |
 | 桌面端 | 空间面板「配额…」弹窗：全局默认（仅管理员可改）+ 本仓库配额（覆盖 / 恢复继承），并显示生效值与来源 |
 
@@ -1583,3 +1600,112 @@ checkout → Rust 工具链 + 缓存 → Node 22 + npm 缓存
 - **架构取决于 runner**：`macos-latest` 目前是 arm64，因此 mac 产物是 arm64；要同时出 x64 需要加 `--x64` 并为原生模块交叉编译（`cargo build --target x86_64-apple-darwin`），本轮未做；
 - **无自动更新**：需要更新服务器与签名，属于交付阶段的事；
 - 工作流本身尚未在 GitHub 上跑过（本机无法执行 Actions），首次运行可能需要微调缓存路径或系统依赖。
+
+---
+
+## 33. 首位用户引导与 LDAP 接入（2026-11-12）
+
+### 33.1 需求与结论
+
+需求原话：**「第一个注册或者第一个使用 LDAP 登录的用户就自动成为管理员」**。本轮同时把 LDAP 登录从「协议已定义、实现 `UNIMPLEMENTED`」推到可用。
+
+- 两条入口共用 `ServerStore::first_user_slot()`：在 `BEGIN IMMEDIATE` 写事务里判定「用户表为空且没有引导审计记录」，谁先落库谁拿走唯一的管理员名额；跨 CLI / gRPC 进程互斥，删掉首用户也不会重发名额。
+- `init-admin` 从「部署前置条件」降级为可选预置 / 救援：只在没有**可登录**管理员时可用；首位注册者没设密码时可用同名 `init-admin` 重置口令，避免 token 丢失导致全库锁死。
+- 首位注册仍不收集密码：申请单直接 `approved`，一次性 token 随 `RegisterResponse` 返回本人；`SetPassword` 复核策略后才能登录。
+- 首位 LDAP 用户由 `login_ldap()` 直接建 `ACTIVE` + `admin` 映射并签发 JWT；之后 JIT 用户按 `ldap_group_roles` 取初始角色（未命中 `readonly`），**已有账号角色以本地为准**，防目录侧组调整把引导管理员降级。
+
+### 33.2 改动范围
+
+| 层 | 内容 |
+| --- | --- |
+| `vcs-core::auth` | `seal_secret` / `open_secret`：HMAC-SHA256 keystream + encrypt-then-MAC，加密 LDAP bind 密码（域分隔，密钥来自 `server.secret`） |
+| `vcs-server/src/ldap.rs`（新） | `ldap3 0.11`（sync + `tls-rustls`）：LDAPS / StartTLS、RFC 4515 转义、服务账号 bind → 搜索用户 → 二次 bind、组查询、连通性测试；默认校验证书，连接/操作各 5 秒超时 |
+| `vcs-server::ServerStore` | `register` 返回 `RegisterOutcome`（首位自动批准）；`login_ldap` JIT；LDAP 配置读写 / 组映射 / 权限；`bootstrap_admin` 救援；`first_user_slot` |
+| `vcs-grpc` | `Login` 的 LDAP 分支（`spawn_blocking` 做同步 bind）、`Get/Update/TestLdapConfig` 三个 RPC、`RegisterResponse` 新字段 |
+| `vcs-cli` | `register` 打印首位 token；`login --ldap`；`ldap-config` / `ldap-show` / `ldap-test` |
+| `desktop` | 顶栏身份来源下拉、首位注册自动填入设置密码框、管理员「目录设置」面板（配置 + 测试连接） |
+
+### 33.3 协议变更（只新增字段，编号不复用）
+
+| 消息 | 新增 |
+| --- | --- |
+| `RegisterResponse` | `password_setup_token=4`、`setup_token_expires_at=5`、`auto_approved=6`、`granted_role=7` |
+| `LdapConfig` | `group_roles=12`（新 `GroupRole{group_dn, role}`）；`tls_mode` 注释明确禁止明文 |
+| `GetLdapConfigResponse` | `bind_password_set=3` |
+
+`desktop/proto/repo.proto` 副本同步更新；`ErrorCode` 编号未动，契约测试保持全绿。
+
+### 33.4 安全边界
+
+- **抢注风险**：空库且开放注册时，最先到达的人拿走管理员。缓解：名额事务内只发一次 + 引导审计 + 抢先执行 `init-admin` 可关闭该入口；对公网暴露的场景应前置 TLS 网关并先预置管理员。
+- 目录不可用只返回 `LDAP_UNAVAILABLE`，本地账号不受影响；用户不存在与口令错误统一 `INVALID_CREDENTIALS`。
+- bind 密码明文既不落盘也不回传（`server.db` 二进制检索断言）；读取接口返回 `bind_password_set` 而非密码。
+- 目录配置 / 测试接口要求 `admin` + `admin` scope；CLI 本机运维通道（`actor=None`）与 `init-admin` 同级权限。
+
+### 33.5 验收与遗留
+
+| 检查项 | 结果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 通过（零警告） |
+| `cargo test --workspace` | 通过：新增首位注册 / LDAP 首用户 / 名额互斥 / 配置加密 / 组映射 / 权限 / gRPC 端到端首用户注册等用例 |
+| `desktop` 的 `npm run typecheck` | 通过 |
+| `desktop` 冒烟 | 增加断言：已有管理员时注册不自动批准、不返回 token |
+
+遗留：真机 / mock 目录的端到端 bind 测试、目录连接池、嵌套组解析、注册接口限流。当前 LDAP 测试用注入 `DirectoryUser` 覆盖业务层，目录协议层覆盖转义、URL 与配置校验。
+
+---
+
+## 34. M5：管理端 Web 化、桌面端职责收敛与菜单式布局（2026-11-12）
+
+### 34.1 诉求与边界判断
+
+用户要求：管理端单独做 Web 页面并集成进 `vcs`；桌面端只提供仓库使用功能；客户端界面没有菜单、布局混乱，需要优化。
+
+边界按「是否需要治理权限」切分，而不是按 proto 里的 service 名：
+
+| 移到 Web 管理端 | 留在桌面端 |
+| --- | --- |
+| 审批台（注册 / 建库）、LDAP 目录设置、管理员直通新建、全局与单仓库配额核定、成员增删与角色、空间治理（清理 / 回收站 / 保留策略 / GC）、全库用户与仓库视图 | 连接 / 断开、自助注册与设置密码、提交建库申请、仓库列表与选择、检出 / 状态 / diff / 冲突三栏 / 提交 / 更新 / 还原 / 历史、**只读**容量条 |
+
+桌面端原来的「成员」「空间」两个大面板占了渲染层近 500 行，且 `applyRole` 只隐藏管理员专属入口、对所有角色都展示了治理面板——这正是「混乱」的根源。剥离后 `applyRole` 不再需要，`guard()` 里误嵌入的重复 `bootstrap()`（每次点击按钮都会重跑会话恢复）也一并修掉。
+
+### 34.2 服务端：一个二进制同时跑 gRPC 与 HTTP
+
+| 位置 | 改动 |
+| --- | --- |
+| `crates/vcs-grpc/src/admin.rs`（新） | axum 0.7 路由 + 约 40 个 JSON 接口；`include_str!` 把 `admin_assets/{index.html,app.js,styles.css}` 编进二进制，无需静态文件服务器 |
+| `crates/vcs-grpc/src/lib.rs` | `ServeConfig.admin_listen: Option<SocketAddr>`；`serve()` 用 `tokio::select!` 同时驱动 gRPC 与 HTTP，任一退出即结束进程 |
+| `crates/vcs-cli/src/main.rs` | `--admin-listen`（默认 `127.0.0.1:8080` / `VCS_ADMIN_LISTEN`）与 `--no-admin`（`VCS_NO_ADMIN`） |
+| `crates/vcs-server/src/admin.rs`（新） | `AdminOverview` / `AdminUser` 与 `admin_overview` / `admin_list_users` / `admin_list_repos` / `admin_set_user_status` / `admin_set_user_role`；补上了原先 gRPC `SetUserStatus`/`SetUserRole` 未落地的业务方法 |
+
+关键决策：
+
+- **先绑定 HTTP 再拉起 gRPC**。管理端口被占用时立刻失败，避免「gRPC 就绪但管理页面没起来」的半残状态；冒烟脚本用 `--no-admin` 或随机端口，不抢固定 8080。
+- **不引入新的认证体系**。管理端登录复用 `ServerStore::login` / `login_ldap` 签发的同一份 JWT，请求头与 gRPC 一样是 `Authorization: Bearer`；每个 `/api/*` 都校验 token 且要求 `role == Admin`，非管理员登录直接拒绝。
+- **仓库级治理用 `Session::system()`**。成员门的设计是「全局 admin 也不能绕过」，但管理后台必须能治理任意仓库。做法是：中间件先完成管理员鉴权，再克隆会话、把 `kind` 标成 `System`（user_id 保留，审计仍是真人）。`ServerStore` 的成员管理三处与 `list_members` 增加 system 例外；桌面端 / gRPC 客户端拿不到 system 身份，成员门不变。
+- **状态 / 角色变更递增 `token_version`**，停用或降级的账号已签发 JWT 立即失效；禁止停用自己、禁止动最后一个可用管理员。
+- 存储调用一律走 `spawn_blocking` 并在闭包内取锁，避免阻塞 tokio worker；注意 `std::sync::Mutex` 不可重入，不在 `match` 表达式里直接持有 guard。
+
+### 34.3 桌面端：菜单式布局
+
+顶部连接条 + 左侧垂直菜单（**工作副本 / 仓库 / 账号**）+ 右侧单一内容视图，菜单切换只切 class、不发请求；未登录默认「账号」，登录 / 恢复会话后切「工作副本」，断开回「账号」。管理面板、配额弹窗、LDAP 表单、审批台全部删除；`main/index.ts` 与 `preload/index.ts` 的通道从 52 个精简到 23 个（同时清掉 preload 里重复的成员接口声明），`client.ts` 的方法全部保留——冒烟脚本直连它，不经过 IPC。
+
+`smoke-ui.cjs` 的 `domIds > 50` 阈值随页面瘦身调整为 `> 25`；`.brand` / `#target` / bootstrap 回填等断言保持原样。
+
+### 34.4 验收
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` | 通过 |
+| `cargo test --workspace` | 通过（含 `system_session_cannot_be_authenticated` 等既有权限用例） |
+| `npm run typecheck` / `npm run build` / `npm run smoke:ui` | 通过（UI 冒烟 `pass:true`，`apiKeys=23`） |
+| `npm run smoke` | 通过（提交 / 冲突 / 审批 / 成员 / 空间治理 / 配额全链路；脚本带 `--no-admin`） |
+| `npm run smoke:admin`（新，已接入 CI） | 通过：静态页、未登录拦截、错口令、管理员登录、全库视图、直通建库、任意仓库成员、配额覆盖、建号 / 停用、无效 token |
+
+### 34.5 遗留
+
+- 管理端是**明文 HTTP**，默认只绑本机；跨机必须 `--admin-listen 0.0.0.0:8080` 并前置 TLS 网关。
+- 登录令牌存浏览器 `localStorage`（请求走 `Authorization` 头而非 Cookie，因此没有 CSRF 面），但没有服务端会话撤销；停用账号靠 `token_version` 立即失效。
+- 用户列表 / 审批列表是单次上限查询（500 / 200 条），没有分页与搜索。
+- 管理端没有真实浏览器自动化用例，当前用 HTTP 层冒烟覆盖；`vcs serve` 的 `--admin-listen :0` 场景没有对外暴露实际绑定端口。

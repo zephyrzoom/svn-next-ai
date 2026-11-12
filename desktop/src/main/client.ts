@@ -61,6 +61,47 @@ export const ErrorCode = {
 
 export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode];
 
+/** 目录组 → 全局角色（role 与 proto 的 Role 一致：1 只读 / 2 可写 / 3 管理员）。 */
+export interface LdapGroupRoleDto {
+  groupDn: string;
+  role: number;
+}
+
+/** 目录服务配置。bind 密码不在这个结构里，写入时单独传、读取时不回传。 */
+export interface LdapConfigDto {
+  host: string;
+  port: number;
+  tlsMode: string;
+  baseDn: string;
+  bindDn: string;
+  userFilter: string;
+  groupFilter: string;
+  attrUsername: string;
+  attrDisplayName: string;
+  enabled: boolean;
+  groupRoles: LdapGroupRoleDto[];
+}
+
+/** proto-loader 对未设置的字段会给 undefined，这里统一补默认值给界面用。 */
+export function normalizeLdapConfig(raw: any): LdapConfigDto {
+  return {
+    host: raw?.host ?? '',
+    port: Number(raw?.port ?? 636),
+    tlsMode: raw?.tlsMode ?? 'ldaps',
+    baseDn: raw?.baseDn ?? '',
+    bindDn: raw?.bindDn ?? '',
+    userFilter: raw?.userFilter ?? '(uid={username})',
+    groupFilter: raw?.groupFilter ?? '',
+    attrUsername: raw?.attrUsername ?? 'uid',
+    attrDisplayName: raw?.attrDisplayName ?? 'cn',
+    enabled: Boolean(raw?.enabled),
+    groupRoles: (raw?.groupRoles ?? []).map((g: any) => ({
+      groupDn: String(g.groupDn ?? ''),
+      role: Number(g.role ?? 1),
+    })),
+  };
+}
+
 /** 服务端业务错误：`code` 是 proto 的 ErrorCode，客户端据此给不同提示。 */
 export class VcsError extends Error {
   constructor(
@@ -348,11 +389,16 @@ export class VcsClient {
     });
   }
 
-  async login(username: string, password: string): Promise<UserInfo> {
+  /** `source` 决定走本地口令还是目录 bind；默认是本地账号。 */
+  async login(
+    username: string,
+    password: string,
+    source: 'LOCAL' | 'LDAP' = 'LOCAL',
+  ): Promise<UserInfo> {
     const resp = await this.invoke<any>(this.auth, 'login', {
       username,
       password,
-      source: 1, // AUTH_SOURCE_LOCAL
+      source: source === 'LDAP' ? 2 : 1,
     });
     assertOk(resp.status);
     this.token = resp.accessToken as string;
@@ -668,19 +714,76 @@ export class VcsClient {
     }));
   }
 
-  /** 自助注册（免认证）。提交后账号处于 PENDING，不能登录。 */
+  /**
+   * 自助注册（免认证）。
+   *
+   * 空库第一个账号会被自动批准为管理员，`autoApproved` 为 true，
+   * `passwordSetupToken` 是**只返回这一次**的一次性设置密码凭证。
+   */
   async register(
     username: string,
     displayName: string,
     reason: string,
-  ): Promise<{ requestId: string; state: number }> {
+  ): Promise<{
+    requestId: string;
+    state: number;
+    autoApproved: boolean;
+    passwordSetupToken: string;
+    setupTokenExpiresAt: number;
+    grantedRole: number;
+  }> {
     const resp = await this.invoke<any>(this.auth, 'register', {
       username,
       displayName,
       reason,
     });
     assertOk(resp.status);
-    return { requestId: resp.requestId as string, state: resp.state as number };
+    return {
+      requestId: resp.requestId as string,
+      state: resp.state as number,
+      autoApproved: Boolean(resp.autoApproved),
+      passwordSetupToken: (resp.passwordSetupToken as string) ?? '',
+      setupTokenExpiresAt: Number(resp.setupTokenExpiresAt ?? 0),
+      grantedRole: Number(resp.grantedRole ?? 0),
+    };
+  }
+
+  /** 读取目录配置（不含明文 bind 密码）。仅管理员可调用。 */
+  async getLdapConfig(): Promise<{
+    config: LdapConfigDto;
+    bindPasswordSet: boolean;
+  }> {
+    const resp = await this.invoke<any>(this.auth, 'getLdapConfig', {});
+    assertOk(resp.status);
+    return {
+      config: normalizeLdapConfig(resp.config),
+      bindPasswordSet: Boolean(resp.bindPasswordSet),
+    };
+  }
+
+  /** 保存目录配置。`bindPassword` 留空表示沿用已保存的密码。 */
+  async updateLdapConfig(config: LdapConfigDto, bindPassword: string): Promise<void> {
+    const resp = await this.invoke<any>(this.auth, 'updateLdapConfig', {
+      config,
+      bindPassword,
+    });
+    assertOk(resp.status);
+  }
+
+  /** 连通性测试：服务账号 bind + 抽样搜索，不改动本地账号。 */
+  async testLdapConnection(
+    config: LdapConfigDto,
+    bindPassword: string,
+  ): Promise<{ boundDn: string; userCountSample: number }> {
+    const resp = await this.invoke<any>(this.auth, 'testLdapConnection', {
+      config,
+      bindPassword,
+    });
+    assertOk(resp.status);
+    return {
+      boundDn: (resp.boundDn as string) ?? '',
+      userCountSample: Number(resp.userCountSample ?? 0),
+    };
   }
 
   /** 用审批发放的一次性 token 设置初始密码（免认证）。 */

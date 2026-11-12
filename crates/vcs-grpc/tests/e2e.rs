@@ -32,6 +32,15 @@ struct Harness {
 
 impl Harness {
     async fn start(tag: &str) -> Self {
+        Self::start_inner(tag, true).await
+    }
+
+    /// 空库启动：用来验证「第一个注册 / 第一个 LDAP 登录自动成为管理员」的引导链路。
+    async fn start_empty(tag: &str) -> Self {
+        Self::start_inner(tag, false).await
+    }
+
+    async fn start_inner(tag: &str, with_admin: bool) -> Self {
         let root = std::env::temp_dir().join(format!(
             "vcs-grpc-{tag}-{}-{}",
             std::process::id(),
@@ -40,7 +49,9 @@ impl Harness {
         std::fs::create_dir_all(&root).unwrap();
         let store = ServerStore::open(root.join("store")).unwrap();
         // 服务端进程里通常由部署脚本做这一步；测试里直接建管理员。
-        store.bootstrap_admin("alice", "张爱丽", PASSWORD).unwrap();
+        if with_admin {
+            store.bootstrap_admin("alice", "张爱丽", PASSWORD).unwrap();
+        }
         let store: Store = Arc::new(Mutex::new(store));
         let (addr, shutdown, _handle) = serve_in_background(store).await.unwrap();
         Self {
@@ -856,4 +867,89 @@ async fn member_and_repo_admin_rpcs_work_over_the_wire() {
         .unwrap()
         .into_inner();
     assert_eq!(ok.status.unwrap().code, pb::ErrorCode::Ok as i32);
+}
+
+#[tokio::test]
+async fn first_registration_over_grpc_auto_approves_the_admin() {
+    let h = Harness::start_empty("first-user-grpc").await;
+
+    // 目录未配置：LDAP 登录必须明确报「不可用」，绝不退化成「校验通过」。
+    let unconfigured = h
+        .auth()
+        .await
+        .login(Request::new(pb::LoginRequest {
+            username: "alice".into(),
+            password: PASSWORD.into(),
+            source: pb::AuthSource::Ldap as i32,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        unconfigured.status.unwrap().code,
+        pb::ErrorCode::LdapUnavailable as i32
+    );
+    assert!(unconfigured.access_token.is_empty());
+
+    // 空库第一个注册：自动批准为 admin，token 直接回给本人。
+    let reg = h
+        .auth()
+        .await
+        .register(Request::new(pb::RegisterRequest {
+            username: "alice".into(),
+            display_name: "张爱丽".into(),
+            reason: "首位用户".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reg.status.unwrap().code, pb::ErrorCode::Ok as i32);
+    assert!(reg.auto_approved);
+    assert_eq!(reg.state, pb::RegistrationStatus::Approved as i32);
+    assert_eq!(reg.granted_role, pb::Role::Admin as i32);
+    assert!(reg.password_setup_token.starts_with("vcs_setup_"));
+    assert!(reg.setup_token_expires_at > 0);
+
+    let pw = h
+        .auth()
+        .await
+        .set_password(Request::new(pb::SetPasswordRequest {
+            setup_token: reg.password_setup_token.clone(),
+            new_password: PASSWORD.into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(pw.status.unwrap().code, pb::ErrorCode::Ok as i32);
+
+    let logged = h
+        .auth()
+        .await
+        .login(Request::new(pb::LoginRequest {
+            username: "alice".into(),
+            password: PASSWORD.into(),
+            source: pb::AuthSource::Local as i32,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(logged.status.unwrap().code, pb::ErrorCode::Ok as i32);
+    assert_eq!(logged.user.unwrap().role, pb::Role::Admin as i32);
+
+    // 第二个人仍是普通待审批申请，拿不到任何 token。
+    let second = h
+        .auth()
+        .await
+        .register(Request::new(pb::RegisterRequest {
+            username: "bob".into(),
+            display_name: "李波".into(),
+            reason: "申请".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second.status.unwrap().code, pb::ErrorCode::Ok as i32);
+    assert!(!second.auto_approved);
+    assert_eq!(second.state, pb::RegistrationStatus::Pending as i32);
+    assert!(second.password_setup_token.is_empty());
 }

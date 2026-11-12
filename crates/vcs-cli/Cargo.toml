@@ -4,9 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "svn-next CLI：M1 验证检出/提交/状态语义"
+description = "svn-next 唯一可执行文件：CLI 客户端 + serve 服务 + server 运维"
 
-# 命令行程序名固定为 vcs（文档与脚本都按这个名字写）
+# 全 workspace 只有这一个二进制，客户端与服务端能力都以子命令提供。
 [[bin]]
 name = "vcs"
 path = "src/main.rs"
@@ -14,7 +14,9 @@ path = "src/main.rs"
 [dependencies]
 vcs-core.workspace = true
 vcs-server.workspace = true
+vcs-grpc.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rpassword = "7"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }

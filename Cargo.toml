@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+# 六个 crate 里只有 vcs-cli 带二进制：唯一产物 `vcs`，服务端能力以 `vcs serve` / `vcs server info` 子命令提供。
 members = ["crates/vcs-core", "crates/vcs-proto", "crates/vcs-server", "crates/vcs-grpc", "crates/vcs-napi", "crates/vcs-cli"]
 
 [workspace.package]

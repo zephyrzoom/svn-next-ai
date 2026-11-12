@@ -66,9 +66,9 @@ jobs:
           BIN="$PWD/target/debug"
           STORE="$RUNNER_TEMP/grpc-store"
           mkdir -p "$STORE"
-          out=$(timeout 5 "$BIN/vcs-grpc" --root "$STORE" --listen 127.0.0.1:50077 2>&1 || true)
+          out=$(timeout 5 "$BIN/vcs" --store "$STORE" serve --listen 127.0.0.1:50077 --no-admin 2>&1 || true)
           echo "$out"
-          echo "$out" | grep -q "vcs-grpc 已启动"
+          echo "$out" | grep -q "vcs serve 已启动"
 
       - name: 端到端冒烟
         run: |
@@ -262,7 +262,7 @@ jobs:
           # 切成可执行 → 后台维护应真的按策略清理（系统身份，无需人工触发）
           policy_id=$("$BIN/vcs" retention-list --store "$DEMO/store" monthly | sed -n 's/^\(rt_[A-Za-z0-9]*\).*/\1/p' | head -1)
           "$BIN/vcs" retention-set --store "$DEMO/store" monthly --pattern '^20\d{4}$' --keep-months 2 --id "$policy_id" --execute
-          # 后台维护：保留策略 + 转正到期清理 + 全库 GC（vcs-grpc 的定时任务调的就是这个入口）
+          # 后台维护：保留策略 + 转正到期清理 + 全库 GC（vcs serve 的定时任务调的就是这个入口）
           out=$("$BIN/vcs" maintenance --store "$DEMO/store"); echo "$out"
           echo "$out" | grep -q "保留策略清理 1 个仓库"
           "$BIN/vcs" purged --store "$DEMO/store" monthly | grep -q "202609"
@@ -270,7 +270,7 @@ jobs:
           echo "CLI 冒烟通过"
 
   desktop:
-    # 类型检查之外，还要真跑一遍「单人提交闭环」：起真实的 vcs-grpc、真连网、真写文件。
+    # 类型检查之外，还要真跑一遍「单人提交闭环」：起真实的 vcs serve、真连网、真写文件。
     # 只 typecheck 无法证明 gRPC 流式调用与 proto-loader 的字段映射是对的。
     runs-on: ubuntu-latest
     env:
@@ -282,12 +282,21 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: 构建 Rust 二进制（冒烟要用 vcs 与 vcs-grpc）
-        run: cargo build -p vcs-cli -p vcs-grpc
+      - name: 构建 Rust 二进制（冒烟只用 vcs 一个）
+        run: cargo build -p vcs-cli
       - working-directory: desktop
         run: npm install --no-audit --no-fund
       - working-directory: desktop
         run: npm run typecheck
       - working-directory: desktop
+        # build 末尾自带 check-startup-assets.cjs：校验主进程 loadFile 的页面、
+        # preload、html 本地引用与源码一致性。CI 不启动 Electron（二进制被跳过），
+        # 这一层是拦住「构建成功但窗口白屏」的唯一防线。
+        name: 构建与启动契约检查
+        run: npm run build
+      - working-directory: desktop
         name: 单人提交闭环冒烟
         run: npm run smoke
+      - working-directory: desktop
+        name: 内置 Web 管理端冒烟
+        run: npm run smoke:admin
