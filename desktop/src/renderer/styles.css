@@ -57,8 +57,10 @@ body {
   width: 100%;
 }
 
+/* 右上角只显示姓名：不展示角色，也不展示免登录到期时间 */
 .who {
-  color: var(--muted);
+  color: var(--ink);
+  font-weight: 500;
   min-width: 0;
   max-width: 220px;
   overflow: hidden;

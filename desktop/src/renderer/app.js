@@ -33,7 +33,6 @@ const state = {
   /** 当前选中的账号类型 tab：LOCAL / LDAP，登录时按它选身份来源。 */
   source: 'LOCAL',
   authMode: 'login',
-  sessionExpiresAt: 0,
   canPersistToken: true,
 
   repos: [],
@@ -217,12 +216,6 @@ function setSource(source) {
   setAuthMode(state.source === 'LDAP' ? 'login' : state.authMode);
 }
 
-function formatDate(seconds) {
-  const date = new Date(seconds * 1000);
-  const pad = (value) => String(value).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-}
-
 /** 登录页里「登录 / 申请注册」两个表单的切换，纯界面操作。 */
 function setAuthMode(mode) {
   state.authMode = mode;
@@ -290,26 +283,19 @@ async function connect() {
 
 /** 登录成功与「用保存的凭证恢复」共用同一段收尾逻辑。 */
 async function applySession(session, { target = '', resumed = false } = {}) {
-  const { user, expiresAt } = session;
+  const { user } = session;
   state.user = user;
   const usedTarget = target || effectiveTarget();
   state.target = usedTarget;
-  state.sessionExpiresAt = Number(expiresAt || 0);
-  el('who').textContent = `${user.displayName || user.username} · ${roleLabel(user.role)}`;
-  el('session-hint').textContent = state.sessionExpiresAt > 0
-    ? `免登录至 ${formatDate(state.sessionExpiresAt)}`
-    : '本次会话';
+  // 右上角只这个人的姓名：角色与免登录到期都不在界面上出现。
+  el('who').textContent = user.displayName || user.username;
   showApp();
   // 工作副本目录属于「这台机器」的记忆，与账号无关：登录后一次性读回来。
   // 读不到（旧版客户端留下的设置、磁盘只读）不该挡住登录，只是这次要重新选目录。
   const dirs = await api.loadRepoDirs();
   state.wcDirs = dirs && dirs.ok && dirs.data ? dirs.data : {};
   await loadRepos();
-  banner(resumed ? `已用保存的凭证恢复会话：${user.username}` : '');
-}
-
-function roleLabel(role) {
-  return { 1: '只读', 2: '可写', 3: '管理员' }[role] || '未知角色';
+  banner(resumed ? `已用保存的凭证恢复会话：${user.displayName || user.username}` : '');
 }
 
 async function doRegister() {
@@ -814,9 +800,7 @@ async function disconnect() {
   state.changes = [];
   state.conflicts = [];
   state.diff = [];
-  state.sessionExpiresAt = 0;
   el('who').textContent = '';
-  el('session-hint').textContent = '';
   el('repo-nav').innerHTML = '';
   el('changes').innerHTML = '';
   el('log').innerHTML = '';
