@@ -200,7 +200,12 @@ jobs:
           fi
           req=$("$BIN/vcs" repo-request-list --store "$DEMO/store" --state pending | awk '/bob-repo/{print $1}')
           "$BIN/vcs" login --store "$DEMO/store" --username alice --password 'Abcdef1!'
-          "$BIN/vcs" repo-approve --store "$DEMO/store" "$req" --quota 1073741824 --note "同意"
+          approved=$("$BIN/vcs" repo-approve --store "$DEMO/store" "$req" --note "同意")
+          echo "$approved"
+          # 容量不由审批人填写：建库固定 10 GiB
+          if ! echo "$approved" | grep -q "10.0 GiB"; then
+            echo "建库容量不是固定 10 GiB：$approved"; exit 1
+          fi
           # 管理员使用他人仓库仍需成员资格
           if "$BIN/vcs" info --store "$DEMO/store" bob-repo; then
             echo "非成员竟然能读取仓库"; exit 1
@@ -235,8 +240,15 @@ jobs:
           "$BIN/vcs" member-remove --store "$DEMO/store" bob-repo --username alice \
             | grep -q "已把 alice 移出"
 
-          # 管理员核定 1 MiB 上限，再恢复继承
+          # 扩容：成员申请固定 +10 GiB（不填容量），管理员按磁盘余量审批
+          "$BIN/vcs" repo-expand --store "$DEMO/store" bob-repo --reason "素材变多" \
+            | grep -q "10.0 GiB → 20.0 GiB"
+          expand=$("$BIN/vcs" repo-expand-list --store "$DEMO/store" --state pending | awk '/bob-repo/{print $1}')
           "$BIN/vcs" login --store "$DEMO/store" --username alice --password 'Abcdef1!'
+          "$BIN/vcs" repo-expand-approve --store "$DEMO/store" "$expand" --note "同意" \
+            | grep -q "20.0 GiB"
+
+          # 管理员核定 1 MiB 上限，再恢复继承
           "$BIN/vcs" repo-quota --store "$DEMO/store" bob-repo --quota 1048576 | grep -q "单仓库覆盖"
           "$BIN/vcs" repo-quota --store "$DEMO/store" bob-repo --inherit | grep -q "系统兜底"
 
