@@ -126,20 +126,10 @@ function effectiveTarget() {
   return state.target || state.defaultTarget || FALLBACK_TARGET;
 }
 
-function isCustomTarget() {
-  return Boolean(state.target && state.target !== state.defaultTarget);
-}
-
-function renderTarget() {
-  el('current-target').textContent =
-    `${effectiveTarget()}${isCustomTarget() ? '（自定义）' : '（默认）'}`;
-}
-
-/** 「设置」面板：只在用户点开时暴露地址，默认地址来自打包配置。 */
+/** 齿轮面板：界面上不展示地址，默认地址来自打包配置，用户可在此覆盖。 */
 function openSettings() {
   el('server-target').value = effectiveTarget();
-  el('target-note').textContent =
-    `默认地址：${state.defaultTarget}（打包时由 build-config.json 配置）`;
+  el('target-note').textContent = `默认地址：${state.defaultTarget}（保存即覆盖）`;
   el('server-settings').classList.remove('hidden');
   authMessage('');
   el('server-target').focus();
@@ -162,16 +152,14 @@ async function saveTargetSetting() {
     state.target = override;
   }
   closeSettings();
-  renderTarget();
-  authMessage(override ? `服务器地址已改为 ${value}。` : '已恢复为打包默认地址。');
+  authMessage(override ? '服务器地址已保存，登录时使用该地址。' : '已恢复为打包默认地址。');
 }
 
 async function resetTargetSetting() {
   if (state.target) unwrap(await api.setTarget(''), '恢复默认服务器地址');
   state.target = '';
   closeSettings();
-  renderTarget();
-  authMessage(`已恢复默认服务器地址 ${state.defaultTarget}。`);
+  authMessage('已恢复为打包默认地址。');
 }
 
 /** 账号类型 tab：切到哪个就按哪种身份登录；LDAP 不需要注册。 */
@@ -230,7 +218,6 @@ function showLogin(message = '') {
   el('auth-screen').classList.remove('hidden');
   clearBanner();
   closeSettings();
-  renderTarget();
   setAuthMode('login');
   el('password').value = '';
   if (message) authMessage(message);
@@ -271,10 +258,8 @@ async function applySession(session, { target = '', resumed = false } = {}) {
   state.target = usedTarget;
   state.sessionExpiresAt = Number(expiresAt || 0);
   el('who').textContent = `${user.displayName || user.username} · ${roleLabel(user.role)}`;
-  el('server-label').textContent = usedTarget;
   el('account-name').textContent = `${user.displayName || user.username}（${user.username}）`;
   el('account-role').textContent = roleLabel(user.role);
-  el('account-target').textContent = usedTarget;
   el('session-until').textContent = sessionText(state.sessionExpiresAt);
   el('session-hint').textContent = state.sessionExpiresAt > 0
     ? `免登录至 ${formatDate(state.sessionExpiresAt)}`
@@ -713,7 +698,6 @@ async function bootstrap() {
         '当前系统不支持加密存储凭证，重启后需要重新登录（连接信息仍会保留）。';
     }
   }
-  renderTarget();
   setSource('LOCAL');
   const resumed = await api.tryResume(effectiveTarget());
   if (resumed.ok && resumed.data) {

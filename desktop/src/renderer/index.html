@@ -15,14 +15,27 @@
       <div class="auth-card">
         <div class="auth-head">
           <div class="brand">svn-next</div>
-          <button id="open-settings" class="link" type="button" title="修改服务器地址">设置</button>
+          <!-- 服务器地址不在界面上展示，只在这个齿轮面板里可见、可改 -->
+          <button
+            id="open-settings"
+            class="icon-button"
+            type="button"
+            title="服务器设置"
+            aria-label="服务器设置"
+          >
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false">
+              <path
+                fill="currentColor"
+                d="M19.14 12.94a7.07 7.07 0 0 0 0-1.88l2.03-1.58a.5.5 0 0 0 .12-.62l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.1 7.1 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54c-.58.24-1.12.55-1.62.94l-2.39-.96a.5.5 0 0 0-.6.22L2.67 8.86a.5.5 0 0 0 .12.62l2.03 1.58a7.07 7.07 0 0 0 0 1.88l-2.03 1.58a.5.5 0 0 0-.12.62l1.92 3.32c.13.22.39.31.6.22l2.39-.96c.5.39 1.04.7 1.62.94l.36 2.54c.04.24.25.42.5.42h3.84c.25 0 .46-.18.5-.42l.36-2.54c.58-.24 1.12-.55 1.62-.94l2.39.96c.21.09.47 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.62l-2.03-1.58ZM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2Z"
+              />
+            </svg>
+          </button>
         </div>
         <h1 id="auth-title">登录</h1>
         <p id="auth-sub" class="view-sub">选择账号类型并登录。</p>
-        <p class="auth-server">服务器：<span id="current-target">—</span></p>
         <div id="auth-message" class="auth-message hidden"></div>
 
-        <!-- 服务器地址默认由打包配置注入，这里只在用户点「设置」时暴露 -->
+        <!-- 服务器地址默认由打包配置注入，只在用户点齿轮时暴露 -->
         <div id="server-settings" class="server-settings hidden">
           <label>服务器地址<input id="server-target" placeholder="host:port，不带 http://" spellcheck="false" /></label>
           <p class="hint" id="target-note"></p>
@@ -65,7 +78,6 @@
     <div id="app-shell" class="app-shell hidden">
       <header class="topbar">
         <div class="brand">svn-next</div>
-        <span id="server-label" class="muted"></span>
         <div class="conn">
           <span id="session-hint" class="who"></span>
           <span id="who" class="who"></span>
@@ -209,7 +221,6 @@
               <div class="card-head"><h2>当前账号</h2></div>
               <ul class="notes">
                 <li>用户：<span id="account-name" class="em">—</span>（角色 <span id="account-role">—</span>）</li>
-                <li>服务端：<span id="account-target">—</span></li>
                 <li>会话：<span id="session-until">—</span></li>
               </ul>
               <button id="account-disconnect" class="ghost">退出登录</button>
