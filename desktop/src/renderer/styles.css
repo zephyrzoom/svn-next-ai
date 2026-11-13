@@ -596,6 +596,49 @@ button.ghost {
   min-width: 0;
 }
 
+/* 同一个仓库检出多份时才出现的切换器：不让它把上下文条撑破，完整路径在选项 title 里 */
+.wc-dir-select {
+  flex: 0 1 180px;
+  max-width: 180px;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* 检出卡片里的「已检出的目录」清单：长路径换行，操作按钮不参与挤压 */
+.wc-dir-list {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.wc-dir-list .list {
+  max-height: 180px;
+}
+
+.wc-dir-list li {
+  align-items: center;
+  cursor: default;
+}
+
+.wc-dir-list li .dir-path {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.wc-dir-list li .dir-current {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--accent);
+}
+
+.wc-dir-list li button {
+  flex: 0 0 auto;
+}
+
 .wc-bar #wc-status {
   flex: 0 0 auto;
 }

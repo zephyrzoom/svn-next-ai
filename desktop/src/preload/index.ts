@@ -173,9 +173,9 @@ export interface VcsApi {
   pickDir(): Promise<Envelope<string | null>>;
   /** 目录是哪个仓库的工作副本；不是工作副本（还没有 wc.db）时返回 null。 */
   wcInfo(dir: string): Promise<Envelope<WorkingCopyInfoDto | null>>;
-  /** 仓库 → 本地工作副本目录的绑定（存在 userData/settings.json）。 */
-  loadRepoDirs(): Promise<Envelope<Record<string, string>>>;
-  saveRepoDirs(dirs: Record<string, string>): Promise<Envelope<null>>;
+  /** 仓库 → 该仓库的全部工作副本目录（首个为最近使用的一份）。 */
+  loadRepoDirs(): Promise<Envelope<Record<string, string[]>>>;
+  saveRepoDirs(dirs: Record<string, string[]>): Promise<Envelope<null>>;
   checkout(
     repoId: string,
     dir: string,

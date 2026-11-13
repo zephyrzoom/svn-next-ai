@@ -1,4 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain } from 'electron';
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import { VcsError, VcsClient, type UserInfo } from './client';
@@ -223,9 +224,13 @@ ipcMain.handle('vcs:pickDir', () =>
 /**
  * 目录属于哪个仓库。**不是工作副本时返回 null**，让界面能平静地引导「检出到这里」，
  * 而不是先弹一条「wc.db 不存在」的错误。
+ *
+ * 必须只读：原生 `wc.info` 遇到没有 wc.db 的目录会 create 一份空工作副本，
+ * 而「换目录 / 再检出一份」只是探测，不该在用户刚选的目录里凭空写 `.vcs/`。
  */
 ipcMain.handle('vcs:wcInfo', (_event, dir: string) =>
   wrap(async () => {
+    if (!fs.existsSync(path.join(dir, '.vcs', 'wc.db'))) return null;
     try {
       return wc.openInfo(dir);
     } catch {
@@ -234,10 +239,10 @@ ipcMain.handle('vcs:wcInfo', (_event, dir: string) =>
   }),
 );
 
-/** 仓库 → 本地工作副本目录的绑定，重启后仍能对上「哪个仓库在本地有目录」。 */
+/** 仓库 → 该仓库的全部工作副本目录，重启后仍能对上「哪个仓库在本地有几份」。 */
 ipcMain.handle('vcs:repoDirs', () => wrap(async () => loadRepoDirs()));
 
-ipcMain.handle('vcs:saveRepoDirs', (_event, dirs: Record<string, string>) =>
+ipcMain.handle('vcs:saveRepoDirs', (_event, dirs: Record<string, string[]>) =>
   wrap<null>(async () => {
     saveRepoDirs(dirs);
     return null;

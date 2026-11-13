@@ -94,10 +94,20 @@ function verify({ app, BrowserWindow, ipcMain }) {
   }
   // 地址不再显示在界面上，只能靠 IPC 记录证明「保存 / 恢复默认」真的落到了主进程。
   const setTargetCalls = [];
+  // 多份工作副本的回归会真的走一遍「切换 / 移出」，那两条路径会扫描工作副本：
+  // 给 status / diff 塞合法数据，免得断言被 null 数据带偏。
+  const stubData = {
+    'vcs:loadPrefs': PREFS,
+    'vcs:status': { repoId: 'r1', rev: 2, entries: [], conflicts: [] },
+    'vcs:diff': [],
+  };
   for (const channel of channels) {
     ipcMain.handle(channel, async (_event, ...args) => {
       if (channel === 'vcs:setTarget') setTargetCalls.push(args[0]);
-      return { ok: true, data: channel === 'vcs:loadPrefs' ? PREFS : null };
+      const data = Object.prototype.hasOwnProperty.call(stubData, channel)
+        ? stubData[channel]
+        : null;
+      return { ok: true, data };
     });
   }
   // 免登录改成默认行为后，界面上已经没有开关可查：直接钉住主进程契约，
@@ -438,6 +448,80 @@ function verify({ app, BrowserWindow, ipcMain }) {
         problems.push(`提交防重求值失败：${err && err.message}`);
       }
 
+      // 一个仓库检出多份：已检出后仍要有「再检出一份」的入口，能切换、能移出列表。
+      // 原来的 bug 是检出后卡片被永久藏起来，输入框被预填成当前目录，再也点不到「检出」。
+      let multiWc = {};
+      try {
+        multiWc = await win.webContents.executeJavaScript(`(async () => {
+          const shell = document.getElementById('view-repo');
+          shell.classList.remove('hidden');
+          const saved = {
+            repos: state.repos, selected: state.selectedRepoId, dirs: state.wcDirs,
+            wcDir: state.wcDir, checkoutOpen: state.checkoutOpen, tab: state.tab,
+          };
+          state.repos = [{ repoId: 'r1', name: '仓库一', headRev: 3 }];
+          state.selectedRepoId = 'r1';
+          state.wcDirs = { r1: ['/tmp/wc-a', '/tmp/wc-b'], r2: ['/tmp/wc-c'] };
+          state.wcDir = '/tmp/wc-a';
+          state.checkoutOpen = false;
+          renderRepoNav();
+          renderWcBar();
+          const select = document.getElementById('wc-dir-select');
+          const card = document.getElementById('checkout-card');
+          const options = () => Array.from(select.options).map((o) => o.value);
+          const before = {
+            cardHidden: card.classList.contains('hidden'),
+            workbenchVisible: !document.getElementById('workbench').classList.contains('hidden'),
+            options: options(),
+            selectVisible: !select.classList.contains('hidden'),
+            addEnabled: !document.getElementById('open-checkout').disabled,
+            navDot: document.querySelector('.repo-dot').classList.contains('on'),
+            listed: document.querySelectorAll('#wc-dir-items li').length,
+          };
+          document.getElementById('open-checkout').click();
+          const opened = !card.classList.contains('hidden') &&
+            document.getElementById('dir').value === '' &&
+            document.getElementById('checkout-title').textContent === '再检出一份';
+          // 再登记一份；这个目录原本挂在 r2 名下，必须从 r2 摘掉（一个目录只属于一个仓库）。
+          await bindWorkingCopy('r1', '/tmp/wc-c');
+          const bound = {
+            r1: (state.wcDirs.r1 || []).slice(),
+            r2: (state.wcDirs.r2 || []).slice(),
+            active: state.wcDir,
+            cardHidden: card.classList.contains('hidden'),
+            options: options(),
+          };
+          await switchWorkingCopy('/tmp/wc-b');
+          const switched = {
+            active: state.wcDir,
+            first: (state.wcDirs.r1 || [])[0],
+            selectValue: select.value,
+          };
+          await removeWorkingCopy('/tmp/wc-b');
+          const removed = {
+            active: state.wcDir,
+            r1: (state.wcDirs.r1 || []).slice(),
+            cardHidden: card.classList.contains('hidden'),
+          };
+          for (const dir of (state.wcDirs.r1 || []).slice()) await removeWorkingCopy(dir);
+          const emptied = {
+            active: state.wcDir,
+            cardHidden: card.classList.contains('hidden'),
+            workbenchHidden: document.getElementById('workbench').classList.contains('hidden'),
+          };
+          state.repos = saved.repos;
+          state.selectedRepoId = saved.selected;
+          state.wcDirs = saved.dirs;
+          state.wcDir = saved.wcDir;
+          state.checkoutOpen = saved.checkoutOpen;
+          state.tab = saved.tab;
+          shell.classList.add('hidden');
+          return { before, opened, bound, switched, removed, emptied };
+        })()`);
+      } catch (err) {
+        problems.push(`多份工作副本求值失败：${err && err.message}`);
+      }
+
       const checks = {
         页面标题: info.title === 'svn-next',
         // 桌面端剥离管理 UI 后 id 数下降，阈值按「仓库使用」客户端的实际结构设定。
@@ -520,6 +604,32 @@ function verify({ app, BrowserWindow, ipcMain }) {
           commitGuard.after.disabled === false &&
           commitGuard.after.label === '提交',
         提交进行中不会重复进入: commitGuard.blocked === true,
+        // 检出过一份之后，还得能再检出一份：卡片入口、切换下拉、目录清单都得在。
+        已检出后仍可再检出一份:
+          multiWc.before?.cardHidden === true &&
+          multiWc.before?.workbenchVisible === true &&
+          multiWc.before?.addEnabled === true &&
+          multiWc.before?.navDot === true &&
+          multiWc.before?.listed === 2 &&
+          multiWc.opened === true,
+        多份工作副本可切换且记住顺序:
+          multiWc.before?.options?.join(',') === '/tmp/wc-a,/tmp/wc-b' &&
+          multiWc.before?.selectVisible === true &&
+          multiWc.bound?.r1?.join(',') === '/tmp/wc-c,/tmp/wc-a,/tmp/wc-b' &&
+          multiWc.bound?.r2?.length === 0 &&
+          multiWc.bound?.active === '/tmp/wc-c' &&
+          multiWc.bound?.cardHidden === true &&
+          multiWc.bound?.options?.length === 3 &&
+          multiWc.switched?.active === '/tmp/wc-b' &&
+          multiWc.switched?.first === '/tmp/wc-b' &&
+          multiWc.switched?.selectValue === '/tmp/wc-b',
+        移出列表不删文件且能回到检出引导:
+          multiWc.removed?.r1?.join(',') === '/tmp/wc-c,/tmp/wc-a' &&
+          multiWc.removed?.active === '/tmp/wc-c' &&
+          multiWc.removed?.cardHidden === true &&
+          multiWc.emptied?.active === '' &&
+          multiWc.emptied?.cardHidden === false &&
+          multiWc.emptied?.workbenchHidden === true,
       };
       for (const [name, ok] of Object.entries(checks)) {
         if (!ok) problems.push(`断言失败：${name}`);
@@ -533,6 +643,7 @@ function verify({ app, BrowserWindow, ipcMain }) {
         diffHead,
         picker,
         commitGuard,
+        multiWc,
       });
     })
     .catch((err) => finish({ pass: false, fatal: `whenReady 失败：${err && err.message}` }));

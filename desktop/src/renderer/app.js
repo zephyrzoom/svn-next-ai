@@ -16,6 +16,8 @@
  * 把它和仓库并列成两个菜单会让人在两个视图之间丢失「我在哪个仓库」的坐标。
  * 目录与仓库对不上时（拷贝过来的工作副本、换了账号），以目录里 wc.db 记录的 repoId
  * 为准自动切换，宁可变上下文，也不在 A 仓库的界面上改 B 仓库的文件。
+ * 一个仓库允许检出到多个目录、保留多份工作副本，彼此的本地改动互不影响；上下文条
+ * 上的下拉用来切换当前操作的那一份，「检出到新目录」随时可以再铺一份。
  *
  * 治理类的审批（用户与注册、仓库创建、扩容配额、空间治理、目录配置）由服务端
  * Web 管理端承载，桌面端只保留登录、账号自助、仓库使用与工作副本这条主线。
@@ -40,10 +42,12 @@ const state = {
 
   repos: [],
   selectedRepoId: null,
-  /** 仓库 → 本地工作副本目录的绑定，持久化在 userData/settings.json。 */
+  /** 仓库 → 该仓库在本机的所有工作副本目录（首个为最近使用的一份），持久化在 settings.json。 */
   wcDirs: {},
-  /** 当前选中仓库绑定的目录；空串表示这个仓库还没有本地工作副本。 */
+  /** 当前仓库正在操作的那一份工作副本目录；空串表示还没有本地工作副本。 */
   wcDir: '',
+  /** 「检出到本地」卡片是否展开：已有工作副本时由「检出到新目录」按钮临时打开。 */
+  checkoutOpen: false,
   wcRev: 0,
   changes: [],
   conflicts: [],
@@ -317,6 +321,7 @@ async function applySession(session, { target = '', resumed = false } = {}) {
   // 读不到（旧版客户端留下的设置、磁盘只读）不该挡住登录，只是这次要重新选目录。
   const dirs = await api.loadRepoDirs();
   state.wcDirs = dirs && dirs.ok && dirs.data ? dirs.data : {};
+  state.checkoutOpen = false;
   await loadRepos();
   banner(resumed ? `已用保存的凭证恢复会话：${user.displayName || user.username}` : '');
 }
@@ -386,15 +391,17 @@ function renderRepoNav() {
   }
   for (const repo of state.repos) {
     const li = document.createElement('li');
-    const dir = state.wcDirs[repo.repoId];
+    const dirs = dirsFor(repo.repoId);
     li.className = `repo-item${repo.repoId === state.selectedRepoId ? ' active' : ''}`;
-    li.title = dir ? `${repo.name}\n本地工作副本：${dir}` : repo.name;
+    li.title = dirs.length
+      ? `${repo.name}\n本地工作副本（${dirs.length} 份）：\n${dirs.join('\n')}`
+      : repo.name;
     li.innerHTML =
       '<span class="repo-name"></span>' +
       '<span class="repo-dot"></span>' +
       '<span class="repo-rev"></span>';
     li.querySelector('.repo-name').textContent = repo.name;
-    li.querySelector('.repo-dot').classList.toggle('on', Boolean(dir));
+    li.querySelector('.repo-dot').classList.toggle('on', dirs.length > 0);
     li.querySelector('.repo-rev').textContent = `r${repo.headRev}`;
     li.addEventListener('click', () => {
       // 已经选中的仓库再点一次 = 「回到这个仓库的工作区」（比如刚从建库申请页回来）。
@@ -414,13 +421,17 @@ function renderRepoNav() {
  */
 async function selectRepo(repoId) {
   state.selectedRepoId = repoId;
-  state.wcDir = state.wcDirs[repoId] || '';
+  // 每个仓库记住一串目录，第一个是上次用的那份；没检出过就回到检出引导。
+  state.wcDir = dirsFor(repoId)[0] || '';
+  state.checkoutOpen = !state.wcDir;
   state.wcRev = 0;
   state.changes = [];
   state.conflicts = [];
   state.diff = [];
   state.conflict = null;
-  el('dir').value = state.wcDir;
+  // 输入框只用于「再检出一份」的新目录，绝不预填现有工作副本路径：
+  // 预填后误点检出会把那一份的本地改动整盘覆盖掉。
+  el('dir').value = '';
   el('changes').innerHTML = '';
   el('log').innerHTML = '';
   el('members').innerHTML = '';
@@ -468,8 +479,91 @@ function renderMemberAccess() {
   if (!owner && state.tab === 'members') setTab('wc');
 }
 
+/** 取某仓库记住的所有工作副本目录；兼容旧设置里残留的单个字符串。 */
+function dirsFor(repoId) {
+  if (!repoId) return [];
+  const value = state.wcDirs[repoId];
+  if (Array.isArray(value)) return value.filter((dir) => typeof dir === 'string' && dir.trim());
+  return typeof value === 'string' && value.trim() ? [value] : [];
+}
+
+/** 清空与「当前这份工作副本」有关的视图状态，切换目录时不串上一份的变更 / 差异。 */
+function resetWorkingCopyState() {
+  state.wcRev = 0;
+  state.changes = [];
+  state.conflicts = [];
+  state.diff = [];
+  state.conflict = null;
+  el('changes').innerHTML = '';
+  el('diff-path').textContent = '';
+  el('diff-path').title = '';
+  el('diff').textContent = '点击上方变更查看差异';
+  closeConflict();
+  setDiffOpen(false);
+}
+
+/** 上下文条里的切换器：多份工作副本时才出现，选项文本是完整路径。 */
+function renderWcDirOptions() {
+  const select = el('wc-dir-select');
+  const dirs = dirsFor(state.selectedRepoId);
+  select.innerHTML = '';
+  for (const dir of dirs) {
+    const option = document.createElement('option');
+    option.value = dir;
+    option.textContent = dir;
+    option.title = dir;
+    select.appendChild(option);
+  }
+  select.value = state.wcDir || '';
+  select.classList.toggle('hidden', dirs.length < 2);
+}
+
+/** 检出卡片里的目录清单：切换 / 移出列表，两者都不动本地文件。 */
+function renderWcDirList() {
+  const box = el('wc-dir-list');
+  const list = el('wc-dir-items');
+  const dirs = dirsFor(state.selectedRepoId);
+  list.innerHTML = '';
+  for (const dir of dirs) {
+    const li = document.createElement('li');
+    if (dir === state.wcDir) li.classList.add('active');
+    const name = document.createElement('span');
+    name.className = 'dir-path';
+    name.textContent = dir;
+    name.title = dir;
+    li.appendChild(name);
+    if (dir === state.wcDir) {
+      const current = document.createElement('span');
+      current.className = 'dir-current';
+      current.textContent = '当前';
+      li.appendChild(current);
+    } else {
+      const use = document.createElement('button');
+      use.className = 'ghost';
+      use.type = 'button';
+      use.textContent = '切换';
+      use.addEventListener('click', () =>
+        void guard('切换工作副本', () => switchWorkingCopy(dir)),
+      );
+      li.appendChild(use);
+    }
+    const remove = document.createElement('button');
+    remove.className = 'ghost';
+    remove.type = 'button';
+    remove.textContent = '移出列表';
+    remove.addEventListener('click', () =>
+      void guard('移出工作副本', () => removeWorkingCopy(dir)),
+    );
+    li.appendChild(remove);
+    list.appendChild(li);
+  }
+  box.classList.toggle('hidden', dirs.length === 0);
+}
+
 function renderWcBar() {
   const dir = state.wcDir;
+  const dirs = dirsFor(state.selectedRepoId);
+  const hasRepo = Boolean(currentRepo());
   el('wc-path').textContent = dir || '未检出到本地';
   el('wc-path').title = dir;
   el('wc-dot').className = `wc-dot${dir ? ' on' : ''}`;
@@ -480,32 +574,119 @@ function renderWcBar() {
       ? `${conflicts} 个冲突待解决`
       : `${state.changes.length} 个待提交变更 @ r${state.wcRev}`;
   el('wc-status').classList.toggle('warn', conflicts > 0);
-  for (const id of ['pick-dir', 'refresh-status', 'update']) {
+  // 已有工作副本照样能再检出一份；「更换目录」用来绑定拷贝过来的目录，随时可用。
+  el('open-checkout').disabled = !hasRepo;
+  el('pick-dir').disabled = !hasRepo;
+  for (const id of ['refresh-status', 'update']) {
     el(id).disabled = !dir;
   }
   el('commit').disabled = !dir || state.committing;
-  el('checkout-card').classList.toggle('hidden', Boolean(dir));
+  el('checkout-card').classList.toggle('hidden', Boolean(dir) && !state.checkoutOpen);
   el('workbench').classList.toggle('hidden', !dir);
   el('wc-change-count').textContent = dir ? `${state.changes.length} 项` : '';
+  el('checkout-title').textContent = dir ? '再检出一份' : '检出到本地';
+  el('checkout-note').textContent = dir
+    ? `这个仓库已有 ${dirs.length} 份本地工作副本`
+    : '这个仓库还没有本地工作副本';
+  el('checkout-hint').textContent = dir
+    ? '填一个不同的目录再点「检出」：新铺一份，已有的工作副本与本地改动都不受影响。'
+    : '变更、提交、更新都只作用于检出到的那个目录；路径按仓库记住，下次打开会自动带上。';
+  el('cancel-checkout').classList.toggle('hidden', !dir);
+  renderWcDirOptions();
+  renderWcDirList();
 }
 
 // ---------------- 检出、扫描与更新 ----------------
 
-/** 把目录与仓库绑定起来：一个目录只属于一个仓库，顺手清掉指向同一目录的旧绑定。 */
-async function bindWorkingCopy(repoId, dir) {
-  for (const [id, value] of Object.entries(state.wcDirs)) {
-    if (value === dir && id !== repoId) delete state.wcDirs[id];
+/** 把当前绑定关系落盘；失败不拦流程，只是下次打开要重新选目录。 */
+async function saveWorkingCopies() {
+  const clean = {};
+  for (const repoId of Object.keys(state.wcDirs)) {
+    const list = [...new Set(dirsFor(repoId))];
+    if (list.length) clean[repoId] = list;
   }
-  state.wcDirs[repoId] = dir;
-  if (state.selectedRepoId === repoId) state.wcDir = dir;
-  el('dir').value = dir;
-  renderRepoNav();
-  renderWcBar();
-  // 落盘失败不影响这次使用，只是下次要重新选目录——提示一句，不要拦流程。
-  const saved = await api.saveRepoDirs(state.wcDirs);
+  state.wcDirs = clean;
+  const saved = await api.saveRepoDirs(clean);
   if (!saved || !saved.ok) {
     banner('工作副本路径没能保存到本机设置，下次打开需要重新选择目录。', 'error');
   }
+}
+
+/**
+ * 把目录登记到某个仓库名下，并设为这个仓库最近使用的一份（列表首项）。
+ * 一个目录只属于一个仓库：绑定时顺手把它从其它仓库的列表里摘掉——wc.db 里的
+ * repoId 才是权威，界面上留两份归属只会让人在 A 仓库里改到 B 仓库的文件。
+ */
+async function bindWorkingCopy(repoId, dir) {
+  const next = {};
+  for (const [id, value] of Object.entries(state.wcDirs)) {
+    const list = (Array.isArray(value) ? value : value ? [value] : []).filter(
+      (item) => item && !(id !== repoId && item === dir),
+    );
+    if (list.length) next[id] = [...new Set(list)];
+  }
+  const own = next[repoId] || [];
+  next[repoId] = [dir, ...own.filter((item) => item !== dir)];
+  state.wcDirs = next;
+  if (state.selectedRepoId === repoId) {
+    state.wcDir = dir;
+    state.checkoutOpen = false;
+    el('dir').value = '';
+  }
+  renderRepoNav();
+  renderWcBar();
+  await saveWorkingCopies();
+}
+
+/** 切换到同一仓库的另一份工作副本；记住选择，重启后仍停在这份上。 */
+async function switchWorkingCopy(dir) {
+  if (!dir || dir === state.wcDir || !dirsFor(state.selectedRepoId).includes(dir)) return;
+  const rest = dirsFor(state.selectedRepoId).filter((item) => item !== dir);
+  state.wcDirs[state.selectedRepoId] = [dir, ...rest];
+  state.wcDir = dir;
+  state.checkoutOpen = false;
+  resetWorkingCopyState();
+  renderRepoNav();
+  renderWcBar();
+  await saveWorkingCopies();
+  // 先给成功反馈：扫描失败时 guard 的错误提示会盖掉它，而不是反过来把错误吞掉。
+  banner(`已切换到工作副本：${dir}`);
+  await guard('扫描工作副本', refreshStatus);
+}
+
+/** 把一份工作副本移出列表（只是不再记住它，本地文件一个字节都不删）。 */
+async function removeWorkingCopy(dir) {
+  const repoId = state.selectedRepoId;
+  const rest = dirsFor(repoId).filter((item) => item !== dir);
+  if (rest.length) state.wcDirs[repoId] = rest;
+  else delete state.wcDirs[repoId];
+  if (state.wcDir === dir) {
+    state.wcDir = rest[0] || '';
+    state.checkoutOpen = !state.wcDir;
+    resetWorkingCopyState();
+  }
+  renderRepoNav();
+  renderWcBar();
+  await saveWorkingCopies();
+  banner(`已把「${dir}」移出列表（本地文件未删除）。`);
+  // 还有别的副本才需要重新扫描；一份不剩时界面已经回到检出引导。
+  if (state.wcDir) await guard('扫描工作副本', refreshStatus);
+}
+
+/** 打开「再检出一份」：输入框必须清空，不能预填正在用的那份目录。 */
+function openCheckout(dir = '') {
+  // 上下文条在历史 / 容量 tab 上也在，回到工作副本 tab 才看得见检出卡片。
+  setTab('wc');
+  el('dir').value = dir;
+  state.checkoutOpen = true;
+  renderWcBar();
+  el('dir').focus();
+}
+
+function closeCheckout() {
+  state.checkoutOpen = false;
+  el('dir').value = '';
+  renderWcBar();
 }
 
 async function pickCheckoutDir() {
@@ -522,14 +703,23 @@ async function pickWorkingCopy() {
   if (!picked) return;
   const info = unwrap(await api.wcInfo(picked), '读取工作副本信息');
   if (!info) {
-    el('dir').value = picked;
-    banner(`「${picked}」还不是工作副本，确认目录后点「检出」即可把当前仓库铺到这里。`);
-    el('dir').focus();
+    // 以前只把路径填进隐藏的检出卡片，用户根本点不到「检出」——现在直接把卡片展开。
+    openCheckout(picked);
+    banner(`「${picked}」还不是工作副本，点「检出」即可把当前仓库再铺一份到这里。`);
     return;
   }
   const owner = state.repos.find((repo) => repo.repoId === info.repoId);
   if (!owner) {
     banner(`这个目录属于仓库 ${info.repoId}，但当前账号看不到它，无法在这里使用。`, 'error');
+    return;
+  }
+  // 选中的是已经记住的另一份：走切换流程，连变更 / 差异等视图状态一起换干净。
+  if (owner.repoId === state.selectedRepoId && dirsFor(owner.repoId).includes(picked)) {
+    if (picked === state.wcDir) {
+      banner(`已经在「${picked}」这份工作副本上（r${info.rev}）。`);
+    } else {
+      await switchWorkingCopy(picked);
+    }
     return;
   }
   await bindWorkingCopy(owner.repoId, picked);
@@ -553,9 +743,27 @@ async function checkout() {
     banner('请填写检出目录', 'error');
     return;
   }
+  // 检出会把目录里的条目整盘重铺：对已登记的工作副本要挡住，否则一次误点就丢了本地改动。
+  if (dirsFor(repo.repoId).includes(dir)) {
+    banner(
+      `「${dir}」已经是「${repo.name}」的工作副本。要重新铺盘请先在目录清单里把它「移出列表」，` +
+        '或换一个新目录再检出一份。',
+      'error',
+    );
+    return;
+  }
+  // 目录里已有别家仓库的 wc.db 时绝不能铺：那会把别人的工作副本元数据一起改掉。
+  const existing = unwrap(await api.wcInfo(dir), '读取工作副本信息');
+  if (existing && existing.repoId !== repo.repoId) {
+    banner(`「${dir}」是另一个仓库（${existing.repoId}）的工作副本，请换一个新目录再检出。`, 'error');
+    return;
+  }
   const result = unwrap(await api.checkout(repo.repoId, dir), '检出');
   await bindWorkingCopy(repo.repoId, result.dir);
-  banner(`已把「${repo.name}」检出到 ${result.dir}（r${result.rev}，共 ${result.files} 个文件）。`);
+  banner(
+    `已把「${repo.name}」检出到 ${result.dir}（r${result.rev}，共 ${result.files} 个文件），` +
+      `这个仓库现在有 ${dirsFor(repo.repoId).length} 份本地工作副本。`,
+  );
   await refreshStatus();
   await loadLog();
 }
@@ -1197,9 +1405,11 @@ async function disconnect() {
   el('diff-path').textContent = '';
   el('diff-path').title = '';
   el('diff').textContent = '点击上方变更查看差异';
-  el('wc-path').textContent = '';
-  el('checkout-card').classList.remove('hidden');
-  el('workbench').classList.add('hidden');
+  // 目录记忆留在 settings.json，清的只是内存状态；下次登录会重新读回来。
+  state.wcDirs = {};
+  state.checkoutOpen = false;
+  el('dir').value = '';
+  renderWcBar();
   showLogin('已退出登录。');
 }
 
@@ -1246,6 +1456,11 @@ el('do-expand').addEventListener('click', () => void guard('提交扩容申请',
 el('disconnect').addEventListener('click', () => void guard('退出登录', disconnect));
 el('pick-checkout-dir').addEventListener('click', () => void guard('选择目录', pickCheckoutDir));
 el('pick-dir').addEventListener('click', () => void guard('更换目录', pickWorkingCopy));
+el('open-checkout').addEventListener('click', () => openCheckout());
+el('cancel-checkout').addEventListener('click', closeCheckout);
+el('wc-dir-select').addEventListener('change', (event) =>
+  void guard('切换工作副本', () => switchWorkingCopy(event.target.value)),
+);
 el('checkout').addEventListener('click', () => void guard('检出', checkout));
 el('refresh-status').addEventListener('click', () => void guard('扫描', refreshStatus));
 el('update').addEventListener('click', () => void guard('更新', update));

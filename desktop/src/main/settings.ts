@@ -22,8 +22,11 @@ interface SettingsFile {
   sealedToken?: string;
   /** 该 token 的过期时间（Unix 秒），仅「30 天免登录」会话会写入。 */
   sessionExpiresAt?: number;
-  /** 仓库 → 本地工作副本目录。同一条记录，重启后才知道哪个仓库在本地有目录。 */
-  repoDirs?: Record<string, string>;
+  /**
+   * 仓库 → 本地工作副本目录列表（首个是最近使用的那份）。
+   * 旧版本写的是单个字符串，读的时候统一升级成列表，避免老配置丢绑定。
+   */
+  repoDirs?: Record<string, string | string[]>;
 }
 
 function settingsPath(): string {
@@ -152,33 +155,53 @@ export function clearToken(): void {
 }
 
 /**
- * 仓库 → 本地工作副本目录的绑定。
+ * 仓库 → 该仓库在本机的**所有**工作副本目录；第一个是最近使用的一份。
  *
- * 工作副本是「这台机器上的一份拷贝」，所以这份记忆跟着机器走，不跟账号走：换个账号
+ * 一个仓库可以检出多份（不同目录、各自的本地改动互不影响），所以这里是一对多。
+ * 工作副本是「这台机器上的一份拷贝」，这份记忆跟着机器走、不跟账号走：换个账号
  * 登录，同一个仓库的目录依然对得上。里面没有任何凭证，只有路径。
  */
-export function loadRepoDirs(): Record<string, string> {
-  const file = read();
-  const dirs = file.repoDirs;
-  if (!dirs || typeof dirs !== 'object') return {};
-  const clean: Record<string, string> = {};
-  for (const [repoId, dir] of Object.entries(dirs)) {
-    if (typeof dir === 'string' && dir.trim()) clean[repoId] = dir;
+export type RepoDirMap = Record<string, string[]>;
+
+/** 只收绝对路径：界面可能传来误填的相对路径，写进设置下次就对不上了。 */
+function absoluteDir(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const dir = value.trim();
+  if (!dir || (!dir.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(dir))) return null;
+  return dir;
+}
+
+/**
+ * 归一化绑定关系：兼容旧设置的单字符串、去掉重复与相对路径。
+ * 「一个目录只属于一个仓库」在这里兜底——设置文件可能被手工改过，界面层也会自行去重。
+ */
+function normalizeRepoDirs(dirs: unknown): RepoDirMap {
+  if (!dirs || typeof dirs !== 'object' || Array.isArray(dirs)) return {};
+  const clean: RepoDirMap = {};
+  const seen = new Set<string>();
+  for (const [repoId, raw] of Object.entries(dirs)) {
+    const values: unknown[] = Array.isArray(raw) ? raw : [raw];
+    const list: string[] = [];
+    for (const value of values) {
+      const dir = absoluteDir(value);
+      // 先出现的仓库优先：同一路径绝不挂在两个仓库下。
+      if (!dir || seen.has(dir) || list.includes(dir)) continue;
+      seen.add(dir);
+      list.push(dir);
+    }
+    if (list.length > 0) clean[repoId] = list;
   }
   return clean;
 }
 
-/** 保存绑定关系；只收绝对路径，避免把界面上误传的相对路径写进设置。 */
-export function saveRepoDirs(dirs: Record<string, string>): void {
+export function loadRepoDirs(): RepoDirMap {
+  return normalizeRepoDirs(read().repoDirs);
+}
+
+/** 保存绑定关系；列表顺序即最近使用顺序，重启后仍停在上次那份工作副本上。 */
+export function saveRepoDirs(dirs: RepoDirMap): void {
   const file = read();
-  const clean: Record<string, string> = {};
-  if (dirs && typeof dirs === 'object') {
-    for (const [repoId, dir] of Object.entries(dirs)) {
-      if (typeof dir !== 'string' || !dir.trim()) continue;
-      if (!dir.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(dir)) continue;
-      clean[repoId] = dir;
-    }
-  }
+  const clean = normalizeRepoDirs(dirs);
   if (Object.keys(clean).length === 0) delete file.repoDirs;
   else file.repoDirs = clean;
   write(file);

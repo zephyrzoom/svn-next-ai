@@ -114,8 +114,16 @@
                 <span id="wc-dot" class="wc-dot"></span>
                 <span class="wc-title">工作副本</span>
                 <span id="wc-path" class="wc-path">未检出到本地</span>
+                <!-- 同一个仓库可以检出多份：多于一份时用它切换当前操作的那份 -->
+                <select
+                  id="wc-dir-select"
+                  class="wc-dir-select hidden"
+                  title="切换本地工作副本"
+                  aria-label="切换本地工作副本"
+                ></select>
                 <span id="wc-status" class="muted"></span>
                 <span class="wc-actions">
+                  <button id="open-checkout" class="ghost" type="button">检出到新目录…</button>
                   <button id="pick-dir" class="ghost">更换目录…</button>
                   <button id="refresh-status" class="ghost">重新扫描</button>
                   <button id="update">更新</button>
@@ -135,17 +143,25 @@
             <section class="pane" id="pane-wc" data-tab="wc">
               <div class="card" id="checkout-card">
                 <div class="card-head">
-                  <h2>检出到本地</h2>
-                  <span class="muted">这个仓库还没有本地工作副本</span>
+                  <h2 id="checkout-title">检出到本地</h2>
+                  <span id="checkout-note" class="muted">这个仓库还没有本地工作副本</span>
+                  <span class="head-actions">
+                    <button id="cancel-checkout" class="ghost hidden" type="button">取消</button>
+                  </span>
                 </div>
                 <div class="row">
-                  <input id="dir" placeholder="本地目录（绝对路径）" spellcheck="false" />
+                  <input id="dir" placeholder="新的本地目录（绝对路径）" spellcheck="false" />
                   <button id="pick-checkout-dir" class="ghost">选择…</button>
                   <button id="checkout" class="primary">检出</button>
                 </div>
-                <p class="hint">
-                  检出后，变更、提交、更新都只作用于这个目录；路径按仓库记住，下次打开会自动带上。
+                <p id="checkout-hint" class="hint">
+                  变更、提交、更新都只作用于检出到的那个目录；路径按仓库记住，下次打开会自动带上。
                 </p>
+                <!-- 已检出的多份工作副本：在这里切换或移出列表（不会删除本地文件） -->
+                <div id="wc-dir-list" class="wc-dir-list hidden">
+                  <p class="hint">这个仓库已检出的目录（移出列表不会删除本地文件）：</p>
+                  <ul class="list" id="wc-dir-items"></ul>
+                </div>
               </div>
 
               <!-- 变更与差异改成上下堆叠：变更独占整行，长文件路径才不会被右栏挤掉一半；
