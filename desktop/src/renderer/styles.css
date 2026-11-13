@@ -27,16 +27,7 @@ body {
   overflow: hidden;
 }
 
-/* ---------- 顶部连接条 ---------- */
-.topbar {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 10px 18px;
-  background: var(--panel);
-  border-bottom: 1px solid var(--line);
-}
+/* 主界面不再有顶部条：品牌字样只留在登录页，身份区移到左侧栏底部 */
 
 .brand {
   font-weight: 600;
@@ -44,25 +35,15 @@ body {
   letter-spacing: 0.02em;
 }
 
-.conn {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-left: auto;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-}
-
 #server-target {
   width: 100%;
 }
 
-/* 右上角只显示姓名：不展示角色，也不展示免登录到期时间 */
+/* 左下角只显示姓名：不展示角色，也不展示免登录到期时间 */
 .who {
   color: var(--ink);
   font-weight: 500;
   min-width: 0;
-  max-width: 220px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -478,13 +459,24 @@ button.ghost {
   border-style: solid;
 }
 
-.nav-foot {
+/* 左下角身份区：顶住侧栏底部，姓名占剩余宽度、过长省略 */
+.nav-user {
   margin-top: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 10px;
-  font-size: 11px;
-  line-height: 1.7;
-  color: var(--muted);
   border-top: 1px solid var(--line);
+}
+
+.nav-user .who {
+  flex: 1 1 auto;
+}
+
+.nav-user button {
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  font-size: 12px;
 }
 
 .content {

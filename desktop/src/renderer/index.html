@@ -74,17 +74,8 @@
       </div>
     </section>
 
-    <!-- 主界面：登录成功后才显示 -->
+    <!-- 主界面：登录成功后才显示。没有顶部条，身份区收在左侧栏底部 -->
     <div id="app-shell" class="app-shell hidden">
-      <header class="topbar">
-        <div class="brand">svn-next</div>
-        <div class="conn">
-          <!-- 右上角只显示当前登录的人：姓名。免登录到期、角色这些细节不占位置 -->
-          <span id="who" class="who"></span>
-          <button id="disconnect" class="ghost">退出登录</button>
-        </div>
-      </header>
-
       <div id="banner" class="banner hidden"></div>
 
       <div class="shell" id="shell">
@@ -93,9 +84,10 @@
           <div class="nav-title">仓库</div>
           <ul id="repo-nav" class="repo-nav"></ul>
           <button id="nav-new-repo" class="nav-add" type="button">＋ 申请新建仓库</button>
-          <div class="nav-foot">
-            选中仓库后，右侧是它的工作副本、提交历史与容量。<br />
-            自己创建的仓库会多一个「成员」页；审批与其他治理在服务端 Web 管理端。
+          <!-- 左下角身份区：只留姓名与退出登录，不展示角色、会话到期等细节 -->
+          <div class="nav-user">
+            <span id="who" class="who"></span>
+            <button id="disconnect" class="ghost">退出登录</button>
           </div>
         </nav>
 

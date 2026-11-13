@@ -233,11 +233,11 @@ function verify({ app, BrowserWindow, ipcMain }) {
         return;
       }
 
-      // 身份区收尾：登录 / 免登录恢复都走 applySession，右上角必须是姓名。
-      // 服务端 WhoAmI 曾把 display_name 留空，界面就悄悄退回显示账号，这里钉住它。
-      let whoName = '';
+      // 身份区收尾：登录 / 免登录恢复都走 applySession，左下角必须是姓名。
+      // 同时钉住主界面布局：没有顶部条 / 品牌字样，也没有原来的左侧说明文字。
+      let identity = {};
       try {
-        whoName = await win.webContents.executeJavaScript(`(async () => {
+        identity = await win.webContents.executeJavaScript(`(async () => {
           try {
             await applySession({
               user: { userId: 'u_smoke', username: 'smoke', displayName: '张爱丽', role: 3 },
@@ -246,7 +246,20 @@ function verify({ app, BrowserWindow, ipcMain }) {
           } catch (_) {
             // 仓库列表的 IPC 被打桩成 null，收尾会抛错；#who 在这之前已经写好。
           }
-          return document.getElementById('who').textContent.trim();
+          const who = document.getElementById('who');
+          const out = document.getElementById('disconnect');
+          const box = document.querySelector('.nav-user');
+          const nav = document.getElementById('nav');
+          return {
+            whoName: who ? who.textContent.trim() : '',
+            inLeftFoot: Boolean(box && who && out && box.contains(who) && box.contains(out)),
+            hasTopbar: Boolean(document.querySelector('#app-shell .topbar')),
+            hasAppBrand: Boolean(document.querySelector('#app-shell .brand')),
+            oldHintGone:
+              !document.querySelector('.nav-foot') &&
+              !nav.textContent.includes('选中仓库后') &&
+              !nav.textContent.includes('服务端 Web 管理端'),
+          };
         })()`);
       } catch (err) {
         problems.push(`身份区求值失败：${err && err.message}`);
@@ -264,8 +277,12 @@ function verify({ app, BrowserWindow, ipcMain }) {
         默认地址已注入: /^[A-Za-z0-9._:-]+:\d{1,5}$/.test(info.defaultTarget || ''),
         登录页默认可见: info.loginVisible === true && info.appHidden === true,
         免登录默认勾选: info.rememberChecked === true,
-        右上角显示姓名: whoName === '张爱丽',
-        // 地址一律不在界面上出现：登录页正文没有、主界面顶部也没有。
+        左下角显示姓名: identity.whoName === '张爱丽' && identity.inLeftFoot === true,
+        顶部条与左下角说明已移除:
+          identity.hasTopbar === false &&
+          identity.hasAppBrand === false &&
+          identity.oldHintGone === true,
+        // 地址一律不在界面上出现：登录页正文没有，主界面也没有。
         界面不显示服务器地址:
           info.authShowsTarget === false &&
           info.hasServerLabel === false &&
@@ -294,7 +311,7 @@ function verify({ app, BrowserWindow, ipcMain }) {
       for (const [name, ok] of Object.entries(checks)) {
         if (!ok) problems.push(`断言失败：${name}`);
       }
-      finish({ pass: Object.values(checks).every(Boolean), ...info, interaction, whoName });
+      finish({ pass: Object.values(checks).every(Boolean), ...info, interaction, identity });
     })
     .catch((err) => finish({ pass: false, fatal: `whenReady 失败：${err && err.message}` }));
 }
