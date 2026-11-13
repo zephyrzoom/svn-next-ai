@@ -131,6 +131,8 @@ export type ConflictChoiceDto = 'mine' | 'theirs' | 'custom' | 'delete';
 export interface PrefsDto {
   target: string;
   username: string;
+  /** 上次登录的姓名，可能为空（旧客户端留下的设置里没有这一项）。 */
+  displayName: string;
   hasToken: boolean;
   canPersistToken: boolean;
   /** 已记住会话的到期时间（Unix 秒）；0 表示没有长期会话。 */

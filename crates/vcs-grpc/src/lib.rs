@@ -809,7 +809,10 @@ impl AuthService for AuthApi {
             user: Some(pb::UserInfo {
                 user_id: session.user_id,
                 username: session.username,
-                display_name: String::new(),
+                // 免登录恢复走的就是这个接口：姓名必须和 Login 一样来自 users 表，
+                // 否则界面只能回退显示账号。source / status 目前用于展示的场合不多，
+                // 仍沿用会话已校验过的常量值。
+                display_name: session.display_name,
                 source: pb::AuthSource::Local as i32,
                 status: pb::AccountStatus::Active as i32,
                 role: role_to_pb(session.role),

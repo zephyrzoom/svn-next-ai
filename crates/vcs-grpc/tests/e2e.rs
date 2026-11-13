@@ -159,7 +159,12 @@ async fn login_requires_credentials_and_maps_business_errors() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(me.user.unwrap().username, "alice");
+    let me = me.user.unwrap();
+    assert_eq!(me.username, "alice");
+    assert_eq!(
+        me.display_name, "张爱丽",
+        "WhoAmI 必须返回姓名：免登录恢复时右上角才不会退回显示账号"
+    );
 }
 
 #[tokio::test]
@@ -210,6 +215,12 @@ async fn remember_me_signs_a_30_day_session() {
         "免登录会话应为 30 天，实际 {}",
         long.expires_at - now
     );
+    assert_eq!(
+        long.user.as_ref().unwrap().display_name,
+        "张爱丽",
+        "Login 响应要带姓名"
+    );
+    // 30 天 token 恢复会话走 WhoAmI，姓名必须和刚登录时一致。
     let me = h
         .auth()
         .await
@@ -220,7 +231,9 @@ async fn remember_me_signs_a_30_day_session() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(me.user.unwrap().username, "alice");
+    let me = me.user.unwrap();
+    assert_eq!(me.username, "alice");
+    assert_eq!(me.display_name, "张爱丽");
 }
 
 #[tokio::test]

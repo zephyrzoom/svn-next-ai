@@ -16,6 +16,8 @@ import * as path from 'node:path';
 interface SettingsFile {
   target?: string;
   username?: string;
+  /** 上次登录拿到的姓名。旧服务端的 WhoAmI 不返回姓名，用它给身份区兜底。 */
+  displayName?: string;
   /** base64(safeStorage 密文)。没有加密能力时不会写入。 */
   sealedToken?: string;
   /** 该 token 的过期时间（Unix 秒），仅「30 天免登录」会话会写入。 */
@@ -48,6 +50,8 @@ function write(next: SettingsFile): void {
 export interface Prefs {
   target: string;
   username: string;
+  /** 上次登录的姓名（可能为空：旧客户端留下的设置里没有这一项）。 */
+  displayName: string;
   /** 是否保存了可用的凭证（用于界面提示「已记住登录」）。 */
   hasToken: boolean;
   /** 当前平台是否支持加密存储。不支持时界面要提示「重启后需重新登录」。 */
@@ -61,28 +65,45 @@ export function loadPrefs(): Prefs {
   return {
     target: file.target ?? '',
     username: file.username ?? '',
+    displayName: file.displayName ?? '',
     hasToken: Boolean(file.sealedToken),
     canPersistToken: safeStorage.isEncryptionAvailable(),
     sessionExpiresAt: file.sessionExpiresAt ?? 0,
   };
 }
 
+/** 一次登录 / 会话恢复要落盘的东西，缺省项表示「保持原样，不覆盖」。 */
+export interface LoginSnapshot {
+  token?: string;
+  /** 只在「记住我」登录时传：0 或缺省不改动原来记下的到期时间。 */
+  expiresAt?: number;
+  /** 拿到了姓名就刷新缓存；服务端没给（旧版本）时传空以保留旧值。 */
+  displayName?: string;
+}
+
 /**
  * 保存登录结果。
  *
  * - 传 `token`：把凭证加密落盘（「记住我」的 30 天会话同时记下 `expiresAt`）；
- * - 不传 `token`：只保留服务端地址与用户名，清掉凭证——用于「本次会话有效」的登录
- *   以及用旧 token 恢复会话时刷新用户名，不覆盖原来的到期时间。
+ * - 不传 `token`：只保留连接信息，清掉凭证——用于「本次会话有效」的登录。
+ *
+ * `displayName` 是纯展示用的兜底：`WhoAmI` 在旧服务端上不返回姓名，恢复会话时
+ * 就用上次登录缓存的姓名，避免右上角退回显示账号。
  */
 export function saveLogin(
   target: string,
   username: string,
-  token?: string,
-  expiresAt = 0,
+  snapshot: LoginSnapshot = {},
 ): void {
   const file = read();
   file.target = target;
   file.username = username;
+  if (snapshot.displayName !== undefined) {
+    const name = snapshot.displayName.trim();
+    if (name) file.displayName = name;
+    else delete file.displayName;
+  }
+  const { token, expiresAt = 0 } = snapshot;
   if (token && safeStorage.isEncryptionAvailable()) {
     file.sealedToken = safeStorage.encryptString(token).toString('base64');
     if (expiresAt > 0) file.sessionExpiresAt = expiresAt;
@@ -106,6 +127,8 @@ export function saveTarget(target: string): void {
   else delete file.target;
   delete file.sealedToken;
   delete file.sessionExpiresAt;
+  // 换了服务端，上个账号的姓名也不该带过去。
+  delete file.displayName;
   write(file);
 }
 

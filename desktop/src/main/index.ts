@@ -109,12 +109,19 @@ ipcMain.handle(
       client?.close();
       client = next;
       const expiresAt = next.expiresAtValue;
+      // 登录响应带姓名就顺手缓存：旧服务端的 WhoAmI 不返回姓名，恢复会话时要用它兜底。
+      // 没拿到（旧服务端）就传 undefined，保留上次的缓存，不要把姓名清掉。
+      const displayName = user.displayName || undefined;
       if (rememberMe && next.tokenValue) {
         // 「30 天免登录」：凭证加密落盘，并记下到期时间供启动时快速判断。
-        saveLogin(target, user.username, next.tokenValue, expiresAt);
+        saveLogin(target, user.username, {
+          token: next.tokenValue,
+          expiresAt,
+          displayName,
+        });
       } else {
-        // 不记住：只保留地址与用户名，本机不留任何可复用凭证。
-        saveLogin(target, user.username);
+        // 不记住：只留地址、账号与姓名，本机不留任何可复用凭证。
+        saveLogin(target, user.username, { displayName });
       }
       return { user, expiresAt: rememberMe ? expiresAt : 0 };
     }),
@@ -157,10 +164,18 @@ ipcMain.handle('vcs:tryResume', (_event, target: string = '') =>
     next.useToken(token);
     try {
       const user = await next.whoAmI();
+      // 旧服务端的 WhoAmI 把 display_name 留空：用上次登录缓存的姓名兜底，
+      // 否则免登录恢复后右上角会从姓名变回账号。
+      if (!user.displayName && prefs.displayName) {
+        user.displayName = prefs.displayName;
+      }
       client?.close();
       client = next;
-      // 不带 expiresAt 调用：刷新用户名，但保留原来的到期时间。
-      saveLogin(resolved, user.username, token);
+      // 不带 expiresAt 调用：刷新用户名与姓名，但保留原来的到期时间。
+      saveLogin(resolved, user.username, {
+        token,
+        displayName: user.displayName || undefined,
+      });
       return { user, expiresAt: prefs.sessionExpiresAt };
     } catch {
       next.close();

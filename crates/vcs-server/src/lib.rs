@@ -69,6 +69,9 @@ pub enum ActorKind {
 pub struct Session {
     pub user_id: String,
     pub username: String,
+    /// 姓名（纯展示）。JWT / PAT 校验时与用户名一起从 users 表读出，
+    /// `WhoAmI` 才有东西可返回——否则免登录恢复后的界面只能退回显示账号。
+    pub display_name: String,
     pub role: Role,
     pub kind: ActorKind,
     /// PAT 的能力范围；JWT 会话为 `None`，表示「本人全部的权限」。
@@ -88,6 +91,7 @@ impl Session {
         Self {
             user_id: "system".to_string(),
             username: "system".to_string(),
+            display_name: "系统".to_string(),
             role: Role::Admin,
             kind: ActorKind::System,
             scopes: None,
@@ -755,17 +759,18 @@ impl ServerStore {
     }
 
     fn session_from_claims(&self, claims: &Claims) -> Result<Session> {
-        let row: Option<(String, String, String, i64)> = self
+        let row: Option<(String, String, String, String, i64)> = self
             .conn
             .query_row(
-                "SELECT username, status, role, token_version FROM users WHERE user_id = ?1",
+                "SELECT username, display_name, status, role, token_version
+                 FROM users WHERE user_id = ?1",
                 params![claims.sub],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()
             .map_err(db("查询用户失败"))?;
 
-        let (username, status, role, token_version) =
+        let (username, display_name, status, role, token_version) =
             row.ok_or_else(|| Error::new(ErrorCode::Unauthenticated, "token 对应的用户不存在"))?;
         if !parse_account_status(&status)?.may_login() {
             return Err(Error::new(ErrorCode::AccountDisabled, "账号已不可用"));
@@ -779,6 +784,7 @@ impl ServerStore {
         Ok(Session {
             user_id: claims.sub.clone(),
             username,
+            display_name,
             role: parse_role(&role)?,
             kind: ActorKind::User,
             // JWT 就是「本人」，不做能力收窄；PAT 才带 scope。
@@ -4040,16 +4046,17 @@ impl ServerStore {
             return Err(Error::new(ErrorCode::TokenExpired, "该访问令牌已过期"));
         }
 
-        let (username, status, role) = self
+        let (username, display_name, status, role) = self
             .conn
             .query_row(
-                "SELECT username, status, role FROM users WHERE user_id = ?1",
+                "SELECT username, display_name, status, role FROM users WHERE user_id = ?1",
                 params![user_id],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
                         r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
                     ))
                 },
             )
@@ -4070,6 +4077,7 @@ impl ServerStore {
         Ok(Session {
             user_id,
             username,
+            display_name,
             role: parse_role(&role)?,
             kind: ActorKind::User,
             scopes: Some(serde_json::from_str(&scopes).unwrap_or_default()),

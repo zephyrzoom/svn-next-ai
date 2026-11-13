@@ -57,6 +57,7 @@ function verify({ app, BrowserWindow, ipcMain }) {
   const PREFS = {
     target: 'smoke.example:50051',
     username: 'smoke',
+    displayName: '张爱丽',
     hasToken: false,
     canPersistToken: true,
     sessionExpiresAt: 0,
@@ -232,6 +233,25 @@ function verify({ app, BrowserWindow, ipcMain }) {
         return;
       }
 
+      // 身份区收尾：登录 / 免登录恢复都走 applySession，右上角必须是姓名。
+      // 服务端 WhoAmI 曾把 display_name 留空，界面就悄悄退回显示账号，这里钉住它。
+      let whoName = '';
+      try {
+        whoName = await win.webContents.executeJavaScript(`(async () => {
+          try {
+            await applySession({
+              user: { userId: 'u_smoke', username: 'smoke', displayName: '张爱丽', role: 3 },
+              expiresAt: 0,
+            }, { target: 'smoke.example:50051' });
+          } catch (_) {
+            // 仓库列表的 IPC 被打桩成 null，收尾会抛错；#who 在这之前已经写好。
+          }
+          return document.getElementById('who').textContent.trim();
+        })()`);
+      } catch (err) {
+        problems.push(`身份区求值失败：${err && err.message}`);
+      }
+
       const checks = {
         页面标题: info.title === 'svn-next',
         // 桌面端剥离管理 UI 后 id 数下降，阈值按「仓库使用」客户端的实际结构设定。
@@ -244,6 +264,7 @@ function verify({ app, BrowserWindow, ipcMain }) {
         默认地址已注入: /^[A-Za-z0-9._:-]+:\d{1,5}$/.test(info.defaultTarget || ''),
         登录页默认可见: info.loginVisible === true && info.appHidden === true,
         免登录默认勾选: info.rememberChecked === true,
+        右上角显示姓名: whoName === '张爱丽',
         // 地址一律不在界面上出现：登录页正文没有、主界面顶部也没有。
         界面不显示服务器地址:
           info.authShowsTarget === false &&
@@ -273,7 +294,7 @@ function verify({ app, BrowserWindow, ipcMain }) {
       for (const [name, ok] of Object.entries(checks)) {
         if (!ok) problems.push(`断言失败：${name}`);
       }
-      finish({ pass: Object.values(checks).every(Boolean), ...info, interaction });
+      finish({ pass: Object.values(checks).every(Boolean), ...info, interaction, whoName });
     })
     .catch((err) => finish({ pass: false, fatal: `whenReady 失败：${err && err.message}` }));
 }
