@@ -3550,6 +3550,16 @@ impl ServerStore {
         self.expire_stale_requests()?;
         // 成员门 + 仓库状态门：不是成员就不能替别人的仓库要空间。
         let repo = self.require_repo(actor, repo_id)?;
+        // 扩容是拥有者的事：只读 / 读写成员只能看容量，不能申请加空间。
+        // 系统身份（内置 Web 管理端代理管理员）不在这里受限，审批与代提另走管理通道。
+        if !actor.is_system()
+            && self.member_role(&repo.repo_id, &actor.user_id)? != RepoMemberRole::Owner
+        {
+            return Err(Error::new(
+                ErrorCode::PermissionDenied,
+                "只有仓库拥有者可以申请扩容，成员只能查看容量",
+            ));
+        }
         let pending: Option<String> = self
             .conn
             .query_row(

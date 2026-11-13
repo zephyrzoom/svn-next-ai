@@ -1145,6 +1145,20 @@ fn quota_expansion_adds_one_fixed_step() {
         .request_repo_expansion(&alice, &repo.repo_id, "我不是成员")
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::RepoNotMember);
+
+    // 读写成员只能看容量，不能申请扩容：扩容只属于拥有者。
+    store
+        .create_user(&alice, "ivan", "伊万", PASSWORD, Role::User)
+        .unwrap();
+    let (token, _) = store.login("ivan", PASSWORD).unwrap();
+    let ivan = store.authenticate(&token).unwrap();
+    store
+        .add_member(&heidi, &repo.repo_id, "ivan", RepoMemberRole::Writer)
+        .unwrap();
+    let err = store
+        .request_repo_expansion(&ivan, &repo.repo_id, "我也想加空间")
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::PermissionDenied);
 }
 
 #[test]

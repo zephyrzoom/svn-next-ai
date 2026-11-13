@@ -340,7 +340,7 @@ enum Cmd {
         #[arg(long)]
         reason: String,
     },
-    /// 申请扩容（一次固定 +10 GiB，容量无需填写）
+    /// 申请扩容（仅仓库拥有者；一次固定 +10 GiB，容量无需填写）
     RepoExpand {
         repo: String,
         #[arg(long, default_value = "")]

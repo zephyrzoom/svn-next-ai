@@ -658,10 +658,18 @@ async function loadLog() {
   }
 }
 
-/** 容量是只读信息：跟着当前仓库走，不触发任何治理类调用。 */
+/**
+ * 容量是只读信息：跟着当前仓库走，不触发任何治理类调用。
+ * 扩容申请只留给仓库拥有者——普通成员（只读 / 读写）只能看用量与上限。
+ */
 async function loadQuota() {
   const repo = currentRepo();
   el('quota-repo').textContent = repo ? repo.name : '';
+  const owner = isRepoOwner(repo);
+  el('do-expand').classList.toggle('hidden', !owner);
+  el('quota-hint').textContent = owner
+    ? '容量信息只读；需要更多空间时可以申请扩容：一次固定加 10 GiB，由管理员结合服务器磁盘余量审批。'
+    : '容量只读：这里只显示已用空间与配额上限，成员不能申请扩容。';
   if (!repo) return;
   const quota = unwrap(await api.getQuota(repo.repoId), '加载容量');
   renderQuota(quota);
@@ -695,9 +703,13 @@ function renderQuota(quota) {
 // ---------------- 成员管理（仅仓库拥有者） ----------------
 
 /** 与 proto 的 RepoMemberRole 一致：1 owner / 2 maintainer / 3 writer / 4 reader。 */
-const MEMBER_ROLE_LABELS = { 1: '拥有者', 2: '维护者', 3: '写入者', 4: '只读' };
-/** 能授予的角色：owner 不可授予他人（唯一），所以这里只列低阶三种。 */
-const ASSIGNABLE_ROLES = [2, 3, 4];
+const MEMBER_ROLE_LABELS = { 1: '拥有者', 2: '维护者', 3: '读写', 4: '只读' };
+/**
+ * 客户端只放两种权限：读写、只读。维护者是旧版本留下的角色，
+ * 名单里遇到时仍要如实显示（否则下拉会把 2 显示成 3，等于骗人），
+ * 但不再作为选项发给任何人。
+ */
+const ASSIGNABLE_ROLES = [3, 4];
 
 function roleLabel(role) {
   return MEMBER_ROLE_LABELS[role] || `未知角色（${role}）`;
@@ -753,10 +765,17 @@ function renderMembers() {
       const select = document.createElement('select');
       select.className = 'role-select';
       select.setAttribute('aria-label', `调整 ${member.username} 的角色`);
-      for (const role of ASSIGNABLE_ROLES) {
+      // 旧成员可能还停在「维护者」：把当前值补进选项里，让下拉显示真实角色，
+      // 拥有者选中只读/读写后即可把它降下来。
+      const options = ASSIGNABLE_ROLES.includes(member.role)
+        ? ASSIGNABLE_ROLES
+        : [member.role, ...ASSIGNABLE_ROLES];
+      for (const role of options) {
         const option = document.createElement('option');
         option.value = String(role);
-        option.textContent = roleLabel(role);
+        option.textContent = ASSIGNABLE_ROLES.includes(role)
+          ? roleLabel(role)
+          : `${roleLabel(role)}（旧角色，请改为只读或读写）`;
         option.selected = member.role === role;
         select.appendChild(option);
       }
@@ -974,11 +993,15 @@ async function requestRepo() {
   );
 }
 
-/** 扩容申请同样不填容量：一次固定 +10 GiB，由管理员按磁盘余量批准。 */
+/** 扩容申请同样不填容量：一次固定 +10 GiB，由管理员按磁盘余量批准；仅拥有者可提交。 */
 async function requestExpansion() {
   const repo = currentRepo();
   if (!repo) {
     banner('请先在左侧选择一个仓库', 'error');
+    return;
+  }
+  if (!isRepoOwner(repo)) {
+    banner('只有仓库拥有者可以申请扩容，成员只能查看容量。', 'error');
     return;
   }
   const result = unwrap(await api.requestRepoExpansion(repo.repoId, ''), '提交扩容申请');

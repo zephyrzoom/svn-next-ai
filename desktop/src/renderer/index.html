@@ -235,13 +235,16 @@
                 <div class="card-head">
                   <h2>容量</h2>
                   <span id="quota-repo" class="muted"></span>
-                  <button id="do-expand" class="ghost">申请扩容 +10 GiB</button>
+                  <!-- 扩容申请只属于仓库拥有者：普通成员只看用量，按钮默认隐藏 -->
+                  <button id="do-expand" class="ghost hidden">申请扩容 +10 GiB</button>
                 </div>
                 <div class="quota">
                   <div class="bar"><div id="quota-fill"></div></div>
                   <div class="meta" id="quota-text">加载中…</div>
                 </div>
-                <p class="hint">扩容也是「只填申请」：一次固定加 10 GiB，由管理员结合服务器磁盘余量审批。</p>
+                <p class="hint" id="quota-hint">
+                  容量只读：这里只显示已用空间与配额上限，成员不能申请扩容。
+                </p>
               </div>
             </section>
 
@@ -255,8 +258,8 @@
                 </div>
                 <ul id="members" class="list members"></ul>
                 <p class="hint">
-                  只有成员才能检出、提交与更新这个仓库。拥有者唯一且受保护：不可移除、不可降级；
-                  成员变更立即生效，并写入审计日志。
+                  只有成员才能检出、提交与更新这个仓库；成员权限只有读写与只读两种。
+                  拥有者唯一且受保护：不可移除、不可降级；成员变更立即生效，并写入审计日志。
                 </p>
               </div>
 
@@ -291,10 +294,10 @@
                   </span>
                   <label class="picked-role">
                     权限
+                    <!-- 客户端只发两种权限：读写、只读；维护者不下放到客户端 -->
                     <select id="member-role" aria-label="新成员权限">
-                      <option value="3" selected>写入者（可读写）</option>
+                      <option value="3" selected>读写</option>
                       <option value="4">只读</option>
-                      <option value="2">维护者（可管理低阶成员）</option>
                     </select>
                   </label>
                   <button id="add-member" class="primary" type="button">添加</button>
