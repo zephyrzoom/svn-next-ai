@@ -49,6 +49,8 @@ const state = {
   conflicts: [],
   diff: [],
   conflict: null,
+  /** 差异卡片是否展开：默认收起，点变更条目或「查看差异」再打开。 */
+  diffOpen: false,
   tab: 'wc',
   /** 当前仓库的成员列表（仅 owner 打开成员页时会加载）。 */
   members: [],
@@ -415,9 +417,12 @@ async function selectRepo(repoId) {
   state.members = [];
   state.candidates = [];
   el('diff-path').textContent = '';
-  el('diff').textContent = state.wcDir ? '正在扫描工作副本…' : '点击左侧变更查看差异';
+  el('diff-path').title = '';
+  el('diff').textContent = state.wcDir ? '正在扫描工作副本…' : '点击上方变更查看差异';
   el('conflict-editor').classList.add('hidden');
   el('diff').classList.remove('hidden');
+  // 换仓库就是换上下文：差异回到默认收起状态，不把上一个仓库的内容带过来。
+  setDiffOpen(false);
 
   renderRepoNav();
   renderRepoHead();
@@ -572,12 +577,14 @@ async function refreshStatus() {
   closeConflict();
   const diffs = unwrap(await api.diff(dir), '生成差异');
   state.diff = diffs;
+  // 重新扫描会重建变更列表，之前查看的那条不一定还在，差异区回到提示态。
   if (state.changes.length === 0) {
     el('diff').textContent = '工作副本干净';
-    el('diff-path').textContent = '';
   } else {
-    el('diff').textContent = '点击左侧变更查看差异';
+    el('diff').textContent = '点击上方变更查看差异';
   }
+  el('diff-path').textContent = '';
+  el('diff-path').title = '';
 }
 
 function renderChanges() {
@@ -599,6 +606,7 @@ function renderChanges() {
             ? 'M'
             : 'D';
     li.innerHTML = `<span class="badge ${marker}"></span><span class="name"></span>`;
+    li.title = change.path;
     li.querySelector('.badge').textContent = marker;
     li.querySelector('.name').textContent = change.path;
     li.addEventListener('click', () => {
@@ -855,6 +863,21 @@ async function requestExpansion() {
   banner(`已提交「${repo.name}」的扩容申请（${result.requestId}）：通过后上限增加 10 GiB。`);
 }
 
+// ---------------- 差异面板：默认收起，按需展开 ----------------
+
+/**
+ * 差异独占整行，但不必一直占着版面：默认隐藏，点某条变更（或「查看差异」）才展开。
+ * 收起只切显隐，不清内容也不清列表选中态——再展开还是上次看的那条；
+ * 冲突编辑器在这张卡片里，它的显隐由 showConflict / closeConflict 自己管。
+ */
+function setDiffOpen(open) {
+  state.diffOpen = Boolean(open);
+  el('diff-card').classList.toggle('hidden', !state.diffOpen);
+  const toggle = el('toggle-diff');
+  toggle.textContent = state.diffOpen ? '收起差异' : '查看差异';
+  toggle.setAttribute('aria-expanded', String(state.diffOpen));
+}
+
 // ---------------- 冲突三栏 ----------------
 
 function highlight(node) {
@@ -869,7 +892,11 @@ async function showConflict(path, node) {
   highlight(node);
   const detail = unwrap(await api.conflictDetail(state.wcDir, path), '读取冲突内容');
   state.conflict = { path, kind: detail.kind };
-  el('diff-path').textContent = `${path}（${detail.kind} 冲突）`;
+  // 冲突编辑器住在差异卡片里：看冲突就是「需要看差异」，先把卡片展开。
+  setDiffOpen(true);
+  const label = `${path}（${detail.kind} 冲突）`;
+  el('diff-path').textContent = label;
+  el('diff-path').title = label;
   el('diff').classList.add('hidden');
   el('conflict-editor').classList.remove('hidden');
 
@@ -913,11 +940,12 @@ async function resolveConflict(choice) {
 }
 
 function showDiff(path, node) {
-  for (const active of el('changes').querySelectorAll('li.active')) {
-    active.classList.remove('active');
-  }
-  node.classList.add('active');
+  highlight(node);
+  // 从冲突编辑器切回普通差异：先把三栏收掉，否则 diff 还被 hidden 着。
+  closeConflict();
+  setDiffOpen(true);
   el('diff-path').textContent = path;
+  el('diff-path').title = path;
   const entry = state.diff.find((item) => item.path === path);
   el('diff').textContent = entry ? entry.text : '（无文本差异，可能是二进制文件或新增/删除）';
 }
@@ -994,6 +1022,10 @@ async function disconnect() {
   state.members = [];
   state.candidates = [];
   setTab('wc');
+  setDiffOpen(false);
+  el('diff-path').textContent = '';
+  el('diff-path').title = '';
+  el('diff').textContent = '点击上方变更查看差异';
   el('wc-path').textContent = '';
   el('checkout-card').classList.remove('hidden');
   el('workbench').classList.add('hidden');
@@ -1047,6 +1079,8 @@ el('checkout').addEventListener('click', () => void guard('检出', checkout));
 el('refresh-status').addEventListener('click', () => void guard('扫描', refreshStatus));
 el('update').addEventListener('click', () => void guard('更新', update));
 el('revert').addEventListener('click', () => void guard('还原', revertAll));
+el('toggle-diff').addEventListener('click', () => setDiffOpen(!state.diffOpen));
+el('close-diff').addEventListener('click', () => setDiffOpen(false));
 el('commit').addEventListener('click', () => void guard('提交', commit));
 el('refresh-log').addEventListener('click', () => void guard('刷新历史', loadLog));
 // 成员页（owner 专属）：刷新名单、按名字搜人、回车即搜。

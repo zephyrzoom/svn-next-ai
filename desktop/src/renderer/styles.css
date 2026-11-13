@@ -704,6 +704,22 @@ button.ghost:disabled:hover {
   margin-left: 0;
 }
 
+/* 卡片头右侧的一组操作：靠右排列，不参与标题那一行的挤压 */
+.head-actions {
+  display: flex;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+/* 差异标题里跟着的长路径：允许收缩并省略，鼠标悬停看完整值（title 由脚本设置） */
+.card-head #diff-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .row {
   display: flex;
   gap: 8px;
@@ -735,17 +751,17 @@ button.ghost:disabled:hover {
   margin: 8px 0 0;
 }
 
-.split {
+/* 工作副本区：变更与差异上下堆叠，各占整行。差异默认收起，不占版面。 */
+.workbench {
   display: flex;
+  flex-direction: column;
   gap: 16px;
-  align-items: flex-start;
-  flex-wrap: wrap;
 }
 
-.split > .col {
-  flex: 1 1 320px;
-  min-width: 0;
+.workbench > .card {
+  width: 100%;
   margin-bottom: 0;
+  box-sizing: border-box;
 }
 
 .inline-form {
@@ -796,6 +812,22 @@ button.ghost:disabled:hover {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 变更列表独占整行：路径再长也换行铺开，不再被右栏挤成一半后被省略 */
+.list.changes {
+  max-height: 340px;
+}
+
+.list.changes li .name {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+}
+
+.list.changes li .badge {
+  flex: 0 0 auto;
 }
 
 .badge {
@@ -899,8 +931,9 @@ button.ghost:disabled:hover {
   line-height: 1.5;
   white-space: pre;
   overflow: auto;
-  max-height: 260px;
-  min-height: 120px;
+  /* 差异独占整行后给足高度，长 diff 少滚几屏 */
+  max-height: 420px;
+  min-height: 140px;
 }
 
 .diff.small {

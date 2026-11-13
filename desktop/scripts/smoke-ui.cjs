@@ -272,6 +272,52 @@ function verify({ app, BrowserWindow, ipcMain }) {
         problems.push(`身份区求值失败：${err && err.message}`);
       }
 
+      // 工作副本版式：差异默认收起、按需展开；变更与差异各占整行，长路径可换行。
+      let layout = {};
+      try {
+        layout = await win.webContents.executeJavaScript(`(() => {
+          const shell = document.getElementById('view-repo');
+          const workbench = document.getElementById('workbench');
+          // IPC 被打桩时没有仓库，这两个容器默认隐藏；临时显示才量得到真实宽度。
+          shell.classList.remove('hidden');
+          workbench.classList.remove('hidden');
+          const card = document.getElementById('diff-card');
+          const toggle = document.getElementById('toggle-diff');
+          const changeCard = workbench.querySelector('.card');
+          const snapshot = () => ({
+            hidden: card.classList.contains('hidden'),
+            label: toggle.textContent.trim(),
+            expanded: toggle.getAttribute('aria-expanded'),
+          });
+          const before = snapshot();
+          toggle.click();
+          const opened = snapshot();
+          const stacked = getComputedStyle(workbench).flexDirection === 'column';
+          const changeWidth = changeCard.getBoundingClientRect().width;
+          const fullRow =
+            changeWidth > 200 &&
+            Math.abs(changeWidth - card.getBoundingClientRect().width) < 1;
+          state.changes = [{ path: '一个/非常非常长的/目录层级/目录层级/文件名.txt', kind: 'MODIFY' }];
+          state.conflicts = [];
+          renderChanges();
+          const name = document.querySelector('#changes li .name');
+          const longPathWraps =
+            Boolean(name) &&
+            getComputedStyle(name).whiteSpace === 'normal' &&
+            getComputedStyle(name).overflowWrap === 'anywhere';
+          document.getElementById('close-diff').click();
+          document.querySelector('#changes li').click();
+          const clickOpened = !card.classList.contains('hidden');
+          document.getElementById('close-diff').click();
+          const after = snapshot();
+          workbench.classList.add('hidden');
+          shell.classList.add('hidden');
+          return { before, opened, after, stacked, fullRow, longPathWraps, clickOpened };
+        })()`);
+      } catch (err) {
+        problems.push(`工作副本版式求值失败：${err && err.message}`);
+      }
+
       const checks = {
         页面标题: info.title === 'svn-next',
         // 桌面端剥离管理 UI 后 id 数下降，阈值按「仓库使用」客户端的实际结构设定。
@@ -319,6 +365,19 @@ function verify({ app, BrowserWindow, ipcMain }) {
           interaction.resetMessage.includes('默认地址') &&
           setTargetCalls.includes('10.0.0.2:50051') &&
           setTargetCalls.includes(''),
+        差异默认收起:
+          layout.before?.hidden === true &&
+          layout.before.label === '查看差异' &&
+          layout.before.expanded === 'false',
+        差异按需展开与收起:
+          layout.opened?.hidden === false &&
+          layout.opened.label === '收起差异' &&
+          layout.opened.expanded === 'true' &&
+          layout.clickOpened === true &&
+          layout.after?.hidden === true &&
+          layout.after.label === '查看差异',
+        变更与差异各占整行: layout.stacked === true && layout.fullRow === true,
+        长文件路径换行显示: layout.longPathWraps === true,
       };
       for (const [name, ok] of Object.entries(checks)) {
         if (!ok) problems.push(`断言失败：${name}`);

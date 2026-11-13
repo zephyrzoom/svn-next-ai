@@ -148,12 +148,25 @@
                 </p>
               </div>
 
-              <div class="split" id="workbench">
-                <div class="card col">
+              <!-- 变更与差异改成上下堆叠：变更独占整行，长文件路径才不会被右栏挤掉一半；
+                   差异卡片默认收起，点变更条目或「查看差异」再展开，同样占整行。 -->
+              <div class="workbench" id="workbench">
+                <div class="card">
                   <div class="card-head">
                     <h2>变更</h2>
                     <span id="wc-change-count" class="muted"></span>
-                    <button id="revert" class="ghost" title="丢弃所有本地改动">全部还原</button>
+                    <span class="head-actions">
+                      <button
+                        id="toggle-diff"
+                        class="ghost"
+                        type="button"
+                        aria-controls="diff-card"
+                        aria-expanded="false"
+                      >
+                        查看差异
+                      </button>
+                      <button id="revert" class="ghost" title="丢弃所有本地改动">全部还原</button>
+                    </span>
                   </div>
                   <ul id="changes" class="list changes"></ul>
 
@@ -162,12 +175,13 @@
                   <button id="commit" class="primary">提交</button>
                 </div>
 
-                <div class="card col">
+                <div class="card hidden" id="diff-card">
                   <div class="card-head">
                     <h2>差异</h2>
                     <span id="diff-path" class="muted"></span>
+                    <button id="close-diff" class="ghost" type="button">收起</button>
                   </div>
-                  <pre id="diff" class="diff">点击左侧变更查看差异</pre>
+                  <pre id="diff" class="diff">点击上方变更查看差异</pre>
 
                   <div id="conflict-editor" class="conflict hidden">
                     <div class="conflict-grid">
