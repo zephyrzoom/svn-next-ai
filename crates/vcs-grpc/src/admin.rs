@@ -268,11 +268,11 @@ fn strings(v: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// 全局身份只有两种：`admin` 是管理员，其余（含老库的 readonly / writer）都是普通用户。
 fn parse_role(text: &str) -> Role {
     match text.trim().to_ascii_lowercase().as_str() {
         "admin" => Role::Admin,
-        "writer" => Role::Writer,
-        _ => Role::Readonly,
+        _ => Role::User,
     }
 }
 
@@ -485,7 +485,7 @@ fn ldap_json(c: &LdapPublicConfig) -> Value {
         "enabled": cfg.enabled,
         "group_roles": cfg.group_roles.iter().map(|(dn, role)| {
             format!("{dn}={}", match role {
-                Role::Admin => "admin", Role::Writer => "writer", Role::Readonly => "readonly",
+                Role::Admin => "admin", Role::User => "user",
             })
         }).collect::<Vec<_>>().join("\n"),
     })
@@ -519,7 +519,7 @@ fn ldap_from_body(v: &Value) -> CoreResult<LdapSettings> {
         let (dn, role) = line.rsplit_once('=').ok_or_else(|| {
             Error::new(
                 ErrorCode::InvalidArgument,
-                "组映射每行应为 <组DN>=<admin|writer|readonly>",
+                "组映射每行应为 <组DN>=<admin|user>",
             )
         })?;
         cfg.group_roles
@@ -614,16 +614,14 @@ async fn approve_registration(
     State(state): State<AdminState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Json(body): Json<Value>,
 ) -> Response {
     let session = match admin_session(&state, &headers).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let role = parse_role(&s(&body, "role"));
     run(&state, move |store| {
-        let out = store.approve_registration(&session, &id, role)?;
-        // 申请人在注册时已经设好密码，审批只要放行；这里不再返回任何凭证。
+        // 审批只放行，不选类型：通过即普通用户，申请人在注册时已经设好密码。
+        let out = store.approve_registration(&session, &id)?;
         Ok(json!({ "user_id": out.user_id }))
     })
     .await

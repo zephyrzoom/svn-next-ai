@@ -276,9 +276,11 @@ async function main() {
     }
     if (!pendingBlocked) fail('未审批的账号竟然可以登录');
 
-    await client.approveRegistration(registered.requestId, 2);
+    // 审批只放行、不选身份：通过即普通用户（role=1），读写权限按仓库授予。
+    await client.approveRegistration(registered.requestId);
     const bob = await bobClient.login('bob', 'Bobpass1!');
     console.log(`  bob 已能登录（role=${bob.role}），用的是注册时设置的密码`);
+    if (bob.role !== 1) fail(`审批通过后应为普通用户（role=1），实际 ${bob.role}`);
 
     try {
       const request = await bobClient.requestRepo('bob-repo', '个人归档');

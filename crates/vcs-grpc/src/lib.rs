@@ -159,8 +159,7 @@ fn unimplemented<T>(what: &str) -> Result<Response<T>, Status> {
 
 fn role_to_pb(role: Role) -> i32 {
     match role {
-        Role::Readonly => pb::Role::Readonly as i32,
-        Role::Writer => pb::Role::Writer as i32,
+        Role::User => pb::Role::User as i32,
         Role::Admin => pb::Role::Admin as i32,
     }
 }
@@ -168,9 +167,8 @@ fn role_to_pb(role: Role) -> i32 {
 fn parse_role(value: i32) -> Result<Role, Status> {
     match pb::Role::try_from(value).unwrap_or(pb::Role::Unspecified) {
         pb::Role::Admin => Ok(Role::Admin),
-        pb::Role::Writer => Ok(Role::Writer),
-        pb::Role::Readonly => Ok(Role::Readonly),
-        _ => Err(Status::invalid_argument("未知的全局角色")),
+        pb::Role::User => Ok(Role::User),
+        _ => Err(Status::invalid_argument("未知的全局身份")),
     }
 }
 
@@ -470,17 +468,13 @@ fn pb_to_ldap_settings(
 ) -> std::result::Result<LdapSettings, Error> {
     let mut group_roles = Vec::with_capacity(cfg.group_roles.len());
     for entry in &cfg.group_roles {
-        let role = match pb::Role::try_from(entry.role).unwrap_or(pb::Role::Unspecified) {
-            pb::Role::Admin => Role::Admin,
-            pb::Role::Writer => Role::Writer,
-            pb::Role::Readonly => Role::Readonly,
-            _ => {
-                return Err(Error::new(
-                    ErrorCode::InvalidArgument,
-                    format!("组 {} 映射了未知角色", entry.group_dn),
-                ))
-            }
-        };
+        // 组映射只能给「管理员」或「普通用户」；读写权限按仓库授予，与目录无关。
+        let role = parse_role(entry.role).map_err(|_| {
+            Error::new(
+                ErrorCode::InvalidArgument,
+                format!("组 {} 映射了未知身份", entry.group_dn),
+            )
+        })?;
         group_roles.push((entry.group_dn.clone(), role));
     }
     Ok(LdapSettings {
@@ -745,14 +739,11 @@ impl AuthService for AuthApi {
     ) -> Result<Response<pb::ApproveRegistrationResponse>, Status> {
         let session = self.api.session(&request)?;
         let req = request.into_inner();
-        let role = match parse_role(req.role) {
-            Ok(role) => role,
-            Err(status) => return Err(status),
-        };
+        // 审批只放行：不再读角色字段（proto 里已 reserved），通过即普通用户。
         match self
             .api
             .store()
-            .approve_registration(&session, &req.request_id, role)
+            .approve_registration(&session, &req.request_id)
         {
             Ok(approved) => Ok(Response::new(pb::ApproveRegistrationResponse {
                 status: Some(status_ok()),

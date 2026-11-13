@@ -123,7 +123,7 @@ fn only_admins_can_create_users_or_change_global_quota() {
     let alice = admin(&store);
 
     store
-        .create_user(&alice, "bob", "李明", PASSWORD, Role::Writer)
+        .create_user(&alice, "bob", "李明", PASSWORD, Role::User)
         .unwrap();
     let (token, _) = store.login("bob", PASSWORD).unwrap();
     let bob = store.authenticate(&token).unwrap();
@@ -149,7 +149,7 @@ fn non_members_cannot_touch_the_repo() {
     let store = sb.store();
     let alice = admin(&store);
     store
-        .create_user(&alice, "bob", "李明", PASSWORD, Role::Writer)
+        .create_user(&alice, "bob", "李明", PASSWORD, Role::User)
         .unwrap();
     let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
 
@@ -183,10 +183,10 @@ fn reader_cannot_commit_but_writer_can() {
     let store = sb.store();
     let alice = admin(&store);
     store
-        .create_user(&alice, "bob", "李明", PASSWORD, Role::Writer)
+        .create_user(&alice, "bob", "李明", PASSWORD, Role::User)
         .unwrap();
     store
-        .create_user(&alice, "carol", "王芳", PASSWORD, Role::Writer)
+        .create_user(&alice, "carol", "王芳", PASSWORD, Role::User)
         .unwrap();
     let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
     store
@@ -225,7 +225,7 @@ fn member_assignment_follows_the_role_matrix() {
     let alice = admin(&store);
     for (name, display) in [("bob", "李明"), ("carol", "王芳")] {
         store
-            .create_user(&alice, name, display, PASSWORD, Role::Writer)
+            .create_user(&alice, name, display, PASSWORD, Role::User)
             .unwrap();
     }
     let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
@@ -865,7 +865,7 @@ fn purge_requires_write_role() {
     let store = sb.store();
     let (alice, repo_id, _, _) = seed_monthly_repo(&sb, &store);
     store
-        .create_user(&alice, "reader1", "只读者", PASSWORD, Role::Readonly)
+        .create_user(&alice, "reader1", "只读者", PASSWORD, Role::User)
         .unwrap();
     store
         .add_member(&alice, &repo_id, "reader1", RepoMemberRole::Reader)
@@ -938,7 +938,7 @@ fn registration_takes_password_at_signup_and_still_needs_approval() {
 
     // 审批只放行，不再收集密码：审批后直接用注册时设置的密码登录。
     store
-        .approve_registration(&alice, &reg.info.request_id, Role::Writer)
+        .approve_registration(&alice, &reg.info.request_id)
         .unwrap();
     let err = store.login("bob", "Other1!x").unwrap_err();
     assert_eq!(
@@ -948,7 +948,8 @@ fn registration_takes_password_at_signup_and_still_needs_approval() {
     );
     let (token, user) = store.login("bob", PASSWORD).unwrap();
     assert_eq!(user.username, "bob");
-    assert_eq!(user.role, Role::Writer);
+    // 审批只放行、不选类型：通过即普通用户，读写权限按仓库授予。
+    assert_eq!(user.role, Role::User);
 
     // token 版本在审批时递增：审批前签发过的凭证一律失效。
     let session = store.authenticate(&token).unwrap();
@@ -1000,7 +1001,7 @@ fn only_admins_can_see_or_approve_registrations() {
     let store = sb.store();
     let alice = admin(&store);
     store
-        .create_user(&alice, "dave", "赵大", PASSWORD, Role::Writer)
+        .create_user(&alice, "dave", "赵大", PASSWORD, Role::User)
         .unwrap();
     let (token, _) = store.login("dave", PASSWORD).unwrap();
     let dave = store.authenticate(&token).unwrap();
@@ -1009,7 +1010,7 @@ fn only_admins_can_see_or_approve_registrations() {
     let err = store.list_registrations(&dave, None, 10).unwrap_err();
     assert_eq!(err.code, ErrorCode::PermissionDenied);
     let err = store
-        .approve_registration(&dave, &reg.info.request_id, Role::Writer)
+        .approve_registration(&dave, &reg.info.request_id)
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::PermissionDenied);
 
@@ -1090,7 +1091,7 @@ fn quota_expansion_adds_one_fixed_step() {
     let store = sb.store();
     let alice = admin(&store);
     store
-        .create_user(&alice, "heidi", "何迪", PASSWORD, Role::Writer)
+        .create_user(&alice, "heidi", "何迪", PASSWORD, Role::User)
         .unwrap();
     let (token, _) = store.login("heidi", PASSWORD).unwrap();
     let heidi = store.authenticate(&token).unwrap();
@@ -1152,7 +1153,7 @@ fn repo_request_rejects_duplicates_and_limits_visibility() {
     let store = sb.store();
     let alice = admin(&store);
     store
-        .create_user(&alice, "grace", "周洁", PASSWORD, Role::Writer)
+        .create_user(&alice, "grace", "周洁", PASSWORD, Role::User)
         .unwrap();
     let (token, _) = store.login("grace", PASSWORD).unwrap();
     let grace = store.authenticate(&token).unwrap();
@@ -1260,7 +1261,7 @@ fn pat_cannot_exceed_the_owner_role() {
     let store = sb.store();
     let alice = admin(&store);
     store
-        .create_user(&alice, "henry", "吴涵", PASSWORD, Role::Readonly)
+        .create_user(&alice, "henry", "吴涵", PASSWORD, Role::User)
         .unwrap();
     let (token, _) = store.login("henry", PASSWORD).unwrap();
     let henry = store.authenticate(&token).unwrap();
@@ -1308,7 +1309,7 @@ fn repo_with_team(
         ("carol", RepoMemberRole::Reader),
     ] {
         store
-            .create_user(&alice, name, "成员", PASSWORD, Role::Writer)
+            .create_user(&alice, name, "成员", PASSWORD, Role::User)
             .unwrap();
         store.add_member(&alice, &repo.repo_id, name, role).unwrap();
         let (token, _) = store.login(name, PASSWORD).unwrap();
@@ -1415,7 +1416,7 @@ fn repo_quota_override_can_be_set_and_inherited() {
     let store = sb.store();
     let (alice, repo_id, _) = repo_with_team(&sb, &store);
     store
-        .create_user(&alice, "bob2", "普通用户", PASSWORD, Role::Writer)
+        .create_user(&alice, "bob2", "普通用户", PASSWORD, Role::User)
         .unwrap();
     let (token, _) = store.login("bob2", PASSWORD).unwrap();
     let bob2 = store.authenticate(&token).unwrap();
@@ -1572,7 +1573,7 @@ fn purged_paths_are_member_only() {
     let store = sb.store();
     let (alice, repo_id, _, _) = seed_monthly_repo(&sb, &store);
     store
-        .create_user(&alice, "outsider", "路人", PASSWORD, Role::Writer)
+        .create_user(&alice, "outsider", "路人", PASSWORD, Role::User)
         .unwrap();
     let (token, _) = store.login("outsider", PASSWORD).unwrap();
     let outsider = store.authenticate(&token).unwrap();
@@ -1704,7 +1705,7 @@ fn retention_policy_validates_pattern_and_requires_a_limit() {
 
     // 只有 owner / maintainer 能配策略。
     store
-        .create_user(&alice, "carol2", "王佳", PASSWORD, Role::Writer)
+        .create_user(&alice, "carol2", "王佳", PASSWORD, Role::User)
         .unwrap();
     store
         .add_member(&alice, &repo_id, "carol2", RepoMemberRole::Writer)
@@ -1842,7 +1843,7 @@ fn grace_days_must_be_set_by_a_writer() {
     let store = sb.store();
     let (alice, repo_id, _, _) = seed_monthly_repo(&sb, &store);
     store
-        .create_user(&alice, "reader2", "只读", PASSWORD, Role::Readonly)
+        .create_user(&alice, "reader2", "只读", PASSWORD, Role::User)
         .unwrap();
     store
         .add_member(&alice, &repo_id, "reader2", RepoMemberRole::Reader)
@@ -1999,7 +2000,7 @@ fn first_registration_is_automatically_an_admin() {
 
     // 自动批准过的申请不能被重复审批。
     let err = store
-        .approve_registration(&session, &reg.info.request_id, Role::Writer)
+        .approve_registration(&session, &reg.info.request_id)
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::ApprovalNotFound);
 
@@ -2040,7 +2041,8 @@ fn first_ldap_login_is_admin_and_group_mapping_only_applies_to_new_users() {
     let sb = Sandbox::new("first-ldap");
     let store = sb.store();
     let mut cfg = ldap_fixture();
-    cfg.group_roles = vec![("cn=writers,dc=example,dc=com".into(), Role::Writer)];
+    // 全局身份只有两种，组映射能给的只有管理员。
+    cfg.group_roles = vec![("cn=admins,dc=example,dc=com".into(), Role::Admin)];
     store.set_ldap_config(None, &cfg).unwrap();
 
     // 目录里第一个登录的人：无论属于哪个组，都是管理员。
@@ -2048,19 +2050,19 @@ fn first_ldap_login_is_admin_and_group_mapping_only_applies_to_new_users() {
     assert_eq!(first.role, Role::Admin);
     assert_eq!(store.authenticate(&token).unwrap().role, Role::Admin);
 
-    // 之后 JIT 建号按组映射给初始角色；没命中的一律只读。
-    let (_, writer) = store
-        .login_ldap(&dir_user("bob", &["cn=writers,dc=example,dc=com"]))
+    // 之后 JIT 建号按组映射给初始身份；没命中的一律普通用户。
+    let (_, mapped) = store
+        .login_ldap(&dir_user("bob", &["cn=admins,dc=example,dc=com"]))
         .unwrap();
-    assert_eq!(writer.role, Role::Writer);
-    let (_, reader) = store.login_ldap(&dir_user("carol", &[])).unwrap();
-    assert_eq!(reader.role, Role::Readonly);
+    assert_eq!(mapped.role, Role::Admin);
+    let (_, plain) = store.login_ldap(&dir_user("carol", &[])).unwrap();
+    assert_eq!(plain.role, Role::User);
 
-    // 已有账号再次登录只刷新姓名 / DN，组变动不会把引导管理员降级。
+    // 已有账号的再次登录只刷新姓名 / DN：先建号后加组也不会被提权。
     let (_, again) = store
-        .login_ldap(&dir_user("alice", &["cn=writers,dc=example,dc=com"]))
+        .login_ldap(&dir_user("carol", &["cn=admins,dc=example,dc=com"]))
         .unwrap();
-    assert_eq!(again.role, Role::Admin);
+    assert_eq!(again.role, Role::User);
 
     // 目录账号不存本地口令：本地登录会明确提示走目录登录。
     let err = store.login("alice", PASSWORD).unwrap_err();
@@ -2069,12 +2071,12 @@ fn first_ldap_login_is_admin_and_group_mapping_only_applies_to_new_users() {
 
 #[test]
 fn registration_and_ldap_share_a_single_first_user_slot() {
-    // 注册先占了名额：之后第一个 LDAP 用户必须按普通规则（只读）建号。
+    // 注册先占了名额：之后第一个 LDAP 用户必须按普通规则（普通用户）建号。
     let sb = Sandbox::new("first-slot-register");
     let store = sb.store();
     store.register("alice", "张爱丽", PASSWORD, "").unwrap();
     let (_, via_ldap) = store.login_ldap(&dir_user("bob", &[])).unwrap();
-    assert_eq!(via_ldap.role, Role::Readonly);
+    assert_eq!(via_ldap.role, Role::User);
 
     // 反过来：LDAP 先登录成管理员，之后注册的人只能等审批。
     let sb = Sandbox::new("first-slot-ldap");
@@ -2120,7 +2122,7 @@ fn ldap_config_requires_admin_when_called_over_the_network_path() {
     let store = sb.store();
     let alice = admin(&store);
     store
-        .create_user(&alice, "dave", "赵大", PASSWORD, Role::Writer)
+        .create_user(&alice, "dave", "赵大", PASSWORD, Role::User)
         .unwrap();
     let (token, _) = store.login("dave", PASSWORD).unwrap();
     let dave = store.authenticate(&token).unwrap();

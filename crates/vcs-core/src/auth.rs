@@ -68,7 +68,7 @@ pub struct Claims {
     pub sub: String,
     /// 用户名，便于日志与审计直接可读
     pub usr: String,
-    /// 全局角色：admin / writer / readonly
+    /// 全局身份：admin / user（读写权限按仓库授予，不在 token 里）
     pub role: String,
     /// token 版本号
     pub tv: i64,

@@ -485,6 +485,7 @@ impl ServerStore {
         conn.execute_batch(SERVER_SCHEMA)
             .map_err(|e| Error::new(ErrorCode::IoError, format!("初始化 server.db 失败：{e}")))?;
         migrate_single_quota(&conn)?;
+        migrate_user_roles(&conn)?;
 
         let secret = load_or_create_secret(&root)?;
         let signer = TokenSigner::new(secret.clone());
@@ -2651,7 +2652,7 @@ impl ServerStore {
         test_ldap_connection(cfg)
     }
 
-    /// 目录组 → 初始角色：命中多条取最高，没命中一律只读。
+    /// 目录组 → 初始身份：命中多条取最高，没命中一律普通用户。
     fn role_for_groups(&self, tx: &Connection, groups: &[String]) -> Result<Role> {
         let mut stmt = tx
             .prepare("SELECT group_dn, role FROM ldap_group_roles")
@@ -2659,7 +2660,7 @@ impl ServerStore {
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             .map_err(db("查询 LDAP 组映射失败"))?;
-        let mut best = Role::Readonly;
+        let mut best = Role::User;
         for row in rows {
             let (dn, role) = row.map_err(db("解析 LDAP 组映射失败"))?;
             if groups.iter().any(|g| g.eq_ignore_ascii_case(&dn)) {
@@ -2909,7 +2910,8 @@ impl ServerStore {
                 Some("系统自动批准：全库第一个账号"),
             )
         } else {
-            ("pending", "readonly", "pending", None, None)
+            // 待审批账号先按普通用户落库；审批只是把状态转 ACTIVE，不改身份。
+            ("pending", "user", "pending", None, None)
         };
 
         tx.execute(
@@ -3059,11 +3061,13 @@ impl ServerStore {
     }
 
     /// 审批通过：账号转 ACTIVE。密码在注册时已由本人设好，审批只是放行。
+    ///
+    /// 审批**不选类型**：通过即普通用户。读写权限按仓库授予，管理员身份只能由管理员
+    /// 事后在用户页调整（`admin_set_user_role`），不在审批时顺手发放。
     pub fn approve_registration(
         &self,
         actor: &Session,
         request_id: &str,
-        role: Role,
     ) -> Result<ApprovedRegistration> {
         self.require_admin(actor, "审批注册申请")?;
         self.expire_stale_requests()?;
@@ -3102,10 +3106,10 @@ impl ServerStore {
             .map_err(db("开启事务失败"))?;
         // 审批通过同时递增 token_version：即使之前有人拿到过该账号的任何凭证，也立即失效。
         tx.execute(
-            "UPDATE users SET status = 'active', role = ?2, approved_by = ?3, approved_at = ?4,
+            "UPDATE users SET status = 'active', role = 'user', approved_by = ?2, approved_at = ?3,
                               token_version = token_version + 1
              WHERE user_id = ?1",
-            params![user_id, role_to_str(role), actor.user_id, now],
+            params![user_id, actor.user_id, now],
         )
         .map_err(db("激活账号失败"))?;
         tx.execute(
@@ -3121,7 +3125,7 @@ impl ServerStore {
             &actor.user_id,
             "user.approve",
             &username,
-            Some(&format!("{{\"role\":\"{}\"}}", role_to_str(role))),
+            Some("{\"role\":\"user\"}"),
             now,
         )?;
         tx.commit().map_err(db("提交审批事务失败"))?;
@@ -5775,6 +5779,86 @@ fn migrate_single_quota(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// 老库升级：全局身份从「只读 / 可写 / 管理员」收敛为「普通用户 / 管理员」。
+///
+/// SQLite 改不了已存在的 CHECK 约束，只能重建表：
+/// `users.role` 与 `ldap_group_roles.role` 里的 `readonly` / `writer` 一律落成 `user`，
+/// `admin` 保持不变。重建期间关掉外键（`pat_tokens.user_id` 指向 `users`），
+/// 否则 DROP 老表会把令牌一起级联删掉。
+fn migrate_user_roles(conn: &Connection) -> Result<()> {
+    let ddl: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| Error::new(ErrorCode::IoError, format!("读取 users 表结构失败：{e}")))?;
+    // 新库（或已经迁移过）的约束里只有 'user' / 'admin'，不需要动。
+    let Some(ddl) = ddl else { return Ok(()) };
+    if !ddl.contains("'readonly'") {
+        return Ok(());
+    }
+
+    conn.pragma_update(None, "foreign_keys", "OFF")
+        .map_err(|e| Error::new(ErrorCode::IoError, format!("临时关闭外键失败：{e}")))?;
+    let outcome = conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE users_upgrade (
+           user_id        TEXT PRIMARY KEY,
+           username       TEXT NOT NULL UNIQUE,
+           display_name   TEXT NOT NULL,
+           source         TEXT NOT NULL CHECK (source IN ('local', 'ldap')),
+           status         TEXT NOT NULL DEFAULT 'pending'
+                          CHECK (status IN ('pending', 'active', 'disabled', 'rejected', 'expired')),
+           role           TEXT NOT NULL DEFAULT 'user'
+                          CHECK (role IN ('user', 'admin')),
+           password_hash  TEXT,
+           ldap_dn        TEXT,
+           token_version  INTEGER NOT NULL DEFAULT 1,
+           failed_logins  INTEGER NOT NULL DEFAULT 0,
+           locked_until   BIGINT,
+           created_at     BIGINT NOT NULL,
+           approved_by    TEXT,
+           approved_at    BIGINT,
+           last_login_at  BIGINT
+         );
+         INSERT INTO users_upgrade
+           (user_id, username, display_name, source, status, role, password_hash, ldap_dn,
+            token_version, failed_logins, locked_until, created_at, approved_by, approved_at,
+            last_login_at)
+         SELECT user_id, username, display_name, source, status,
+                CASE WHEN role = 'admin' THEN 'admin' ELSE 'user' END,
+                password_hash, ldap_dn, token_version, failed_logins, locked_until,
+                created_at, approved_by, approved_at, last_login_at
+         FROM users;
+         DROP TABLE users;
+         ALTER TABLE users_upgrade RENAME TO users;
+         CREATE INDEX IF NOT EXISTS idx_users_status ON users (status, source);
+         CREATE INDEX IF NOT EXISTS idx_users_ldap_dn ON users (ldap_dn);
+         CREATE TABLE ldap_group_roles_upgrade (
+           group_dn   TEXT PRIMARY KEY,
+           role       TEXT NOT NULL CHECK (role IN ('user', 'admin')),
+           updated_at BIGINT NOT NULL
+         );
+         INSERT INTO ldap_group_roles_upgrade (group_dn, role, updated_at)
+         SELECT group_dn, CASE WHEN role = 'admin' THEN 'admin' ELSE 'user' END, updated_at
+         FROM ldap_group_roles;
+         DROP TABLE ldap_group_roles;
+         ALTER TABLE ldap_group_roles_upgrade RENAME TO ldap_group_roles;
+         COMMIT;",
+    );
+    // 失败时先把事务回滚，否则连接会停在未结束的事务里。
+    if outcome.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    // 无论成败都要把外键开关恢复，后续业务依赖它。
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|e| Error::new(ErrorCode::IoError, format!("恢复外键失败：{e}")))?;
+    outcome.map_err(|e| Error::new(ErrorCode::IoError, format!("升级全局身份字段失败：{e}")))?;
+    Ok(())
+}
+
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn
         .prepare(&format!("PRAGMA table_info({table})"))
@@ -5946,16 +6030,16 @@ fn describe_password_issues(issues: &[core_types::PasswordPolicyError]) -> Strin
 fn role_to_str(role: Role) -> &'static str {
     match role {
         Role::Admin => "admin",
-        Role::Writer => "writer",
-        Role::Readonly => "readonly",
+        Role::User => "user",
     }
 }
 
 fn parse_role(s: &str) -> Result<Role> {
     match s {
         "admin" => Ok(Role::Admin),
-        "writer" => Ok(Role::Writer),
-        "readonly" => Ok(Role::Readonly),
+        // 老库里的 'readonly' / 'writer' 都是普通用户：读写权限现在按仓库授予，
+        // 全局身份只剩「普通用户 / 管理员」两种。
+        "user" | "readonly" | "writer" => Ok(Role::User),
         other => Err(Error::new(
             ErrorCode::InvalidCredentials,
             format!("未知角色：{other}"),
@@ -6110,9 +6194,8 @@ fn first_user_slot(tx: &Connection) -> Result<bool> {
 
 fn role_rank(role: Role) -> u8 {
     match role {
-        Role::Readonly => 1,
-        Role::Writer => 2,
-        Role::Admin => 3,
+        Role::User => 1,
+        Role::Admin => 2,
     }
 }
 

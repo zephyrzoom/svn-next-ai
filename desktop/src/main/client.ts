@@ -61,7 +61,7 @@ export const ErrorCode = {
 
 export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode];
 
-/** 目录组 → 全局角色（role 与 proto 的 Role 一致：1 只读 / 2 可写 / 3 管理员）。 */
+/** 目录组 → 全局身份（role 与 proto 的 Role 一致：1 普通用户 / 3 管理员）。 */
 export interface LdapGroupRoleDto {
   groupDn: string;
   role: number;
@@ -820,13 +820,11 @@ export class VcsClient {
   /**
    * 审批通过注册。
    *
-   * 审批只做放行：申请人注册时设好的密码就是登录口令，服务端不再回传任何凭证。
+   * 审批只做放行、不选身份：通过即普通用户，申请人注册时设好的密码就是登录口令，
+   * 服务端不再回传任何凭证。
    */
-  async approveRegistration(requestId: string, role: number): Promise<{ userId: string }> {
-    const resp = await this.invoke<any>(this.auth, 'approveRegistration', {
-      requestId,
-      role,
-    });
+  async approveRegistration(requestId: string): Promise<{ userId: string }> {
+    const resp = await this.invoke<any>(this.auth, 'approveRegistration', { requestId });
     assertOk(resp.status);
     return { userId: resp.userId as string };
   }

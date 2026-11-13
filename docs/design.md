@@ -217,7 +217,7 @@ LDAP 首次登录成功 ──────────────────�
 ```
 
 - `PENDING` / `REJECTED` / `EXPIRED` / `DISABLED` 一律不可登录，返回 `ERROR_CODE_ACCOUNT_PENDING` 等明确错误码，客户端给友好提示而不是反复报「密码错误」。
-- 审批通过时分配角色（默认只读，管理员可指定）。**密码在注册时就由本人设置并写库**：审批只是放行，不再有「先开通、后激活」两段式，也就没有一次性链接需要转交。
+- 审批通过只放行、不选类型：通过即普通用户（读写权限按仓库授予，见 §35）。**密码在注册时就由本人设置并写库**：审批只是放行，不再有「先开通、后激活」两段式，也就没有一次性链接需要转交。
 - **首位用户引导（本轮定稿）**：全库第一个账号自动成为 `admin`，无需审批、无需预置 bootstrap 管理员。注册与 LDAP 首次登录共用 `first_user_slot()`：在 `BEGIN IMMEDIATE` 写事务内判定「用户表为空且没有引导审计记录」，谁先提交谁拿走名额，跨 CLI / gRPC 进程互斥。引导记录落 `audit_log`（`user.first_admin.register` / `user.first_admin.ldap`），即便删掉首用户也不会让第二个人再抢注。
 - 首位注册者同样在提交时设好密码：申请单直接 `approved`，注册完即可登录，不需要任何激活步骤。
 - `init-admin` 降级为「可选的预置管理员 + 首位账号救援」：只在没有可登录管理员时可用；同名本地账号没有可用口令（旧流程遗留）时重置口令并提权，避免全库锁死。
@@ -240,7 +240,7 @@ LDAP 首次登录成功 ──────────────────�
 - 必须 LDAPS 或 StartTLS，禁止明文 bind；服务账号只读、最小权限。
 - `ldap_config.bind_password_enc` 用 `vcs_core::auth::seal_secret` 加密（HMAC-SHA256 keystream + encrypt-then-MAC，密钥取自 `server.secret` 并做域分隔），读取接口 `LdapPublicConfig` 恒不回传明文；`UpdateLdapConfig` 的 `bind_password` 留空表示沿用已存密码；`TestLdapConnection` 供管理员验证配置。
 - **降级策略**：LDAP 不可用时，本地管理员与本地账号仍能登录，避免全员锁死；LDAP 登录返回 `ERROR_CODE_LDAP_UNAVAILABLE`，绝不退化成「校验通过」。用户不存在与口令错误统一返回 `INVALID_CREDENTIALS`，不泄露账号是否存在。
-- **首次登录免审批（已定稿）**：LDAP 用户不走自助注册审批，bind 成功即 JIT 创建 `ACTIVE` 本地映射并写审计。**首个目录用户自动成为 `admin`**（与注册共用引导名额）；之后的组 → 角色映射由 `ldap_group_roles` 配置，命中多条取最高、未命中 `readonly`，且**只在 JIT 建号时生效**——已有账号角色以本地为准，避免目录侧组调整把引导管理员悄悄降级。
+- **首次登录免审批（已定稿）**：LDAP 用户不走自助注册审批，bind 成功即 JIT 创建 `ACTIVE` 本地映射并写审计。**首个目录用户自动成为 `admin`**（与注册共用引导名额）；之后的组 → 身份映射由 `ldap_group_roles` 配置（只有 `admin` / `user` 两种取值），命中多条取最高、未命中 `user`，且**只在 JIT 建号时生效**——已有账号身份以本地为准，避免目录侧组调整把引导管理员悄悄降级。
 - 目录侧只读取用户名（`attr_username`）与姓名（`attr_display_name`），不再读取邮箱属性；LDAP 账号不受 8.4 的本地密码策略约束，密码由目录服务自行管理。
 - 仍待补：目录连接池、嵌套组解析、真机目录集成测试。当前自动化覆盖 filter 转义、配置校验、故障降级，以及注入 `DirectoryUser` 的 JIT / 首位规则 / gRPC 端到端首用户注册。
 
@@ -1230,14 +1230,14 @@ bootstrap 管理员（CLI 直连存储根）→ 启动 vcs serve（真实端口�
 | 登录页 | 「本地账号 / LDAP 账号」tab、用户名 / 密码（默认 30 天免登录，无勾选框）、申请注册（用户名 / 姓名 / 密码 / 理由）、齿轮图标 ⚙（服务器地址设置，平时不展示地址） |
 | 主界面顶栏 | 当前用户、会话到期提示、「退出登录」（不展示服务端地址） |
 | 仓库面板 | 管理员：直通新建；普通用户：提交建库申请（仓库名 + 用途说明） |
-| 审批台（仅管理员） | 待审批注册（可选角色、只放行不发凭证、拒绝需填原因）、待审批建库（通过 / 拒绝） |
+| 审批台（仅管理员） | 待审批注册（只放行、通过即普通用户、拒绝需填原因）、待审批建库（通过 / 拒绝） |
 
 ### 23.3 冒烟新增链路
 
 ```
-register(bob) → 待审批列表里能看到 → approve（role=writer）
+register(bob) → 待审批列表里能看到 → approve（不选类型，通过即普通用户）
 → register 直设密码 → 未审批登录被拒 → 审批后同一密码可登录
-→ bob 登录成功（role=2）
+→ bob 登录成功（role=1，普通用户）
 → bob 申请仓库 bob-repo → 审批前 listRepos 看不到
 → 管理员在待审批列表里看到 → approve → bob 的 listRepos 出现该仓库
 → bob getHead 成功（r0，owner 身份）
@@ -1730,3 +1730,40 @@ checkout → Rust 工具链 + 缓存 → Node 22 + npm 缓存
 - 登录令牌存浏览器 `localStorage`（请求走 `Authorization` 头而非 Cookie，因此没有 CSRF 面），但没有服务端会话撤销；停用账号靠 `token_version` 立即失效。
 - 用户列表 / 审批列表是单次上限查询（500 / 200 条），没有分页与搜索。
 - 管理端没有真实浏览器自动化用例，当前用 HTTP 层冒烟覆盖；`vcs serve` 的 `--admin-listen :0` 场景没有对外暴露实际绑定端口。
+
+## 35. 全局身份收敛为「普通用户 / 管理员」（2026-11-13）
+
+原来的 `Role { Readonly, Writer, Admin }` 把「能不能写」当成了全局身份，和逐仓库的成员角色（`owner / maintainer / writer / reader`）叠在一起，同一个概念说了两遍：一个 `writer` 身份的账号在没被加入的仓库里照样什么都不能做，而一个 `readonly` 身份的账号只要成了某仓库的 owner 就照样能写。本轮把全局身份收敛成只有两种，读写权限**只**由成员角色决定。
+
+### 35.1 模型
+
+| 层 | 取值 | 决定什么 |
+| --- | --- | --- |
+| 全局身份 `Role` | `User`（普通用户）/ `Admin`（管理员） | 能否做**全局治理**：审批注册与建库、用户启停与改身份、LDAP 配置、直通建库、配额核定、Web 管理端登录。与仓库读写无关 |
+| 仓库成员角色 `RepoMemberRole` | `owner` / `maintainer` / `writer` / `reader` | **这个仓库里能做什么**：检出、提交、清理、管成员。逐仓库独立授予 |
+
+### 35.2 改动点
+
+| 位置 | 改动 |
+| --- | --- |
+| `crates/vcs-core/src/lib.rs` | `Role` 只留 `User`（默认）/ `Admin`；新增 `is_admin()` |
+| `proto/repo.proto` | `Role { ROLE_UNSPECIFIED, ROLE_USER=1, ROLE_ADMIN=3 }`，`ROLE_WRITER` 的编号 2 标 `reserved`；`ApproveRegistrationRequest.role` 标 `reserved 2` |
+| `schema/server.sql` | `users.role` 默认 `user`、约束 `IN ('user','admin')`；`ldap_group_roles.role` 同 |
+| `crates/vcs-server/src/lib.rs` | `role_to_str` / `parse_role`（老值 `readonly` / `writer` 统一读成 `user`）/ `role_rank`；`approve_registration(actor, request_id)` 去掉角色参数，落库固定 `role='user'`；注册待审账号也按 `user` 建；LDAP 组映射未命中给 `User`。新增 `migrate_user_roles()` 老库升级 |
+| `crates/vcs-grpc/src/{lib,admin}.rs` | 枚举转换按两个取值；`ApproveRegistration` 不再读角色；`/api/registrations/:id/approve` 不收角色；LDAP 组映射文案改为 `组DN=admin|user` |
+| `crates/vcs-cli/src/main.rs` | `register-approve <id>`（去掉 `--role`）、`user-create --role user|admin`（默认 `user`） |
+| 管理端页面 | 审批台注册卡片去掉角色下拉；用户页「身份」下拉只有普通用户 / 管理员；直接建号的「身份」同 |
+| 桌面端 | `client.approveRegistration(requestId)` 去掉角色参数；LDAP 组映射 DTO 注释改为 1 普通用户 / 3 管理员 |
+
+### 35.3 老库升级
+
+SQLite 改不了已存在的 `CHECK`，所以 `migrate_user_roles()` 重建 `users` 与 `ldap_group_roles` 两张表：`readonly` / `writer` → `user`，`admin` 保持。重建期间临时 `PRAGMA foreign_keys=OFF`（`pat_tokens.user_id` 指向 `users`，不关掉会级联删令牌），结束后恢复并重建两个索引。检测方式是读 `sqlite_master` 里 `users` 的 DDL，含 `'readonly'` 才迁——新库与已迁移库直接跳过，重复启动无副作用。已在 3 用户 + 1 令牌 + 2 条组映射的旧库上验证：身份收敛正确、令牌与索引都在、`foreign_key_check` / `integrity_check` 通过。
+
+### 35.4 验收
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --workspace` | 通过（146 例；LDAP 用例改为验证组映射给 `admin`、先建号后加组不提升） |
+| `npm run smoke` | 通过：审批通过后 `bob` 的 role 断言为 1（普通用户） |
+| `npm run smoke:admin` | 通过：直接建号改用 `role=user`，审批台 / 用户列表无角色下拉 |
+| 旧库升级 | 手工构造旧 schema 的 `server.db` 后 `vcs server info` 触发迁移，幂等 |

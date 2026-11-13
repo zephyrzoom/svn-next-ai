@@ -82,7 +82,7 @@ function stateBadge(state) {
   return `<span class="badge ${cls}">${esc(label)}</span>`;
 }
 
-const ROLE_LABEL = { Admin: '管理员', Writer: '写', Readonly: '只读', admin: '管理员', writer: '写', readonly: '只读' };
+const ROLE_LABEL = { Admin: '管理员', User: '普通用户', admin: '管理员', user: '普通用户' };
 const MEMBER_LABEL = { Owner: 'owner', Maintainer: 'maintainer', Writer: 'writer', Reader: 'reader' };
 
 function empty(text) {
@@ -194,9 +194,6 @@ async function loadApprovals() {
         <div class="meta">申请理由：${esc(r.reason || '—')} · ${esc(fmtTime(r.submitted_at))}</div>
       </div>
       <div class="actions">
-        <select data-field="role">
-          <option value="readonly">只读</option><option value="writer">写</option><option value="admin">管理员</option>
-        </select>
         <button class="mini primary" data-action="approve-reg">通过</button>
         <button class="mini danger" data-action="reject-reg">拒绝</button>
       </div>
@@ -245,8 +242,8 @@ $('reg-list').addEventListener('click', (event) => {
   const id = row.dataset.id;
   void act(async () => {
     if (button.dataset.action === 'approve-reg') {
-      await post(`/registrations/${encodeURIComponent(id)}/approve`, { role: field(row, 'role') });
-      toast('已通过，申请人可直接用注册时设置的密码登录');
+      await post(`/registrations/${encodeURIComponent(id)}/approve`, {});
+      toast('已通过，申请人成为普通用户，可直接用注册时设置的密码登录');
     } else {
       const reason = window.prompt('拒绝原因（必填）', '');
       if (!reason) return;
@@ -315,11 +312,10 @@ async function loadUsers() {
       <td class="muted">${esc(fmtTime(u.last_login_at))}</td>
       <td><div class="actions">
         <select data-field="role">
-          <option value="readonly" ${u.role === 'readonly' ? 'selected' : ''}>只读</option>
-          <option value="writer" ${u.role === 'writer' ? 'selected' : ''}>写</option>
+          <option value="user" ${u.role !== 'admin' ? 'selected' : ''}>普通用户</option>
           <option value="admin" ${u.role === 'admin' ? 'selected' : ''}>管理员</option>
         </select>
-        <button class="mini" data-action="role">改角色</button>
+        <button class="mini" data-action="role">改身份</button>
         <button class="mini ${u.status === 'active' ? 'danger' : ''}" data-action="status">
           ${u.status === 'active' ? '停用' : '启用'}
         </button>
@@ -335,7 +331,7 @@ $('users-table').addEventListener('click', (event) => {
   void act(async () => {
     if (button.dataset.action === 'role') {
       await post(`/users/${encodeURIComponent(id)}/role`, { role: field(row, 'role') });
-      toast('角色已更新，该用户的登录令牌已失效');
+      toast('身份已更新，该用户的登录令牌已失效');
     } else {
       const active = button.textContent.trim() === '启用';
       await post(`/users/${encodeURIComponent(id)}/status`, { active });

@@ -159,8 +159,8 @@ enum Cmd {
         name: String,
         #[arg(long)]
         password: Option<String>,
-        /// 全局角色：admin / writer / readonly
-        #[arg(long, default_value = "writer")]
+        /// 全局身份：user（普通用户）/ admin（管理员）；读写权限在仓库成员里授予
+        #[arg(long, default_value = "user")]
         role: String,
     },
     /// 添加仓库成员
@@ -271,13 +271,8 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// 审批通过注册申请（仅管理员；申请人用注册时的密码登录）
-    RegisterApprove {
-        request_id: String,
-        /// readonly / writer / admin
-        #[arg(long, default_value = "readonly")]
-        role: String,
-    },
+    /// 审批通过注册申请（仅管理员；只放行，通过即普通用户，申请人用注册时的密码登录）
+    RegisterApprove { request_id: String },
     /// 驳回注册申请（仅管理员，必须写原因）
     RegisterReject {
         request_id: String,
@@ -554,7 +549,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             save_token(&store_root, &token, &user.username)?;
             println!(
-                "登录成功：{}（{}，角色 {}）",
+                "登录成功：{}（{}，身份 {}）",
                 user.display_name,
                 user.username,
                 role_label(user.role)
@@ -838,7 +833,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 parse_global_role(&role)?,
             )?;
             println!(
-                "已创建账号：{}（{}，角色 {}）",
+                "已创建账号：{}（{}，身份 {}）",
                 user.username,
                 user.display_name,
                 role_label(user.role)
@@ -1230,12 +1225,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Cmd::RegisterApprove { request_id, role } => {
+        Cmd::RegisterApprove { request_id } => {
             let store = ServerStore::open(&store_root)?;
             let session = require_session(&store, &store_root)?;
-            let approved =
-                store.approve_registration(&session, &request_id, parse_global_role(&role)?)?;
+            let approved = store.approve_registration(&session, &request_id)?;
             println!("已审批通过，账号 user_id = {}", approved.user_id);
+            println!("通过即普通用户；读写权限请用 vcs member-add / member-set-role 按仓库授予。");
             println!("申请人可直接用注册时设置的密码登录，无需再发放任何链接。");
         }
 
@@ -1278,9 +1273,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 c.attr_username, c.attr_display_name
             );
             if c.group_roles.is_empty() {
-                println!("组 → 角色映射：无（JIT 用户默认 readonly）");
+                println!("组 → 身份映射：无（JIT 用户默认普通用户）");
             } else {
-                println!("组 → 角色映射：");
+                println!("组 → 身份映射：");
                 for (dn, role) in &c.group_roles {
                     println!("  {dn} → {}", role_label(*role));
                 }
@@ -1762,8 +1757,7 @@ fn prompt(label: &str) -> Result<String, Box<dyn std::error::Error>> {
 fn role_label(role: vcs_core::Role) -> &'static str {
     match role {
         vcs_core::Role::Admin => "admin",
-        vcs_core::Role::Writer => "writer",
-        vcs_core::Role::Readonly => "readonly",
+        vcs_core::Role::User => "user",
     }
 }
 
@@ -1773,16 +1767,16 @@ fn parse_group_role_entry(
     // DN 里本身带 '='，所以从最后一个 '=' 切角色名。
     let (dn, role) = value
         .rsplit_once('=')
-        .ok_or("组映射格式应为 <group_dn>=<admin|writer|readonly>")?;
+        .ok_or("组映射格式应为 <group_dn>=<admin|user>")?;
     Ok((dn.to_string(), parse_global_role(role)?))
 }
 
 fn parse_global_role(value: &str) -> Result<vcs_core::Role, Box<dyn std::error::Error>> {
     match value {
         "admin" => Ok(vcs_core::Role::Admin),
-        "writer" => Ok(vcs_core::Role::Writer),
-        "readonly" => Ok(vcs_core::Role::Readonly),
-        other => Err(format!("未知全局角色：{other}（可选 admin / writer / readonly）").into()),
+        // 老习惯的 writer / readonly 一律按普通用户处理：读写权限现在按仓库授予。
+        "user" | "writer" | "readonly" => Ok(vcs_core::Role::User),
+        other => Err(format!("未知全局身份：{other}（可选 admin / user）").into()),
     }
 }
 

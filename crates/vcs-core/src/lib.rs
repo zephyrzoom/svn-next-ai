@@ -319,17 +319,26 @@ pub enum RegistrationStatus {
     Expired,
 }
 
+/// 全局身份：只有「普通用户」与「管理员」两种。
+///
+/// 读写权限**不在**这里——那是逐仓库授予的成员角色（[`RepoMemberRole`]）：
+/// 同一个账号可以在 A 仓库是 `writer`、在 B 仓库只是 `reader`，与它是不是管理员无关。
+/// 管理员唯一多出来的能力是全局治理（审批、用户管理、目录配置、直通建库、配额核定）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Role {
     #[default]
-    Readonly,
-    Writer,
+    User,
     Admin,
 }
 
 impl Role {
     /// 注册审批与用户管理接口仅限管理员。
     pub fn can_approve_registrations(&self) -> bool {
+        matches!(self, Self::Admin)
+    }
+
+    /// 是否管理员（全局治理身份）。
+    pub fn is_admin(&self) -> bool {
         matches!(self, Self::Admin)
     }
 }
@@ -622,7 +631,10 @@ mod tests {
         assert!(!AccountStatus::Disabled.may_login());
         assert!(!AccountStatus::Rejected.may_login());
         assert!(Role::Admin.can_approve_registrations());
+        assert!(Role::Admin.is_admin());
         assert!(!Role::default().can_approve_registrations());
+        assert_eq!(Role::default(), Role::User, "默认身份是普通用户");
+        assert!(!Role::User.is_admin());
     }
 
     #[test]

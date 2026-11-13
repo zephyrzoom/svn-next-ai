@@ -486,7 +486,7 @@ async fn out_of_date_and_membership_are_reported_in_status() {
         let store = ServerStore::open(h.root.join("store")).unwrap();
         let session = store.authenticate(&token).unwrap();
         store
-            .create_user(&session, "bob", "李波", PASSWORD, vcs_core::Role::Writer)
+            .create_user(&session, "bob", "李波", PASSWORD, vcs_core::Role::User)
             .unwrap();
     }
     let bob = login(&h, "bob", PASSWORD).await;
@@ -635,7 +635,6 @@ async fn admin_approval_and_purge_over_grpc() {
         .approve_registration(bearer(
             Request::new(pb::ApproveRegistrationRequest {
                 request_id: reg.request_id.clone(),
-                role: pb::Role::Writer as i32,
             }),
             &token,
         ))
@@ -832,7 +831,6 @@ async fn member_and_repo_admin_rpcs_work_over_the_wire() {
         .approve_registration(bearer(
             Request::new(pb::ApproveRegistrationRequest {
                 request_id: reg.request_id,
-                role: pb::Role::Writer as i32,
             }),
             &alice,
         ))

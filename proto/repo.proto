@@ -517,10 +517,13 @@ enum RegistrationStatus {
   REGISTRATION_STATUS_EXPIRED = 4;
 }
 
+// 全局身份只有两种：普通用户与管理员。读写权限不在这里，而是逐仓库授予的
+// 成员角色（RepoMemberRole）：同一账号在 A 仓库可写、在 B 仓库只读，与身份无关。
 enum Role {
   ROLE_UNSPECIFIED = 0;
-  ROLE_READONLY = 1;
-  ROLE_WRITER = 2;
+  ROLE_USER = 1;
+  // 原 ROLE_WRITER：写权限已下放到仓库成员角色，编号不复用。
+  reserved 2;
   ROLE_ADMIN = 3;
 }
 
@@ -573,6 +576,7 @@ message RegisterResponse {
   reserved 4, 5;
   // 首位注册者会被自动批准为管理员：审批通过即可用注册时的密码登录。
   bool auto_approved = 6;
+  // 仅 auto_approved 时有意义（ROLE_ADMIN）；普通申请留 ROLE_UNSPECIFIED。
   Role granted_role = 7;
 }
 
@@ -610,7 +614,8 @@ message ListRegistrationsResponse {
 
 message ApproveRegistrationRequest {
   string request_id = 1;
-  Role role = 2;
+  // 审批只是放行：通过即普通用户，不再选角色。要提管理员走 SetUserRole。
+  reserved 2;
 }
 
 message ApproveRegistrationResponse {
@@ -692,8 +697,8 @@ message RevokePatResponse {
   Status status = 1;
 }
 
-// 目录组 → 全局角色。只在 JIT 建号时决定初始角色，已有账号的角色以本地为准，
-// 避免目录侧组调整意外把引导管理员降级。
+// 目录组 → 全局身份（ROLE_ADMIN / ROLE_USER）。只在 JIT 建号时决定初始身份，
+// 已有账号以本地为准，避免目录侧组调整意外把引导管理员降级。
 message GroupRole {
   string group_dn = 1;
   Role role = 2;
@@ -753,6 +758,7 @@ message SetUserStatusResponse {
   Status status = 1;
 }
 
+// 调整全局身份：只有 ROLE_USER / ROLE_ADMIN 两个取值，读写权限请在仓库成员里授予。
 message SetUserRoleRequest {
   string user_id = 1;
   Role role = 2;

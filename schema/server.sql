@@ -288,6 +288,8 @@ CREATE INDEX IF NOT EXISTS idx_audit_repo_time ON audit_log (repo_id, at);
 -- 用户字段固定三项：username（用户名）、password_hash（密码哈希）、display_name（姓名）。
 -- LDAP 用户不存密码，本地用户存 Argon2id 哈希（含随机 salt）。
 -- 本地密码须 >= 8 位且同时含数字、大写、小写、特殊字符；服务端在 SetPassword 强制校验。
+-- role 只有 'user'（普通用户）与 'admin'（管理员）两种：读写权限不是全局的，而是
+-- 由 repo_members.role 逐仓库授予（owner / maintainer / writer / reader）。
 -- token_version 在禁用账号或改角色时递增，JWT 携带该版本号实现即时失效。
 CREATE TABLE IF NOT EXISTS users (
   user_id        TEXT PRIMARY KEY,
@@ -296,8 +298,8 @@ CREATE TABLE IF NOT EXISTS users (
   source         TEXT NOT NULL CHECK (source IN ('local', 'ldap')),
   status         TEXT NOT NULL DEFAULT 'pending'
                  CHECK (status IN ('pending', 'active', 'disabled', 'rejected', 'expired')),
-  role           TEXT NOT NULL DEFAULT 'readonly'
-                 CHECK (role IN ('readonly', 'writer', 'admin')),
+  role           TEXT NOT NULL DEFAULT 'user'
+                 CHECK (role IN ('user', 'admin')),
   password_hash  TEXT,
   ldap_dn        TEXT,
   token_version  INTEGER NOT NULL DEFAULT 1,
@@ -352,7 +354,7 @@ CREATE TABLE IF NOT EXISTS ldap_config (
 
 CREATE TABLE IF NOT EXISTS ldap_group_roles (
   group_dn   TEXT PRIMARY KEY,
-  role       TEXT NOT NULL CHECK (role IN ('readonly', 'writer', 'admin')),
+  role       TEXT NOT NULL CHECK (role IN ('user', 'admin')),
   updated_at BIGINT NOT NULL
 );
 

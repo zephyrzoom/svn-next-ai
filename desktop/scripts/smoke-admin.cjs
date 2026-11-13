@@ -156,7 +156,7 @@ async function main() {
     step('用户与全局配额');
     res = await api(base, '/api/users', {
       method: 'POST', token,
-      body: { username: 'bob', display_name: '鲍勃', password: 'Bobpass1!', role: 'writer' },
+      body: { username: 'bob', display_name: '鲍勃', password: 'Bobpass1!', role: 'user' },
     });
     check(res.status === 200 && res.data.ok, '直接建号失败');
     const bob = res.data.data.user.user_id;
