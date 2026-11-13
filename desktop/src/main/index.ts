@@ -57,6 +57,12 @@ function createWindow(): void {
   const win = new BrowserWindow({
     width: 1180,
     height: 780,
+    // 下限宽度按内容反推：左侧仓库栏固定 216px，内容区左右 padding 44px、卡片 padding 32px，
+    // 最吃宽度的是冲突编辑器的三列并排（每列 minmax(0,1fr)）——960 时每列还有约 228px 可编辑；
+    // 再窄下去三列会被压成一条、变更路径和成员行的角色下拉也会互相挤。
+    // 高度下限保证「tab + 变更列表 + 提交区」能同时露出，更长的差异交给内容区滚动。
+    minWidth: 960,
+    minHeight: 640,
     title: 'svn-next',
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
