@@ -176,7 +176,7 @@ async fn remember_me_signs_a_30_day_session() {
         .unwrap()
         .as_secs() as i64;
 
-    // 不勾「记住我」：12 小时，CLI / Web 管理端 / 公共机器保持原来的安全边界。
+    // remember_me=false：12 小时，CLI / Web 管理端 / 公共机器保持原来的安全边界。
     let short = h
         .auth()
         .await
@@ -196,7 +196,7 @@ async fn remember_me_signs_a_30_day_session() {
         short.expires_at - now
     );
 
-    // 勾选后：30 天，且这张 token 立刻可用（不是仅仅把数字写大）。
+    // remember_me=true（桌面端默认）：30 天，且这张 token 立刻可用（不是仅仅把数字写大）。
     let long = h
         .auth()
         .await

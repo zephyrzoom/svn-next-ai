@@ -75,7 +75,7 @@ export function loadPrefs(): Prefs {
 /** 一次登录 / 会话恢复要落盘的东西，缺省项表示「保持原样，不覆盖」。 */
 export interface LoginSnapshot {
   token?: string;
-  /** 只在「记住我」登录时传：0 或缺省不改动原来记下的到期时间。 */
+  /** 只在 30 天免登录会话传：0 或缺省不改动原来记下的到期时间。 */
   expiresAt?: number;
   /** 拿到了姓名就刷新缓存；服务端没给（旧版本）时传空以保留旧值。 */
   displayName?: string;
@@ -84,8 +84,8 @@ export interface LoginSnapshot {
 /**
  * 保存登录结果。
  *
- * - 传 `token`：把凭证加密落盘（「记住我」的 30 天会话同时记下 `expiresAt`）；
- * - 不传 `token`：只保留连接信息，清掉凭证——用于「本次会话有效」的登录。
+ * - 传 `token`：把凭证加密落盘（30 天免登录会话同时记下 `expiresAt`）；
+ * - 不传 `token`：只保留连接信息，清掉凭证——没有拿到 token 或无加密能力时走这条。
  *
  * `displayName` 是纯展示用的兜底：`WhoAmI` 在旧服务端上不返回姓名，恢复会话时
  * 就用上次登录缓存的姓名，避免右上角退回显示账号。

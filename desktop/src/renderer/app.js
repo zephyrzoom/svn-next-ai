@@ -8,7 +8,7 @@
  * 界面分两层：启动先显示「登录页」（本地账号 / LDAP 账号两个 tab、注册入口、
  * 服务器地址「设置」），成功后才切到「主界面」。默认服务器地址由打包配置
  * （config.js）注入，用户在设置里改的地址覆盖它并持久化。
- * 勾选 30 天免登录时，主进程用系统加密存储保存凭证，启动时 tryResume 直接恢复会话。
+ * 主进程用系统加密存储保存凭证（默认 30 天免登录，界面无开关），启动时 tryResume 直接恢复会话。
  *
  * 主界面只有一条主线：**仓库**。左侧是仓库列表，选中哪一个，右侧整个工作区就属于它
  * （工作副本 / 提交历史 / 容量三个 tab）。顶部固定一条上下文条，写着当前仓库名、
@@ -277,13 +277,13 @@ async function connect() {
   const target = effectiveTarget();
   const username = el('username').value.trim();
   const password = el('password').value;
-  const rememberMe = el('remember').checked;
   if (!username || !password) {
     authMessage('请填写用户名与密码', 'error');
     return;
   }
+  // 默认就是 30 天免登录：界面不再有勾选框，主进程统一按长期会话签发并加密保存凭证。
   const session = unwrap(
-    await api.connect(target, username, password, state.source, rememberMe),
+    await api.connect(target, username, password, state.source),
     '登录',
   );
   el('password').value = '';
@@ -1076,13 +1076,8 @@ async function bootstrap() {
   if (saved) {
     if (saved.target) state.target = saved.target;
     if (saved.username) el('username').value = saved.username;
+    // 没有加密存储能力时无法免登录：提示由 setAuthMode 统一在登录页给出。
     state.canPersistToken = saved.canPersistToken;
-    if (!saved.canPersistToken) {
-      el('remember').checked = false;
-      el('remember').disabled = true;
-      el('remember-label').textContent =
-        '当前系统不支持加密存储凭证，重启后需重新登录（连接信息仍会保留）';
-    }
   }
   setSource('LOCAL');
   const resumed = await api.tryResume(effectiveTarget());

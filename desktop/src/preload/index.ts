@@ -141,7 +141,7 @@ export interface PrefsDto {
 
 export interface SessionDto {
   user: UserDto;
-  /** 0 表示本次会话有效（没有勾选 30 天免登录）。 */
+  /** 会话到期时间（Unix 秒）；0 只可能是旧版设置里没记住的短期会话。 */
   expiresAt: number;
 }
 
@@ -155,12 +155,12 @@ export interface QuotaDto {
 
 export interface VcsApi {
   // —— 连接与仓库使用 ——
+  /** 桌面端固定 30 天免登录，主进程统一按长期会话签发，无需传 rememberMe。 */
   connect(
     target: string,
     username: string,
     password: string,
     source?: 'LOCAL' | 'LDAP',
-    rememberMe?: boolean,
   ): Promise<Envelope<SessionDto>>;
   disconnect(): Promise<Envelope<null>>;
   /** 上次的连接信息（不含凭证）。 */
@@ -241,8 +241,8 @@ export interface VcsApi {
 }
 
 const api: VcsApi = {
-  connect: (target, username, password, source, rememberMe) =>
-    ipcRenderer.invoke('vcs:connect', target, username, password, source, rememberMe),
+  connect: (target, username, password, source) =>
+    ipcRenderer.invoke('vcs:connect', target, username, password, source),
   disconnect: () => ipcRenderer.invoke('vcs:disconnect'),
   loadPrefs: () => ipcRenderer.invoke('vcs:loadPrefs'),
   tryResume: (target) => ipcRenderer.invoke('vcs:tryResume', target),

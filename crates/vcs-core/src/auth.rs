@@ -21,10 +21,10 @@ use crate::{hash_bytes, Error, ErrorCode, Hash, Result};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// JWT 有效期默认 12 小时；CLI / Web 管理端与未勾选「记住我」的客户端走这条。
+/// JWT 有效期默认 12 小时；CLI / Web 管理端走这条。
 pub const DEFAULT_TOKEN_TTL_SECONDS: i64 = 12 * 60 * 60;
 
-/// 客户端勾选「30 天内免登录」时的会话长度。
+/// 桌面客户端默认的 30 天免登录会话长度。
 ///
 /// 只在桌面端这类把 token 交给系统钥匙串加密保存的客户端开放；服务器依旧无状态，
 /// 禁用账号 / 改角色 / 重置口令会递增 `token_version`，长期 token 同样立即失效。

@@ -100,6 +100,12 @@ function verify({ app, BrowserWindow, ipcMain }) {
       return { ok: true, data: channel === 'vcs:loadPrefs' ? PREFS : null };
     });
   }
+  // 免登录改成默认行为后，界面上已经没有开关可查：直接钉住主进程契约，
+  // 防止某次重构把桌面端登录又退回 12 小时会话。
+  const mainSrc = fs.readFileSync(mainEntry, 'utf8');
+  const fixedLongSession =
+    /const DESKTOP_REMEMBER_ME\s*=\s*true/.test(mainSrc) &&
+    /login\(username, password, source, DESKTOP_REMEMBER_ME\)/.test(mainSrc);
 
   app
     .whenReady()
@@ -149,7 +155,8 @@ function verify({ app, BrowserWindow, ipcMain }) {
             domIds: document.querySelectorAll('[id]').length,
             loginVisible: !document.getElementById('auth-screen').classList.contains('hidden'),
             appHidden: document.getElementById('app-shell').classList.contains('hidden'),
-            rememberChecked: document.getElementById('remember').checked,
+            hasRememberCheckbox: Boolean(document.getElementById('remember')),
+            loginInputs: Array.from(document.querySelectorAll('#login-form input')).map((i) => i.id),
             hasTargetInput: Boolean(document.getElementById('target')),
             settingsHidden: document.getElementById('server-settings').classList.contains('hidden'),
             hasSettingsButton: Boolean(settingsButton),
@@ -276,7 +283,12 @@ function verify({ app, BrowserWindow, ipcMain }) {
         // 启动契约静态检查之外，这里再确认打包注入的默认地址真的到了渲染层。
         默认地址已注入: /^[A-Za-z0-9._:-]+:\d{1,5}$/.test(info.defaultTarget || ''),
         登录页默认可见: info.loginVisible === true && info.appHidden === true,
-        免登录默认勾选: info.rememberChecked === true,
+        // 免登录改为默认行为：登录页不再有勾选框，表单只留用户名与密码。
+        登录页无免登录勾选框: info.hasRememberCheckbox === false,
+        登录表单只有用户名与密码:
+          Array.isArray(info.loginInputs) &&
+          info.loginInputs.join(',') === 'username,password',
+        桌面端固定_30_天长期会话: fixedLongSession,
         左下角显示姓名: identity.whoName === '张爱丽' && identity.inLeftFoot === true,
         顶部条与左下角说明已移除:
           identity.hasTopbar === false &&

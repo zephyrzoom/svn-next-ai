@@ -407,8 +407,9 @@ export class VcsClient {
   }
 
   /**
-   * `source` 决定走本地口令还是目录 bind；`rememberMe` 让服务端签发 30 天会话
-   * （登录页默认勾选）。两者都只影响本次签发，不改变后续请求的鉴权方式。
+   * `source` 决定走本地口令还是目录 bind；`rememberMe` 让服务端签发 30 天会话，
+   * 桌面端登录固定传 true（登录页已无勾选框），CLI / Web 管理端仍是 12 小时。
+   * 两者都只影响本次签发，不改变后续请求的鉴权方式。
    */
   async login(
     username: string,

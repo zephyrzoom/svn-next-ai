@@ -80,6 +80,12 @@ function createWindow(): void {
 
 const NOT_WIRED = '该功能在桌面端不可用，请使用服务端 Web 管理端';
 
+/**
+ * 桌面端登录一律按 30 天长期会话签发：登录页不再提供「免登录」开关，
+ * CLI / Web 管理端仍走服务端的 12 小时默认有效期。
+ */
+const DESKTOP_REMEMBER_ME = true;
+
 function notWired(): Promise<never> {
   return Promise.reject(new Error(NOT_WIRED));
 }
@@ -94,14 +100,13 @@ ipcMain.handle(
     username: string,
     password: string,
     source: 'LOCAL' | 'LDAP' = 'LOCAL',
-    rememberMe = true,
   ) =>
     wrap<{ user: UserInfo; expiresAt: number }>(async () => {
       const next = new VcsClient(target);
       // 登录失败不能把当前已登录的 client 关掉：新连接自己收拾干净。
       let user: UserInfo;
       try {
-        user = await next.login(username, password, source, rememberMe);
+        user = await next.login(username, password, source, DESKTOP_REMEMBER_ME);
       } catch (err) {
         next.close();
         throw err;
@@ -112,18 +117,18 @@ ipcMain.handle(
       // 登录响应带姓名就顺手缓存：旧服务端的 WhoAmI 不返回姓名，恢复会话时要用它兜底。
       // 没拿到（旧服务端）就传 undefined，保留上次的缓存，不要把姓名清掉。
       const displayName = user.displayName || undefined;
-      if (rememberMe && next.tokenValue) {
-        // 「30 天免登录」：凭证加密落盘，并记下到期时间供启动时快速判断。
+      if (next.tokenValue) {
+        // 30 天免登录：凭证加密落盘，并记下到期时间供启动时快速判断。
         saveLogin(target, user.username, {
           token: next.tokenValue,
           expiresAt,
           displayName,
         });
       } else {
-        // 不记住：只留地址、账号与姓名，本机不留任何可复用凭证。
+        // 理论上登录成功必有 token；真没拿到时只留地址、账号与姓名，不落可复用凭证。
         saveLogin(target, user.username, { displayName });
       }
-      return { user, expiresAt: rememberMe ? expiresAt : 0 };
+      return { user, expiresAt };
     }),
 );
 

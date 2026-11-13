@@ -621,7 +621,7 @@ impl AuthService for AuthApi {
         request: Request<pb::LoginRequest>,
     ) -> Result<Response<pb::LoginResponse>, Status> {
         let req = request.into_inner();
-        // 「30 天免登录」是客户端的显式选择：不勾 / CLI / Web 管理端仍是 12 小时。
+        // 桌面客户端默认按 30 天免登录签发（登录页无勾选框）；CLI / Web 管理端仍是 12 小时。
         let ttl = if req.remember_me {
             vcs_core::auth::REMEMBER_ME_TTL_SECONDS
         } else {

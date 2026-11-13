@@ -183,18 +183,6 @@ button.icon-button:focus-visible {
   font-size: 12px;
 }
 
-.auth-form label.check {
-  flex-direction: row;
-  align-items: center;
-  gap: 8px;
-  color: var(--ink);
-}
-
-.auth-form label.check input {
-  width: auto;
-  margin: 0;
-}
-
 #username,
 #password {
   width: 100%;

@@ -623,7 +623,7 @@ impl ServerStore {
         })
     }
 
-    /// 本地登录：默认 12 小时会话（CLI / Web 管理端 / 未勾选「记住我」的客户端）。
+    /// 本地登录：默认 12 小时会话（CLI / Web 管理端）。
     pub fn login(&self, username: &str, password: &str) -> Result<(String, UserInfo)> {
         self.login_with_ttl(username, password, auth::DEFAULT_TOKEN_TTL_SECONDS)
             .map(|(token, _, user)| (token, user))
@@ -632,7 +632,7 @@ impl ServerStore {
     /// 本地登录并指定本次 token 有效期。
     ///
     /// 校验状态机 + 口令，签发带 `token_version` 的 JWT；返回值中间一项是
-    /// `expires_at`（Unix 秒），供客户端展示「免登录到哪天」并在本地到期后直接回登录页。
+    /// `expires_at`（Unix 秒），供客户端在本地判断 30 天免登录会话何时到期并回登录页。
     pub fn login_with_ttl(
         &self,
         username: &str,
