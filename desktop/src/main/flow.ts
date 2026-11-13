@@ -26,6 +26,8 @@ export interface CommitResult {
   modified: number;
   deleted: number;
   pushed: number;
+  /** 实际写进历史的提交信息：用户留空时是自动生成的那一条。 */
+  message: string;
 }
 
 /** 检出到目录：先拿树，再拉对象流，最后铺盘并写基线。 */
@@ -49,15 +51,35 @@ export async function checkoutRepo(
   return { dir, rev: target, files };
 }
 
+/**
+ * 提交信息留空时按变更自动生成一条。
+ *
+ * 单人提交里，写一句「改了什么」常常只是流程税：变更列表本身已经把事实摆在那里。
+ * 界面上允许不填，这里就必须给出可追溯的兜底——历史里看到「修改 3 个文件：新增 1、
+ * 修改 2」总好过一条空白记录。只有一个文件时直接写动作 + 路径，信息量最大。
+ */
+function autoCommitMessage(changes: wc.LocalChange[]): string {
+  const label = { ADD: '新增', MODIFY: '修改', DELETE: '删除' } as const;
+  const count = (kind: 'ADD' | 'MODIFY' | 'DELETE') =>
+    changes.filter((change) => change.kind === kind).length;
+  if (changes.length === 1) {
+    const only = changes[0];
+    return `${label[only.kind] ?? '变更'} ${only.path}`;
+  }
+  const parts: string[] = [];
+  for (const kind of ['ADD', 'MODIFY', 'DELETE'] as const) {
+    const n = count(kind);
+    if (n > 0) parts.push(`${label[kind]} ${n}`);
+  }
+  return `提交 ${changes.length} 个文件（${parts.join('、')}）`;
+}
+
 /** 提交工作副本：采集 → 校验版本 → Begin → 推缺的对象 → Finalize → 刷新基线。 */
 export async function commitWorkingCopy(
   client: VcsClient,
   dir: string,
   message: string,
 ): Promise<CommitResult> {
-  if (!message.trim()) {
-    throw new Error('提交信息不能为空');
-  }
   // 冲突未解决一律拒绝：宁可挡住，也不猜用户想留哪一边（与 CLI 的 `vcs commit` 一致）。
   if (wc.hasConflicts(dir)) {
     const conflicts = wc
@@ -72,6 +94,8 @@ export async function commitWorkingCopy(
   if (changes.length === 0) {
     throw new Error('工作副本没有变更');
   }
+  // 提交信息可以不填：空串（或只有空白）按本次变更自动生成，界面上不必再拦一次。
+  const subject = message.trim() || autoCommitMessage(changes);
 
   const head = await client.getHead(manifest.repoId);
   if (manifest.rev !== head.rev) {
@@ -99,7 +123,7 @@ export async function commitWorkingCopy(
     manifest.repoId,
     manifest.rev,
     changes as ChangePayload[],
-    message,
+    subject,
     estimated,
   );
   try {
@@ -116,6 +140,7 @@ export async function commitWorkingCopy(
       modified: changes.filter((c) => c.kind === 'MODIFY').length,
       deleted: changes.filter((c) => c.kind === 'DELETE').length,
       pushed: toPush.length,
+      message: subject,
     };
   } catch (err) {
     // 失败就显式放弃会话，别把半截上传留给 2 小时 TTL。

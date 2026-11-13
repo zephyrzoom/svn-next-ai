@@ -675,6 +675,23 @@ button.ghost:disabled:hover {
   margin: 0;
 }
 
+/* 标题与按钮不参与挤压：卡片头里只有一个可伸缩的元素（说明文字 / 路径），
+   否则中文标题会被压成一字一行、按钮文案被折成两行。 */
+.card-head h2,
+.card-head button,
+.head-actions {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* 卡片头里跟随的长文本（仓库名、条数）允许收缩并省略，鼠标悬停看完整值 */
+.card-head > .muted {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* 卡片头里只有最后一个非标题元素靠右，其余紧跟标题——避免两个 auto 边距把中间文本推到半空 */
 .card-head > :last-child:not(h2) {
   margin-left: auto;
@@ -711,13 +728,20 @@ button.ghost:disabled:hover {
   flex: 0 0 auto;
 }
 
-/* 差异标题里跟着的长路径：允许收缩并省略，鼠标悬停看完整值（title 由脚本设置） */
-.card-head #diff-path {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+/* 差异标题下的路径单独占一行：长路径换行铺开，不再被省略号截断 */
+.diff-path {
+  margin: -2px 0 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* 没有选中条目时不留空行 */
+.diff-path:empty {
+  display: none;
 }
 
 .row {
@@ -917,6 +941,85 @@ button.ghost:disabled:hover {
 
 .list.candidates {
   max-height: 220px;
+}
+
+/* 搜索下拉：结果浮在输入框下面，不占版面；这里只选人，不含任何权限分类 */
+.combo {
+  position: relative;
+  margin: 8px 0;
+}
+
+.combo > input {
+  width: 100%;
+}
+
+.list.candidates.dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 12;
+  max-height: 240px;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 12px 28px rgba(44, 44, 42, 0.14);
+}
+
+.list.candidates.dropdown li {
+  padding: 7px 8px;
+}
+
+.list.candidates.dropdown li .pick-hint {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--accent);
+}
+
+/* 选中之后才露出「权限 + 添加」：把人选清楚，再决定给什么权限 */
+.picked {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  background: #eef4ef;
+  border: 1px solid #dbe6de;
+  border-radius: 8px;
+}
+
+.picked-who {
+  flex: 1 1 160px;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.picked-who .who-id {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.picked-role {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.picked-role select {
+  padding: 3px 6px;
+  font-size: 12px;
 }
 
 /* ---------- 差异与冲突 ---------- */

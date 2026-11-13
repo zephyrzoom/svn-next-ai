@@ -318,6 +318,126 @@ function verify({ app, BrowserWindow, ipcMain }) {
         problems.push(`工作副本版式求值失败：${err && err.message}`);
       }
 
+      // 差异卡片头：标题与「收起」不被长路径挤成竖排，路径自己占一行并换行铺开。
+      let diffHead = {};
+      try {
+        diffHead = await win.webContents.executeJavaScript(`(() => {
+          const shell = document.getElementById('view-repo');
+          const workbench = document.getElementById('workbench');
+          shell.classList.remove('hidden');
+          workbench.classList.remove('hidden');
+          const card = document.getElementById('diff-card');
+          card.classList.remove('hidden');
+          const longPath = Array.from({ length: 24 }, (_, i) => '目录层级' + i).join('/') + '/文件名.txt';
+          const path = document.getElementById('diff-path');
+          path.textContent = longPath;
+          path.title = longPath;
+          const h2 = card.querySelector('.card-head h2');
+          const close = document.getElementById('close-diff');
+          const cs = getComputedStyle(path);
+          const h2Box = h2.getBoundingClientRect();
+          const closeBox = close.getBoundingClientRect();
+          // 单行的按钮约 30px 高；被挤成两行会到 45px 以上。
+          const out = {
+            h2SingleLine: h2Box.height < 28 && h2.scrollWidth <= h2.clientWidth + 1,
+            closeSingleLine: closeBox.height < 42 && close.scrollWidth <= close.clientWidth + 1,
+            closeHeight: closeBox.height,
+            h2Height: h2Box.height,
+            pathWraps: cs.whiteSpace === 'normal' && cs.overflowWrap === 'anywhere',
+            pathFull: path.scrollWidth <= path.clientWidth + 1,
+            pathMultiline: path.getBoundingClientRect().height > 34,
+            pathOutsideHead: !card.querySelector('.card-head #diff-path'),
+          };
+          path.textContent = '';
+          card.classList.add('hidden');
+          workbench.classList.add('hidden');
+          shell.classList.add('hidden');
+          return out;
+        })()`);
+      } catch (err) {
+        problems.push(`差异卡片头求值失败：${err && err.message}`);
+      }
+
+      // 添加成员：搜索行只有输入框（不含权限分类），点结果选中后才露出「权限 + 添加」。
+      let picker = {};
+      try {
+        picker = await win.webContents.executeJavaScript(`(() => {
+          const shell = document.getElementById('view-repo');
+          shell.classList.remove('hidden');
+          state.members = [];
+          state.picked = null;
+          state.candidates = [
+            { userId: 'u1', username: 'lisi', displayName: '李四' },
+            { userId: 'u2', username: 'wangwu', displayName: '王五' },
+          ];
+          state.candidateIndex = 0;
+          const input = document.getElementById('member-query');
+          const list = document.getElementById('member-candidates');
+          input.value = '李';
+          renderCandidates();
+          const dropdown =
+            !list.classList.contains('hidden') &&
+            getComputedStyle(list).position === 'absolute' &&
+            list.querySelectorAll('li').length === 2;
+          const searchRowHasRole = Boolean(input.parentElement.querySelector('select'));
+          const roleInsidePicker = Boolean(
+            document.getElementById('member-picked').querySelector('#member-role'),
+          );
+          list.querySelectorAll('li')[1].click();
+          const out = {
+            dropdown,
+            searchRowHasRole,
+            roleInsidePicker,
+            picked: state.picked && state.picked.username,
+            pickedVisible: !document.getElementById('member-picked').classList.contains('hidden'),
+            listClosed: list.classList.contains('hidden'),
+            queryShown: input.value,
+          };
+          state.picked = null;
+          state.candidates = [];
+          input.value = '';
+          renderCandidates();
+          shell.classList.add('hidden');
+          return out;
+        })()`);
+      } catch (err) {
+        problems.push(`成员搜索求值失败：${err && err.message}`);
+      }
+
+      // 提交：按钮有忙碌态（禁用 + 文案），committing 标记挡住重复进入。
+      let commitGuard = {};
+      try {
+        commitGuard = await win.webContents.executeJavaScript(`(async () => {
+          const button = document.getElementById('commit');
+          const message = document.getElementById('message');
+          setCommitBusy(true);
+          const busy = {
+            disabled: button.disabled,
+            label: button.textContent.trim(),
+            inputDisabled: message.disabled,
+          };
+          setCommitBusy(false);
+          const after = { disabled: button.disabled, label: button.textContent.trim() };
+          const beforeBanner = document.getElementById('banner').textContent;
+          state.committing = true;
+          state.wcDir = '/tmp/不存在的目录';
+          state.changes = [{ path: 'a.txt', kind: 'MODIFY' }];
+          state.conflicts = [];
+          message.value = '';
+          await commit();
+          const blocked =
+            !button.disabled &&
+            button.textContent.trim() === '提交' &&
+            document.getElementById('banner').textContent === beforeBanner;
+          state.committing = false;
+          state.wcDir = '';
+          state.changes = [];
+          return { busy, after, blocked };
+        })()`);
+      } catch (err) {
+        problems.push(`提交防重求值失败：${err && err.message}`);
+      }
+
       const checks = {
         页面标题: info.title === 'svn-next',
         // 桌面端剥离管理 UI 后 id 数下降，阈值按「仓库使用」客户端的实际结构设定。
@@ -378,11 +498,42 @@ function verify({ app, BrowserWindow, ipcMain }) {
           layout.after.label === '查看差异',
         变更与差异各占整行: layout.stacked === true && layout.fullRow === true,
         长文件路径换行显示: layout.longPathWraps === true,
+        差异标题与收起按钮不竖排:
+          diffHead.h2SingleLine === true && diffHead.closeSingleLine === true,
+        差异路径独占一行并换行:
+          diffHead.pathOutsideHead === true &&
+          diffHead.pathWraps === true &&
+          diffHead.pathFull === true &&
+          diffHead.pathMultiline === true,
+        成员搜索是下拉选人:
+          picker.dropdown === true &&
+          picker.picked === 'wangwu' &&
+          picker.pickedVisible === true &&
+          picker.listClosed === true &&
+          picker.queryShown === '王五',
+        搜索行不含权限分类:
+          picker.searchRowHasRole === false && picker.roleInsidePicker === true,
+        提交按钮有忙碌态:
+          commitGuard.busy.disabled === true &&
+          commitGuard.busy.label === '提交中…' &&
+          commitGuard.busy.inputDisabled === true &&
+          commitGuard.after.disabled === false &&
+          commitGuard.after.label === '提交',
+        提交进行中不会重复进入: commitGuard.blocked === true,
       };
       for (const [name, ok] of Object.entries(checks)) {
         if (!ok) problems.push(`断言失败：${name}`);
       }
-      finish({ pass: Object.values(checks).every(Boolean), ...info, interaction, identity });
+      finish({
+        pass: Object.values(checks).every(Boolean),
+        ...info,
+        interaction,
+        identity,
+        layout,
+        diffHead,
+        picker,
+        commitGuard,
+      });
     })
     .catch((err) => finish({ pass: false, fatal: `whenReady 失败：${err && err.message}` }));
 }

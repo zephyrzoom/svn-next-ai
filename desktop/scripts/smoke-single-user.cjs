@@ -354,6 +354,20 @@ async function main() {
     }
     console.log(`  head = r${head.rev}，历史 ${revisions.length} 条`);
 
+    step('提交信息留空：按本次变更自动生成');
+    fs.writeFileSync(path.join(WC, '202610', 'auto.txt'), '自动提交信息\n');
+    // 界面上允许不填：主进程必须补一条可追溯的信息，而不是把空串写进历史。
+    const auto = await flow.commitWorkingCopy(client, WC, '   ');
+    const autoLog = await client.getLog(repo.repoId, 1);
+    if (!autoLog[0] || !String(autoLog[0].message).includes('auto.txt')) {
+      fail(`留空时应写入自动生成的信息：${JSON.stringify(autoLog[0])}`);
+    }
+    if (!String(auto.message).includes('auto.txt')) {
+      fail(`返回值里应带上实际写入的信息：${JSON.stringify(auto)}`);
+    }
+    if (wc.status(WC).length !== 0) fail('留空提交后本地仍有变更');
+    console.log(`  留空时写入的历史：${autoLog[0].message}（r${auto.rev}）`);
+
     step('空间治理：预估 → 清理 → GC');
     const quotaBefore = await client.getQuota(repo.repoId);
     if (quotaBefore.usedBytes <= 0) fail('对象池占用不该是 0');

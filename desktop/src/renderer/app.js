@@ -56,6 +56,17 @@ const state = {
   members: [],
   /** 搜索结果里「可以加进来的人」——已在本仓库的会被过滤掉。 */
   candidates: [],
+  /** 下拉里键盘高亮的下标；-1 表示没有高亮（回车取第一条）。 */
+  candidateIndex: -1,
+  /** 已经选中、等待分配权限的候选账号；为空表示还没选人。 */
+  picked: null,
+  /** 搜索请求进行中（只影响下拉里的提示文案）。 */
+  searching: false,
+  /** 搜索序号：只接受最后一次请求的结果，慢响应不许盖掉新输入。 */
+  searchSeq: 0,
+  searchTimer: 0,
+  /** 提交进行中：按钮禁用的同时用它挡住重复调用。 */
+  committing: false,
 };
 
 const el = (id) => document.getElementById(id);
@@ -413,9 +424,8 @@ async function selectRepo(repoId) {
   el('changes').innerHTML = '';
   el('log').innerHTML = '';
   el('members').innerHTML = '';
-  el('member-candidates').innerHTML = '';
+  resetMemberPicker();
   state.members = [];
-  state.candidates = [];
   el('diff-path').textContent = '';
   el('diff-path').title = '';
   el('diff').textContent = state.wcDir ? '正在扫描工作副本…' : '点击上方变更查看差异';
@@ -473,6 +483,7 @@ function renderWcBar() {
   for (const id of ['pick-dir', 'refresh-status', 'update']) {
     el(id).disabled = !dir;
   }
+  el('commit').disabled = !dir || state.committing;
   el('checkout-card').classList.toggle('hidden', Boolean(dir));
   el('workbench').classList.toggle('hidden', !dir);
   el('wc-change-count').textContent = dir ? `${state.changes.length} 项` : '';
@@ -702,9 +713,17 @@ async function loadMembers() {
   }
   const members = unwrap(await api.listMembers(repo.repoId), '加载成员');
   state.members = members;
+  // 名单变了，候选里可能有人已经是成员：按最新名单过滤一次再重画。
+  pruneCandidates();
   renderMembers();
-  // 还没搜过人就给一句提示，别让「候选列表」看起来像坏掉了。
-  if (state.candidates.length === 0 && !el('member-query').value.trim()) renderCandidates('');
+}
+
+/** 把已经是成员的人从候选里剔掉；如果他正好是当前选中的人，选中态一并作废。 */
+function pruneCandidates() {
+  const existing = new Set(state.members.map((member) => member.userId));
+  state.candidates = state.candidates.filter((user) => !existing.has(user.userId));
+  if (state.picked && existing.has(state.picked.userId)) clearPick();
+  renderCandidates();
 }
 
 /** 成员行：owner 只显示一个「拥有者」标记，其余成员可改角色、可移除。 */
@@ -784,55 +803,158 @@ async function removeMember(member) {
   if (!ok) return;
   unwrap(await api.removeMember(repo.repoId, member.userId), '移除成员');
   banner(`已把「${name}」移出「${repo.name}」。`);
-  state.candidates = state.candidates.filter((user) => user.userId !== member.userId);
-  renderCandidates(el('member-query').value.trim());
   await loadMembers();
 }
 
-async function searchCandidates() {
-  const repo = currentRepo();
-  if (!repo) return;
+/**
+ * 搜人只负责「找到人」，不带任何权限分类：输入即搜（防抖），结果落在下拉里。
+ * 权限是选中之后才决定的事——先按权限筛人，等于逼着人还没认全就先想清楚给什么。
+ */
+const MEMBER_SEARCH_DELAY = 250;
+
+function scheduleSearch() {
+  window.clearTimeout(state.searchTimer);
   const query = el('member-query').value.trim();
   if (!query) {
-    banner('请先输入用户名或姓名', 'error');
+    state.candidates = [];
+    state.candidateIndex = -1;
+    state.searching = false;
+    state.searchSeq += 1;
+    renderCandidates();
     return;
   }
-  const users = unwrap(await api.searchUsers(query), '搜索用户');
+  // 等一小会儿再发请求：连续输入时只查最后一次，别把人名拆成五个请求。
+  state.searchTimer = window.setTimeout(
+    () => void guard('搜索用户', () => searchMembers(query)),
+    MEMBER_SEARCH_DELAY,
+  );
+}
+
+async function searchMembers(query) {
+  const repo = currentRepo();
+  if (!repo || !query.trim()) return;
+  const seq = ++state.searchSeq;
+  state.searching = true;
+  state.candidates = [];
+  state.candidateIndex = -1;
+  renderCandidates();
+  let users;
+  try {
+    users = unwrap(await api.searchUsers(query.trim()), '搜索用户');
+  } catch (err) {
+    // 失败也要把「正在搜索…」收掉，否则下拉会一直挂在那句话上。
+    if (seq === state.searchSeq) {
+      state.searching = false;
+      renderCandidates();
+    }
+    throw err;
+  }
+  // 慢响应回来的顺序不一定是发出去的顺序：只认最后一次输入的结果。
+  if (seq !== state.searchSeq) return;
+  state.searching = false;
   const existing = new Set(state.members.map((member) => member.userId));
   state.candidates = users.filter((user) => !existing.has(user.userId));
-  renderCandidates(query);
+  state.candidateIndex = state.candidates.length > 0 ? 0 : -1;
+  renderCandidates();
 }
 
-function renderCandidates(query = '') {
+/** 下拉内容：只列可添加的人，点一下（或回车）就是「选中」，不直接加进去。 */
+function renderCandidates() {
   const list = el('member-candidates');
+  const input = el('member-query');
+  const query = input.value.trim();
+  const open = Boolean(query) && !state.picked;
   list.innerHTML = '';
-  if (state.candidates.length === 0) {
-    list.innerHTML = query
-      ? '<li class="empty">没有可添加的账号：对方可能已经是成员，或账号还没通过审批。</li>'
-      : '<li class="empty">输入用户名或姓名后点「搜索」。</li>';
+  list.classList.toggle('hidden', !open);
+  input.setAttribute('aria-expanded', String(open));
+  if (!open) {
+    state.candidateIndex = -1;
     return;
   }
-  for (const user of state.candidates) {
+  if (state.candidates.length === 0) {
     const li = document.createElement('li');
+    li.className = 'empty';
+    li.textContent = state.searching
+      ? '正在搜索…'
+      : '没有可添加的账号：对方可能已经是成员，或账号还没通过审批。';
+    list.appendChild(li);
+    return;
+  }
+  state.candidates.forEach((user, index) => {
+    const li = document.createElement('li');
+    li.setAttribute('role', 'option');
+    li.setAttribute('aria-selected', String(index === state.candidateIndex));
+    li.classList.toggle('active', index === state.candidateIndex);
     li.innerHTML =
       '<span class="member-name"><span class="who-name"></span><span class="who-id"></span></span>' +
-      '<button class="primary" type="button">添加</button>';
+      '<span class="pick-hint">选择</span>';
     li.querySelector('.who-name').textContent = user.displayName || user.username;
     li.querySelector('.who-id').textContent = `@${user.username}`;
-    li.querySelector('button').addEventListener('click', () => void guard('添加成员', () => addMember(user)));
+    // 用 mousedown 挡住输入框失焦，click 才能稳定落到这一行上。
+    li.addEventListener('mousedown', (event) => event.preventDefault());
+    li.addEventListener('click', () => pickCandidate(user));
     list.appendChild(li);
-  }
+  });
 }
 
-async function addMember(user) {
+/** 选中一个人：输入框收成他的名字，下拉收起，下面露出「权限 + 添加」。 */
+function pickCandidate(user) {
+  state.picked = user;
+  state.candidates = [];
+  state.candidateIndex = -1;
+  const name = user.displayName || user.username;
+  el('member-query').value = name;
+  el('picked-name').textContent = name;
+  el('picked-id').textContent = `@${user.username}`;
+  el('member-role').value = '3';
+  el('member-picked').classList.remove('hidden');
+  renderCandidates();
+}
+
+/** 取消选中：keepQuery 用于「又继续在输入框里改字」的场景，别把刚打的字抹掉。 */
+function clearPick({ keepQuery = false } = {}) {
+  state.picked = null;
+  el('member-picked').classList.add('hidden');
+  el('picked-name').textContent = '';
+  el('picked-id').textContent = '';
+  if (!keepQuery) el('member-query').value = '';
+  renderCandidates();
+}
+
+/** 换仓库 / 退出登录：候选、选中态、待发的搜索请求全部作废。 */
+function resetMemberPicker() {
+  state.candidates = [];
+  state.candidateIndex = -1;
+  state.searching = false;
+  state.picked = null;
+  state.searchSeq += 1;
+  window.clearTimeout(state.searchTimer);
+  el('member-query').value = '';
+  el('member-candidates').innerHTML = '';
+  el('member-candidates').classList.add('hidden');
+  el('member-query').setAttribute('aria-expanded', 'false');
+  el('member-picked').classList.add('hidden');
+}
+
+/** 添加：权限到这里才选。按钮在请求期间禁用，避免连点加出重复成员。 */
+async function addPickedMember() {
   const repo = currentRepo();
-  if (!repo) return;
+  const user = state.picked;
+  if (!repo || !user) return;
   const role = Number(el('member-role').value);
-  unwrap(await api.addMember(repo.repoId, user.userId, role), '添加成员');
-  banner(`已把「${user.displayName || user.username}」加入「${repo.name}」，角色：${roleLabel(role)}。`);
-  state.candidates = state.candidates.filter((item) => item.userId !== user.userId);
-  renderCandidates(el('member-query').value.trim());
-  await loadMembers();
+  const button = el('add-member');
+  if (button.disabled) return;
+  button.disabled = true;
+  button.textContent = '添加中…';
+  try {
+    unwrap(await api.addMember(repo.repoId, user.userId, role), '添加成员');
+    banner(`已把「${user.displayName || user.username}」加入「${repo.name}」，权限：${roleLabel(role)}。`);
+    clearPick();
+    await loadMembers();
+  } finally {
+    button.disabled = false;
+    button.textContent = '添加';
+  }
 }
 
 // ---------------- 建库申请 / 扩容申请 ----------------
@@ -952,25 +1074,50 @@ function showDiff(path, node) {
 
 // ---------------- 提交 / 更新 / 还原 ----------------
 
+/** 提交按钮的忙碌态：既告诉人事情在做，也让第二次点击落空。 */
+function setCommitBusy(busy) {
+  const button = el('commit');
+  button.disabled = busy;
+  button.textContent = busy ? '提交中…' : '提交';
+  el('message').disabled = busy;
+}
+
+/**
+ * 提交。提交信息可以留空——主进程会按本次变更自动生成一条，
+ * 界面上不必为了「写一句话」把整次提交挡住。
+ * 提交是几秒级的网络往返：按钮禁用 + committing 标记双保险，连点只会提交一次。
+ */
 async function commit() {
+  if (state.committing) return;
   const dir = state.wcDir;
-  const message = el('message').value.trim();
   if (!dir) {
     banner('请先检出工作副本', 'error');
     return;
   }
-  if (!message) {
-    banner('请填写提交信息', 'error');
+  if (state.conflicts.length > 0) {
+    banner('存在未解决的冲突，请先解决后再提交', 'error');
     return;
   }
-  const result = unwrap(await api.commit(dir, message), '提交');
-  el('message').value = '';
-  banner(
-    `已提交 r${result.rev}：新增 ${result.added}，修改 ${result.modified}，删除 ${result.deleted}` +
-      `（上传 ${result.pushed} 个对象，服务端已有内容不重复上传）`,
-  );
-  // 提交会推进仓库 HEAD：列表里的版本号与历史都要跟着刷新。
-  await loadRepos();
+  if (state.changes.length === 0) {
+    banner('工作副本没有变更，不需要提交', 'error');
+    return;
+  }
+  const message = el('message').value.trim();
+  state.committing = true;
+  setCommitBusy(true);
+  try {
+    const result = unwrap(await api.commit(dir, message), '提交');
+    el('message').value = '';
+    banner(
+      `已提交 r${result.rev}：${result.message}（新增 ${result.added}，修改 ${result.modified}，` +
+        `删除 ${result.deleted}；上传 ${result.pushed} 个对象，服务端已有内容不重复上传）`,
+    );
+    // 提交会推进仓库 HEAD：列表里的版本号与历史都要跟着刷新。
+    await loadRepos();
+  } finally {
+    state.committing = false;
+    setCommitBusy(false);
+  }
 }
 
 async function update() {
@@ -1018,9 +1165,10 @@ async function disconnect() {
   el('changes').innerHTML = '';
   el('log').innerHTML = '';
   el('members').innerHTML = '';
-  el('member-candidates').innerHTML = '';
+  resetMemberPicker();
   state.members = [];
-  state.candidates = [];
+  state.committing = false;
+  setCommitBusy(false);
   setTab('wc');
   setDiffOpen(false);
   el('diff-path').textContent = '';
@@ -1083,15 +1231,57 @@ el('toggle-diff').addEventListener('click', () => setDiffOpen(!state.diffOpen));
 el('close-diff').addEventListener('click', () => setDiffOpen(false));
 el('commit').addEventListener('click', () => void guard('提交', commit));
 el('refresh-log').addEventListener('click', () => void guard('刷新历史', loadLog));
-// 成员页（owner 专属）：刷新名单、按名字搜人、回车即搜。
+// 成员页（owner 专属）：刷新名单 + 搜索下拉（输入即搜，选人之后再定权限）。
 el('refresh-members').addEventListener('click', () => void guard('刷新成员', loadMembers));
-el('search-members').addEventListener('click', () => void guard('搜索用户', searchCandidates));
+el('member-query').addEventListener('input', () => {
+  // 选中之后再改字 = 重新找人：先撤掉选中态，别让人以为加的还是原来那个。
+  if (state.picked) clearPick({ keepQuery: true });
+  scheduleSearch();
+});
 el('member-query').addEventListener('keydown', (event) => {
+  const open = !el('member-candidates').classList.contains('hidden');
+  const size = state.candidates.length;
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    if (!open || size === 0) return;
+    event.preventDefault();
+    const delta = event.key === 'ArrowDown' ? 1 : -1;
+    state.candidateIndex = (Math.max(state.candidateIndex, 0) + delta + size) % size;
+    renderCandidates();
+    return;
+  }
   if (event.key === 'Enter') {
     event.preventDefault();
-    void guard('搜索用户', searchCandidates);
+    if (open && size > 0) {
+      pickCandidate(state.candidates[Math.max(state.candidateIndex, 0)]);
+      return;
+    }
+    // 结果还没回来（防抖未触发）时按回车 = 立刻搜一次。
+    const query = el('member-query').value.trim();
+    if (query) {
+      window.clearTimeout(state.searchTimer);
+      void guard('搜索用户', () => searchMembers(query));
+    }
+    return;
+  }
+  if (event.key === 'Escape') {
+    if (open) {
+      event.preventDefault();
+      state.candidates = [];
+      state.candidateIndex = -1;
+      renderCandidates();
+    } else if (state.picked) {
+      clearPick();
+    }
   }
 });
+// 点到别处：下拉收起，但不丢已经选好的人。
+document.addEventListener('click', (event) => {
+  if (event.target.closest('.combo')) return;
+  el('member-candidates').classList.add('hidden');
+  el('member-query').setAttribute('aria-expanded', 'false');
+});
+el('add-member').addEventListener('click', () => void guard('添加成员', addPickedMember));
+el('cancel-pick').addEventListener('click', () => clearPick());
 // 浮层提示点一下就关，不必等它自己退场。
 el('banner').addEventListener('click', clearBanner);
 

@@ -171,16 +171,23 @@
                   <ul id="changes" class="list changes"></ul>
 
                   <div class="card-head"><h2>提交</h2></div>
-                  <textarea id="message" rows="2" placeholder="提交信息"></textarea>
+                  <textarea
+                    id="message"
+                    rows="2"
+                    placeholder="提交信息（留空则按本次变更自动生成，例如「修改 src/app.js」）"
+                  ></textarea>
                   <button id="commit" class="primary">提交</button>
                 </div>
 
                 <div class="card hidden" id="diff-card">
+                  <!-- 标题与「收起」固定不换行；路径单独占一行，长路径换行显示而不是省略 -->
                   <div class="card-head">
                     <h2>差异</h2>
-                    <span id="diff-path" class="muted"></span>
-                    <button id="close-diff" class="ghost" type="button">收起</button>
+                    <span class="head-actions">
+                      <button id="close-diff" class="ghost" type="button">收起</button>
+                    </span>
                   </div>
+                  <p id="diff-path" class="diff-path"></p>
                   <pre id="diff" class="diff">点击上方变更查看差异</pre>
 
                   <div id="conflict-editor" class="conflict hidden">
@@ -256,18 +263,46 @@
               <div class="card narrow">
                 <div class="card-head">
                   <h2>添加成员</h2>
-                  <span class="muted">按用户名或姓名搜索已启用的账号</span>
+                  <span class="muted">输入用户名或姓名，从下拉结果里选人</span>
                 </div>
-                <div class="row">
-                  <input id="member-query" placeholder="用户名 / 姓名" spellcheck="false" />
-                  <select id="member-role" aria-label="新成员角色">
-                    <option value="3" selected>写入者（可读写）</option>
-                    <option value="4">只读</option>
-                    <option value="2">维护者（可管理低阶成员）</option>
-                  </select>
-                  <button id="search-members" class="primary">搜索</button>
+                <!-- 搜索只管找人：结果下拉里不带任何权限分类，选中之后才决定给什么权限 -->
+                <div class="combo">
+                  <input
+                    id="member-query"
+                    placeholder="搜索用户名 / 姓名"
+                    spellcheck="false"
+                    autocomplete="off"
+                    role="combobox"
+                    aria-autocomplete="list"
+                    aria-expanded="false"
+                    aria-controls="member-candidates"
+                  />
+                  <ul
+                    id="member-candidates"
+                    class="list candidates dropdown hidden"
+                    role="listbox"
+                    aria-label="搜索结果"
+                  ></ul>
                 </div>
-                <ul id="member-candidates" class="list candidates"></ul>
+                <div id="member-picked" class="picked hidden">
+                  <span class="picked-who">
+                    将添加 <b id="picked-name"></b>
+                    <span id="picked-id" class="who-id"></span>
+                  </span>
+                  <label class="picked-role">
+                    权限
+                    <select id="member-role" aria-label="新成员权限">
+                      <option value="3" selected>写入者（可读写）</option>
+                      <option value="4">只读</option>
+                      <option value="2">维护者（可管理低阶成员）</option>
+                    </select>
+                  </label>
+                  <button id="add-member" class="primary" type="button">添加</button>
+                  <button id="cancel-pick" class="ghost" type="button">取消</button>
+                </div>
+                <p class="hint">
+                  搜索不分权限：先选中人，再在添加时分配读写权限。添加立即生效，并写入审计日志。
+                </p>
               </div>
             </section>
           </section>
