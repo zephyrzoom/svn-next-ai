@@ -18,7 +18,9 @@
  * 为准自动切换，宁可变上下文，也不在 A 仓库的界面上改 B 仓库的文件。
  * 一个仓库允许检出到多个目录、保留多份工作副本，彼此的本地改动互不影响；上下文条
  * 上的下拉用来切换当前操作的那一份，「检出到新目录」随时可以再铺一份——切换目录
- * 只有这一个入口，不再另放一个「更换目录」按钮。
+ * 只有这一个入口，不再另放一个「更换目录」按钮。检出卡片里的「选择…」会只读探测
+ * `.vcs/wc.db`：选到的目录若本来就是一份工作副本（例如从别处拷来的），直接把它
+ * 接进来 / 切过去，绝不重新铺盘——原「更换目录」的绑定能力就收在这个入口里。
  *
  * 治理类的审批（用户与注册、仓库创建、扩容配额、空间治理、目录配置）由服务端
  * Web 管理端承载，桌面端只保留登录、账号自助、仓库使用与工作副本这条主线。
@@ -589,8 +591,8 @@ function renderWcBar() {
     ? `这个仓库已有 ${dirs.length} 份本地工作副本`
     : '这个仓库还没有本地工作副本';
   el('checkout-hint').textContent = dir
-    ? '填一个不同的目录再点「检出」：新铺一份，已有的工作副本与本地改动都不受影响。'
-    : '变更、提交、更新都只作用于检出到的那个目录；路径按仓库记住，下次打开会自动带上。';
+    ? '填一个不同的目录再点「检出」：新铺一份，已有副本不受影响；用「选择…」选到已有工作副本则直接切换或接进来。'
+    : '变更、提交、更新都只作用于检出到的那个目录；路径按仓库记住，下次打开会自动带上。用「选择…」选到已有工作副本时会直接接进来，不会重新铺盘。';
   el('cancel-checkout').classList.toggle('hidden', !dir);
   renderWcDirOptions();
   renderWcDirList();
@@ -691,7 +693,51 @@ function closeCheckout() {
 
 async function pickCheckoutDir() {
   const dir = unwrap(await api.pickDir(), '选择目录');
-  if (dir) el('dir').value = dir;
+  if (!dir) return;
+  // 只读探测：选到的目录里本来就有 .vcs/wc.db 时，直接把这份工作副本接进来，
+  // 别把路径填进检出输入框——误点一下「检出」就会把已有文件和本地改动整盘重铺。
+  const info = unwrap(await api.wcInfo(dir), '读取工作副本信息');
+  if (info) {
+    await adoptWorkingCopy(dir, info);
+    return;
+  }
+  el('dir').value = dir;
+}
+
+/**
+ * 把「已经是一份工作副本」的目录接进来，而不是重新检出铺盘。
+ *
+ * 「选择…」选到从别处拷来的工作副本、或用户在输入框里手敲了这样一个目录，都走这里：
+ * wc.db 里的 repoId 是唯一权威，宁可把上下文切到它真正所属的仓库，也不能让一次
+ * 「检出」覆盖掉已有文件与本地改动。这就是原先「更换目录」按钮的能力，收进了唯一
+ * 的目录选择入口里，界面上不再多一个按钮。
+ */
+async function adoptWorkingCopy(dir, info) {
+  const owner = state.repos.find((repo) => repo.repoId === info.repoId);
+  if (!owner) {
+    banner(`这个目录属于仓库 ${info.repoId}，但当前账号看不到它，无法在这里使用。`, 'error');
+    return;
+  }
+  el('dir').value = '';
+  // 已经记住的另一份：走切换流程，连变更 / 差异等视图状态一起换干净。
+  if (owner.repoId === state.selectedRepoId && dirsFor(owner.repoId).includes(dir)) {
+    if (dir === state.wcDir) {
+      banner(`已经在「${dir}」这份工作副本上（r${info.rev}）。`);
+    } else {
+      await switchWorkingCopy(dir);
+    }
+    return;
+  }
+  // 先收起检出卡片：接进来之后不该还留着「检出」按钮和一条旧路径。
+  state.checkoutOpen = false;
+  await bindWorkingCopy(owner.repoId, dir);
+  if (owner.repoId !== state.selectedRepoId) {
+    banner(`这个目录是「${owner.name}」的工作副本，已绑定到该仓库并切换过去。`);
+    await selectRepo(owner.repoId);
+    return;
+  }
+  await guard('扫描工作副本', refreshStatus);
+  banner(`已接上工作副本：${dir}（r${info.rev}），没有重新铺盘。`);
 }
 
 async function checkout() {
@@ -705,19 +751,20 @@ async function checkout() {
     banner('请填写检出目录', 'error');
     return;
   }
-  // 检出会把目录里的条目整盘重铺：对已登记的工作副本要挡住，否则一次误点就丢了本地改动。
-  if (dirsFor(repo.repoId).includes(dir)) {
-    banner(
-      `「${dir}」已经是「${repo.name}」的工作副本。要重新铺盘请先在目录清单里把它「移出列表」，` +
-        '或换一个新目录再检出一份。',
-      'error',
-    );
+  // 目录里已经有一份工作副本（含别家仓库的、从别处拷来的）：只读探测到就接进来，
+  // 绝不重新铺盘——那会把已有文件与本地改动整盘覆盖掉。手敲路径也别想绕过这条保护。
+  const existing = unwrap(await api.wcInfo(dir), '读取工作副本信息');
+  if (existing) {
+    await adoptWorkingCopy(dir, existing);
     return;
   }
-  // 目录里已有别家仓库的 wc.db 时绝不能铺：那会把别人的工作副本元数据一起改掉。
-  const existing = unwrap(await api.wcInfo(dir), '读取工作副本信息');
-  if (existing && existing.repoId !== repo.repoId) {
-    banner(`「${dir}」是另一个仓库（${existing.repoId}）的工作副本，请换一个新目录再检出。`, 'error');
+  // 之前登记过、但 wc.db 已经不在了：宁可让用户先移出列表，也不闷头重铺一份。
+  if (dirsFor(repo.repoId).includes(dir)) {
+    banner(
+      `「${dir}」曾登记为「${repo.name}」的工作副本，但目录里已找不到 .vcs/wc.db。` +
+        '请先在目录清单里把它「移出列表」，或换一个新目录再检出。',
+      'error',
+    );
     return;
   }
   const result = unwrap(await api.checkout(repo.repoId, dir), '检出');

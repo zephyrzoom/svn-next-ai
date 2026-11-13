@@ -94,16 +94,37 @@ function verify({ app, BrowserWindow, ipcMain }) {
   }
   // 地址不再显示在界面上，只能靠 IPC 记录证明「保存 / 恢复默认」真的落到了主进程。
   const setTargetCalls = [];
+  // 「选择…」接进已有工作副本的回归：pickDir 固定给一个「带 wc.db」的目录，wcInfo 只对
+  // 它返回合法的工作副本信息；vcs:checkout 一次都不许被调用（那意味着整盘重铺）。
+  const ADOPT_DIR = '/tmp/wc-adopt';
+  const OTHER_DIR = '/tmp/wc-other';
+  const checkoutCalls = [];
   // 多份工作副本的回归会真的走一遍「切换 / 移出」，那两条路径会扫描工作副本：
-  // 给 status / diff 塞合法数据，免得断言被 null 数据带偏。
+  // 给 status / diff 塞合法数据，免得断言被 null 数据带偏。status 的 repoId 跟着目录走，
+  // 否则跨仓库绑定后 refreshStatus 会把上下文又切回去。
   const stubData = {
     'vcs:loadPrefs': PREFS,
-    'vcs:status': { repoId: 'r1', rev: 2, entries: [], conflicts: [] },
     'vcs:diff': [],
   };
   for (const channel of channels) {
     ipcMain.handle(channel, async (_event, ...args) => {
       if (channel === 'vcs:setTarget') setTargetCalls.push(args[0]);
+      if (channel === 'vcs:checkout') checkoutCalls.push(args);
+      if (channel === 'vcs:pickDir') return { ok: true, data: ADOPT_DIR };
+      if (channel === 'vcs:wcInfo') {
+        return { ok: true, data: args[0] === ADOPT_DIR ? { repoId: 'r1', rev: 9 } : null };
+      }
+      if (channel === 'vcs:status') {
+        return {
+          ok: true,
+          data: {
+            repoId: args[0] === OTHER_DIR ? 'r2' : 'r1',
+            rev: 2,
+            entries: [],
+            conflicts: [],
+          },
+        };
+      }
       const data = Object.prototype.hasOwnProperty.call(stubData, channel)
         ? stubData[channel]
         : null;
@@ -524,6 +545,69 @@ function verify({ app, BrowserWindow, ipcMain }) {
         problems.push(`多份工作副本求值失败：${err && err.message}`);
       }
 
+      // 「选择…」是唯一的目录选择入口：选到已有工作副本时只读探测后直接接进来，
+      // 绝不调用 checkout 重铺；手敲同一个目录点「检出」也必须被挡住。
+      let adopt = {};
+      try {
+        adopt = await win.webContents.executeJavaScript(`(async () => {
+          const shell = document.getElementById('view-repo');
+          shell.classList.remove('hidden');
+          const saved = {
+            repos: state.repos, selected: state.selectedRepoId, dirs: state.wcDirs,
+            wcDir: state.wcDir, checkoutOpen: state.checkoutOpen, tab: state.tab,
+          };
+          const wait = () => new Promise((resolve) => setTimeout(resolve, 250));
+          state.repos = [
+            { repoId: 'r1', name: '仓库一', headRev: 3 },
+            { repoId: 'r2', name: '仓库二', headRev: 1 },
+          ];
+          state.selectedRepoId = 'r1';
+          state.wcDirs = { r1: ['/tmp/wc-a'] };
+          state.wcDir = '/tmp/wc-a';
+          state.checkoutOpen = true;
+          document.getElementById('dir').value = '/tmp/old-input';
+          renderRepoNav();
+          renderWcBar();
+          document.getElementById('pick-checkout-dir').click();
+          await wait();
+          const bound = {
+            active: state.wcDir,
+            dirs: (state.wcDirs.r1 || []).slice(),
+            checkoutOpen: state.checkoutOpen,
+            input: document.getElementById('dir').value,
+            cardHidden: document.getElementById('checkout-card').classList.contains('hidden'),
+          };
+          // 再点一次：已经接进来的这份只提示「已经在…」，不重复登记。
+          document.getElementById('pick-checkout-dir').click();
+          await wait();
+          const again = { dirs: (state.wcDirs.r1 || []).slice(), active: state.wcDir };
+          // 手敲同一个目录点「检出」：也要接进来，不能整盘重铺。
+          state.checkoutOpen = true;
+          renderWcBar();
+          document.getElementById('dir').value = '/tmp/wc-adopt';
+          document.getElementById('checkout').click();
+          await wait();
+          const typed = { dirs: (state.wcDirs.r1 || []).slice(), active: state.wcDir };
+          // 目录属于另一个仓库：以 wc.db 里的 repoId 为准切上下文并绑到那个仓库。
+          await adoptWorkingCopy('/tmp/wc-other', { repoId: 'r2', rev: 5 });
+          const cross = {
+            selected: state.selectedRepoId,
+            active: state.wcDir,
+            r2: (state.wcDirs.r2 || []).slice(),
+          };
+          state.repos = saved.repos;
+          state.selectedRepoId = saved.selected;
+          state.wcDirs = saved.dirs;
+          state.wcDir = saved.wcDir;
+          state.checkoutOpen = saved.checkoutOpen;
+          state.tab = saved.tab;
+          shell.classList.add('hidden');
+          return { bound, again, typed, cross };
+        })()`);
+      } catch (err) {
+        problems.push(`接进已有工作副本求值失败：${err && err.message}`);
+      }
+
       const checks = {
         页面标题: info.title === 'svn-next',
         // 桌面端剥离管理 UI 后 id 数下降，阈值按「仓库使用」客户端的实际结构设定。
@@ -633,6 +717,20 @@ function verify({ app, BrowserWindow, ipcMain }) {
           multiWc.emptied?.active === '' &&
           multiWc.emptied?.cardHidden === false &&
           multiWc.emptied?.workbenchHidden === true,
+        选择已有工作副本直接接进来且不重铺:
+          adopt.bound?.active === '/tmp/wc-adopt' &&
+          adopt.bound?.dirs?.join(',') === '/tmp/wc-adopt,/tmp/wc-a' &&
+          adopt.bound?.checkoutOpen === false &&
+          adopt.bound?.input === '' &&
+          adopt.bound?.cardHidden === true &&
+          adopt.again?.dirs?.length === 2 &&
+          adopt.typed?.dirs?.length === 2 &&
+          adopt.typed?.active === '/tmp/wc-adopt' &&
+          checkoutCalls.length === 0,
+        别家仓库的工作副本以wc_db为准切上下文:
+          adopt.cross?.selected === 'r2' &&
+          adopt.cross?.active === '/tmp/wc-other' &&
+          adopt.cross?.r2?.join(',') === '/tmp/wc-other',
       };
       for (const [name, ok] of Object.entries(checks)) {
         if (!ok) problems.push(`断言失败：${name}`);
@@ -647,6 +745,8 @@ function verify({ app, BrowserWindow, ipcMain }) {
         picker,
         commitGuard,
         multiWc,
+        adopt,
+        checkoutCalls: checkoutCalls.length,
       });
     })
     .catch((err) => finish({ pass: false, fatal: `whenReady 失败：${err && err.message}` }));
