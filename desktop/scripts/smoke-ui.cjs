@@ -181,6 +181,8 @@ function verify({ app, BrowserWindow, ipcMain }) {
               /\\d{1,3}(\\.\\d{1,3}){3}:\\d+/.test(authText) ||
               authText.includes('服务器：'),
             hasServerLabel: Boolean(document.getElementById('server-label')),
+            // 切换工作副本统一走上下文条下拉，不再有重复的「更换目录」按钮。
+            hasPickDir: Boolean(document.getElementById('pick-dir')),
             localTabActive: document.getElementById('tab-local').classList.contains('active'),
             ldapLabel: document.getElementById('tab-ldap').textContent.trim(),
             hasSourceSelect: Boolean(document.getElementById('auth-source')),
@@ -535,6 +537,7 @@ function verify({ app, BrowserWindow, ipcMain }) {
         登录页默认可见: info.loginVisible === true && info.appHidden === true,
         // 免登录改为默认行为：登录页不再有勾选框，表单只留用户名与密码。
         登录页无免登录勾选框: info.hasRememberCheckbox === false,
+        上下文条没有重复的更换目录按钮: info.hasPickDir === false,
         登录表单只有用户名与密码:
           Array.isArray(info.loginInputs) &&
           info.loginInputs.join(',') === 'username,password',

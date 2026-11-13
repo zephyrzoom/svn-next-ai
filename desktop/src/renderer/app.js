@@ -17,7 +17,8 @@
  * 目录与仓库对不上时（拷贝过来的工作副本、换了账号），以目录里 wc.db 记录的 repoId
  * 为准自动切换，宁可变上下文，也不在 A 仓库的界面上改 B 仓库的文件。
  * 一个仓库允许检出到多个目录、保留多份工作副本，彼此的本地改动互不影响；上下文条
- * 上的下拉用来切换当前操作的那一份，「检出到新目录」随时可以再铺一份。
+ * 上的下拉用来切换当前操作的那一份，「检出到新目录」随时可以再铺一份——切换目录
+ * 只有这一个入口，不再另放一个「更换目录」按钮。
  *
  * 治理类的审批（用户与注册、仓库创建、扩容配额、空间治理、目录配置）由服务端
  * Web 管理端承载，桌面端只保留登录、账号自助、仓库使用与工作副本这条主线。
@@ -574,9 +575,8 @@ function renderWcBar() {
       ? `${conflicts} 个冲突待解决`
       : `${state.changes.length} 个待提交变更 @ r${state.wcRev}`;
   el('wc-status').classList.toggle('warn', conflicts > 0);
-  // 已有工作副本照样能再检出一份；「更换目录」用来绑定拷贝过来的目录，随时可用。
+  // 已有工作副本照样能再检出一份；切换已登记的目录统一走上下文条的下拉。
   el('open-checkout').disabled = !hasRepo;
-  el('pick-dir').disabled = !hasRepo;
   for (const id of ['refresh-status', 'update']) {
     el(id).disabled = !dir;
   }
@@ -692,44 +692,6 @@ function closeCheckout() {
 async function pickCheckoutDir() {
   const dir = unwrap(await api.pickDir(), '选择目录');
   if (dir) el('dir').value = dir;
-}
-
-/**
- * 更换目录：先问这个目录「本来是谁的工作副本」，再决定是绑定还是引导检出。
- * 这一步是为了防「在 A 仓库的界面上改 B 仓库的文件」——目录里 wc.db 的 repoId 是唯一权威。
- */
-async function pickWorkingCopy() {
-  const picked = unwrap(await api.pickDir(), '选择目录');
-  if (!picked) return;
-  const info = unwrap(await api.wcInfo(picked), '读取工作副本信息');
-  if (!info) {
-    // 以前只把路径填进隐藏的检出卡片，用户根本点不到「检出」——现在直接把卡片展开。
-    openCheckout(picked);
-    banner(`「${picked}」还不是工作副本，点「检出」即可把当前仓库再铺一份到这里。`);
-    return;
-  }
-  const owner = state.repos.find((repo) => repo.repoId === info.repoId);
-  if (!owner) {
-    banner(`这个目录属于仓库 ${info.repoId}，但当前账号看不到它，无法在这里使用。`, 'error');
-    return;
-  }
-  // 选中的是已经记住的另一份：走切换流程，连变更 / 差异等视图状态一起换干净。
-  if (owner.repoId === state.selectedRepoId && dirsFor(owner.repoId).includes(picked)) {
-    if (picked === state.wcDir) {
-      banner(`已经在「${picked}」这份工作副本上（r${info.rev}）。`);
-    } else {
-      await switchWorkingCopy(picked);
-    }
-    return;
-  }
-  await bindWorkingCopy(owner.repoId, picked);
-  if (owner.repoId !== state.selectedRepoId) {
-    banner(`这个目录是「${owner.name}」的工作副本，已切换到该仓库。`);
-    await selectRepo(owner.repoId);
-    return;
-  }
-  await guard('扫描工作副本', refreshStatus);
-  banner(`已绑定工作副本：${picked}（r${info.rev}）。`);
 }
 
 async function checkout() {
@@ -1455,7 +1417,6 @@ el('do-request').addEventListener('click', () => void guard('提交建库申请'
 el('do-expand').addEventListener('click', () => void guard('提交扩容申请', requestExpansion));
 el('disconnect').addEventListener('click', () => void guard('退出登录', disconnect));
 el('pick-checkout-dir').addEventListener('click', () => void guard('选择目录', pickCheckoutDir));
-el('pick-dir').addEventListener('click', () => void guard('更换目录', pickWorkingCopy));
 el('open-checkout').addEventListener('click', () => openCheckout());
 el('cancel-checkout').addEventListener('click', closeCheckout);
 el('wc-dir-select').addEventListener('change', (event) =>
