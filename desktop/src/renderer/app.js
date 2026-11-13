@@ -1254,8 +1254,7 @@ el('toggle-diff').addEventListener('click', () => setDiffOpen(!state.diffOpen));
 el('close-diff').addEventListener('click', () => setDiffOpen(false));
 el('commit').addEventListener('click', () => void guard('提交', commit));
 el('refresh-log').addEventListener('click', () => void guard('刷新历史', loadLog));
-// 成员页（owner 专属）：刷新名单 + 搜索下拉（输入即搜，选人之后再定权限）。
-el('refresh-members').addEventListener('click', () => void guard('刷新成员', loadMembers));
+// 成员页（owner 专属）：名单跟随仓库与增删自动刷新，搜索下拉输入即搜，选人之后再定权限。
 el('member-query').addEventListener('input', () => {
   // 选中之后再改字 = 重新找人：先撤掉选中态，别让人以为加的还是原来那个。
   if (state.picked) clearPick({ keepQuery: true });
