@@ -17,7 +17,7 @@
  * 目录与仓库对不上时（拷贝过来的工作副本、换了账号），以目录里 wc.db 记录的 repoId
  * 为准自动切换，宁可变上下文，也不在 A 仓库的界面上改 B 仓库的文件。
  * 一个仓库允许检出到多个目录、保留多份工作副本，彼此的本地改动互不影响；上下文条
- * 上的下拉用来切换当前操作的那一份，「检出到新目录」随时可以再铺一份——切换目录
+ * 上的下拉用来切换当前操作的那一份，上下文条的「检出」随时可以再铺一份——切换目录
  * 只有这一个入口，不再另放一个「更换目录」按钮。检出卡片里的「选择…」会只读探测
  * `.vcs/wc.db`：选到的目录若本来就是一份工作副本（例如从别处拷来的），直接把它
  * 接进来 / 切过去，绝不重新铺盘——原「更换目录」的绑定能力就收在这个入口里。
@@ -53,7 +53,7 @@ const state = {
   wcDirs: {},
   /** 当前仓库正在操作的那一份工作副本目录；空串表示还没有本地工作副本。 */
   wcDir: '',
-  /** 「检出到本地」卡片是否展开：已有工作副本时由「检出到新目录」按钮临时打开。 */
+  /** 「检出到本地」卡片是否展开：已有工作副本时由「检出」按钮临时打开。 */
   checkoutOpen: false,
   wcRev: 0,
   changes: [],
@@ -813,7 +813,10 @@ function renderSparseSummary() {
   el('sparse-toggle').textContent = state.sparse.open ? '收起' : '选择目录';
   el('sparse-toggle').setAttribute('aria-expanded', String(state.sparse.open));
   el('sparse-body').classList.toggle('hidden', !state.sparse.open);
-  el('sparse-card').classList.toggle('hidden', !currentRepo());
+  // 稀疏规则跟着「检出」卡片走：平时不占版面，点「检出」把卡片摊开时一起露出来。
+  // 检出引导态（还没有工作副本）本来就得选目录，所以照样显示。
+  const checkoutVisible = !state.wcDir || state.checkoutOpen;
+  el('sparse-card').classList.toggle('hidden', !currentRepo() || !checkoutVisible);
 }
 
 /** 已检出的副本调整规则：只补拉新增前缀、移除干净条目，绝不重新铺盘。 */

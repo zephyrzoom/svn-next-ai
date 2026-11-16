@@ -551,10 +551,14 @@ function verify({ app, BrowserWindow, ipcMain }) {
             navDot: document.querySelector('.repo-dot').classList.contains('on'),
             listed: document.querySelectorAll('#wc-dir-items li').length,
           };
+          // 稀疏检出卡片平时不占版面：点「检出」摊开卡片时才跟着出现。
+          const sparseHiddenBefore = document.getElementById('sparse-card').classList.contains('hidden');
           document.getElementById('open-checkout').click();
           const opened = !card.classList.contains('hidden') &&
             document.getElementById('dir').value === '' &&
-            document.getElementById('checkout-title').textContent === '再检出一份';
+            document.getElementById('checkout-title').textContent === '再检出一份' &&
+            sparseHiddenBefore === true &&
+            !document.getElementById('sparse-card').classList.contains('hidden');
           // 再登记一份；这个目录原本挂在 r2 名下，必须从 r2 摘掉（一个目录只属于一个仓库）。
           await bindWorkingCopy('r1', '/tmp/wc-c');
           const bound = {
@@ -710,6 +714,8 @@ function verify({ app, BrowserWindow, ipcMain }) {
           document.getElementById('checkout').click();
           await wait();
           const applyVisible = !document.getElementById('sparse-apply').classList.contains('hidden');
+          // 检出完成后卡片收起，稀疏面板跟着一起退场——它只服务于「检出」这一步。
+          const cardHiddenAfter = document.getElementById('sparse-card').classList.contains('hidden');
           // 应用规则：回报里的「清理了几个空目录 / 哪些目录因为还有用户文件被保留」
           // 必须落到提示语上，否则用户只会看到空文件夹赖着不走却不知道原因。
           state.wcDir = '/tmp/sparse-new';
@@ -734,7 +740,10 @@ function verify({ app, BrowserWindow, ipcMain }) {
           state.sparse.rules = saved.sparseRules;
           state.sparse.repoId = saved.sparseRepoId;
           shell.classList.add('hidden');
-          return { roots, afterSrc, finalRules, cleared, normalized, applyVisible, applyBanner };
+          return {
+            roots, afterSrc, finalRules, cleared, normalized, applyVisible,
+            applyBanner, cardHiddenAfter,
+          };
         })()`);
       } catch (err) {
         problems.push(`稀疏检出求值失败：${err && err.message}`);
@@ -929,6 +938,8 @@ function verify({ app, BrowserWindow, ipcMain }) {
           sparse.normalized?.join(',') === 'README.md,docs,src' &&
           sparse.cleared?.length === 0 &&
           sparse.applyVisible === true,
+        稀疏面板只在检出时出现:
+          sparse.cardHiddenAfter === true && multiWc.opened === true,
         应用规则后提示空目录已清理并说明保留原因:
           String(sparse.applyBanner || '').includes('清理 2 个空目录') &&
           String(sparse.applyBanner || '').includes('docs') &&
