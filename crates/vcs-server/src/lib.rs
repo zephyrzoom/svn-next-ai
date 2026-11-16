@@ -1854,13 +1854,28 @@ impl ServerStore {
         Ok(())
     }
 
-    /// 两棵树之间的差异，供 update 使用。
+    /// 两棵树之间的差异，供 update 使用。全量差异；稀疏副本请用 `get_changes_under`。
     pub fn get_changes(
         &self,
         session: &Session,
         name_or_id: &str,
         from_rev: u64,
         to_rev: u64,
+    ) -> Result<Vec<PendingChange>> {
+        self.get_changes_under(session, name_or_id, from_rev, to_rev, &[])
+    }
+
+    /// 只返回落在稀疏规则内的差异。
+    ///
+    /// 过滤放在服务端，稀疏副本的 update 就不必把整库的对象都下载一遍；
+    /// `vcs-core::WorkingCopy::apply_update` 里还有一道同样的防线，防止上层漏过滤。
+    pub fn get_changes_under(
+        &self,
+        session: &Session,
+        name_or_id: &str,
+        from_rev: u64,
+        to_rev: u64,
+        paths: &[String],
     ) -> Result<Vec<PendingChange>> {
         let repo = self.require_repo(session, name_or_id)?;
         if to_rev < from_rev {
@@ -1875,11 +1890,15 @@ impl ServerStore {
                 format!("r{to_rev} 不存在（当前 head 为 r{}）", repo.head_rev),
             ));
         }
+        let rules = vcs_core::SparseRules::from_paths(paths)?;
         let from_tree = self.revision_root_tree(&repo.repo_id, from_rev)?;
         let to_tree = self.revision_root_tree(&repo.repo_id, to_rev)?;
         let from_map = flatten_map(&self.objects, &from_tree)?;
         let to_map = flatten_map(&self.objects, &to_tree)?;
-        Ok(diff_maps(&from_map, &to_map))
+        Ok(diff_maps(&from_map, &to_map)
+            .into_iter()
+            .filter(|change| rules.includes(&change.path))
+            .collect())
     }
 
     /// 列出调用者是成员的仓库。

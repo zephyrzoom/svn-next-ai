@@ -141,6 +141,22 @@ struct EntryIn {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WcInfoJson {
+    repo_id: String,
+    rev: u64,
+    oldest_rev: u64,
+    /// 空数组 = 全量检出。
+    sparse_rules: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SparseJson {
+    added: usize,
+    removed: usize,
+}
+
+#[derive(Serialize)]
 struct UpdateJson {
     rev: u64,
     updated: usize,
@@ -178,31 +194,25 @@ pub fn hash_bytes_hex(data: Buffer) -> String {
 
 // ---------------- 工作副本 ----------------
 
-/// 工作副本归属：`{"repoId": "...", "rev": 3, "oldestRev": 1}`。
+/// 工作副本归属与稀疏规则：
+/// `{"repoId":"...","rev":3,"oldestRev":1,"sparseRules":[]}`（空数组 = 全量检出）。
 #[napi]
 pub fn wc_info(dir: String) -> napi::Result<String> {
     let wc = open(&dir)?;
     let (repo_id, rev, oldest) = working_copy_info(&wc)?;
-    Ok(format!(
-        "{{\"repoId\":\"{repo_id}\",\"rev\":{rev},\"oldestRev\":{oldest}}}"
-    ))
+    let rules = wc.sparse_rules().map_err(to_napi)?;
+    serde_json::to_string(&WcInfoJson {
+        repo_id,
+        rev,
+        oldest_rev: oldest,
+        sparse_rules: rules.paths,
+    })
+    .map_err(|e| bad(format!("序列化工作副本信息失败：{e}")))
 }
 
-/// 检出：把服务端给的条目与内容铺到磁盘，并写 pristine 基线。
-#[napi]
-pub fn wc_checkout(
-    dir: String,
-    repo_id: String,
-    rev: u32,
-    entries_json: String,
-    hashes: Vec<String>,
-    blobs: Vec<Buffer>,
-) -> napi::Result<u32> {
-    let entries: Vec<EntryIn> =
-        serde_json::from_str(&entries_json).map_err(|e| bad(format!("解析条目失败：{e}")))?;
-    let store = memory_store(hashes, blobs)?;
-    let mut wc = open(&dir)?;
-    let files: Vec<FlatEntry> = entries
+/// JS 传来的条目统一在这里转成 core 的 FlatEntry；检出与规则调整共用。
+fn parse_entries(entries: &[EntryIn]) -> napi::Result<Vec<FlatEntry>> {
+    entries
         .iter()
         .map(|entry| {
             Ok(FlatEntry {
@@ -215,11 +225,67 @@ pub fn wc_checkout(
                 size: entry.size,
             })
         })
-        .collect::<napi::Result<Vec<_>>>()?;
+        .collect()
+}
+
+fn parse_sparse_rules(text: &str) -> napi::Result<vcs_core::SparseRules> {
+    let raw: Vec<String> =
+        serde_json::from_str(text).map_err(|e| bad(format!("解析稀疏规则失败：{e}")))?;
+    vcs_core::SparseRules::from_paths(raw).map_err(to_napi)
+}
+
+/// 检出：把服务端给的条目与内容铺到磁盘，并写 pristine 基线。
+/// `rulesJson` 是稀疏路径数组的 JSON，传 `[]` 表示全量检出。
+#[napi]
+pub fn wc_checkout(
+    dir: String,
+    repo_id: String,
+    rev: u32,
+    entries_json: String,
+    hashes: Vec<String>,
+    blobs: Vec<Buffer>,
+    rules_json: String,
+) -> napi::Result<u32> {
+    let entries: Vec<EntryIn> =
+        serde_json::from_str(&entries_json).map_err(|e| bad(format!("解析条目失败：{e}")))?;
+    let store = memory_store(hashes, blobs)?;
+    let files = parse_entries(&entries)?;
+    let rules = parse_sparse_rules(&rules_json)?;
+    let mut wc = open(&dir)?;
     let written = wc
-        .checkout(&repo_id, rev as u64, &files, &store)
+        .checkout_with_rules(&repo_id, rev as u64, &files, &store, &rules)
         .map_err(to_napi)?;
     Ok(written as u32)
+}
+
+/// 调整稀疏规则：补拉新路径、移除不再需要的路径。
+///
+/// `entriesJson` / `hashes` / `blobs` 是**新增前缀**下的文件与内容，可以为空；
+/// 有本地改动挡路时 core 会直接报错，一个文件都不会删。
+#[napi]
+pub fn wc_apply_sparse_rules(
+    dir: String,
+    rules_json: String,
+    rev: u32,
+    entries_json: String,
+    hashes: Vec<String>,
+    blobs: Vec<Buffer>,
+) -> napi::Result<String> {
+    let rules = parse_sparse_rules(&rules_json)?;
+    let entries: Vec<EntryIn> =
+        serde_json::from_str(&entries_json).map_err(|e| bad(format!("解析条目失败：{e}")))?;
+    let store = memory_store(hashes, blobs)?;
+    let files = parse_entries(&entries)?;
+    // 调整规则必须作用在已存在的工作副本上，绝不在空目录里凭空建一份。
+    let mut wc = WorkingCopy::open(Path::new(&dir)).map_err(to_napi)?;
+    let outcome = wc
+        .apply_sparse_rules(&rules, &files, rev as u64, &store)
+        .map_err(to_napi)?;
+    serde_json::to_string(&SparseJson {
+        added: outcome.added,
+        removed: outcome.removed,
+    })
+    .map_err(|e| bad(format!("序列化稀疏结果失败：{e}")))
 }
 
 /// 扫描工作副本，返回 `[{path, kind}]`。走 core 的 mtime 快路径。

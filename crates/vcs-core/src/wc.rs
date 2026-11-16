@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::hash::{hash_bytes, object_rel_path, to_hex};
+use crate::sparse::{SparseRules, SPARSE_META_KEY};
 use crate::{ChangeKind, EntryKind, Error, ErrorCode, FlatEntry, Hash, ObjectStore, Result};
 
 const WC_SCHEMA: &str = include_str!("../../../schema/wc.sql");
@@ -63,6 +64,15 @@ pub struct StatusEntry {
     pub path: String,
     pub state: WcState,
     pub base_rev: u64,
+}
+
+/// 调整稀疏规则后的增量结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SparseOutcome {
+    /// 新补拉落盘的条目数。
+    pub added: usize,
+    /// 因规则收窄而移除的条目数。
+    pub removed: usize,
 }
 
 pub struct WorkingCopy {
@@ -124,6 +134,19 @@ impl WorkingCopy {
             .map_err(|e| Error::new(ErrorCode::IoError, format!("读 meta 失败：{e}")))
     }
 
+    /// 这份工作副本的稀疏规则。老副本没有这个 meta 键，一律按全量检出对待。
+    pub fn sparse_rules(&self) -> Result<SparseRules> {
+        match self.get_meta(SPARSE_META_KEY)? {
+            Some(text) => SparseRules::from_json(&text),
+            None => Ok(SparseRules::all()),
+        }
+    }
+
+    /// 只改规则本身；增删文件必须走 `apply_sparse_rules`，否则磁盘与 wc.db 会脱节。
+    pub fn set_sparse_rules(&self, rules: &SparseRules) -> Result<()> {
+        self.set_meta(SPARSE_META_KEY, &rules.to_json()?)
+    }
+
     /// 当前工作副本记录的版本号（最近一次检出/更新的基准）。
     pub fn base_rev(&self) -> Result<u64> {
         Ok(self
@@ -162,6 +185,7 @@ impl WorkingCopy {
     /// 检出：把给定版本的完整树铺到磁盘，并写入 wc.db 与 pristine 缓存。
     ///
     /// 调用方负责先把 store 里缺的对象补齐（M1 中 store 即本地服务端存储）。
+    /// 全量检出；稀疏检出用 `checkout_with_rules`。
     pub fn checkout(
         &mut self,
         repo_id: &str,
@@ -169,6 +193,22 @@ impl WorkingCopy {
         files: &[FlatEntry],
         store: &dyn ObjectStore,
     ) -> Result<usize> {
+        self.checkout_with_rules(repo_id, rev, files, store, &SparseRules::all())
+    }
+
+    /// 带稀疏规则的首次检出。
+    ///
+    /// `files` 应当已是按 `rules` 过滤后的清单；这里再挡一道，防止上层漏过滤时
+    /// 把规则外的文件也铺进工作副本。规则写进 meta，后续 update / 规则调整都以它为准。
+    pub fn checkout_with_rules(
+        &mut self,
+        repo_id: &str,
+        rev: u64,
+        files: &[FlatEntry],
+        store: &dyn ObjectStore,
+        rules: &SparseRules,
+    ) -> Result<usize> {
+        let rules_json = rules.to_json()?;
         // 事务会可变借用 self.conn，因此先把只读路径摘出来。
         let wc_root = self.root.clone();
         let tx = self
@@ -182,6 +222,9 @@ impl WorkingCopy {
         let mut written = 0usize;
 
         for entry in files {
+            if !rules.includes(&entry.path) {
+                continue;
+            }
             let data = store.get(&entry.hash)?;
             let target = wc_root.join(&entry.path);
             if let Some(parent) = target.parent() {
@@ -231,6 +274,7 @@ impl WorkingCopy {
             ("head_rev", rev.to_string()),
             ("last_contact_rev", rev.to_string()),
             ("checked_out_at", now.to_string()),
+            (SPARSE_META_KEY, rules_json),
         ] {
             tx.execute(
                 "INSERT INTO meta (key, value) VALUES (?1, ?2)
@@ -243,6 +287,175 @@ impl WorkingCopy {
         tx.commit()
             .map_err(|e| Error::new(ErrorCode::IoError, format!("提交检出事务失败：{e}")))?;
         Ok(written)
+    }
+
+    /// 调整稀疏规则：补拉新纳入的路径、移除不再需要的路径。
+    ///
+    /// `files` 是新规则下的仓库文件清单（可以只带新增前缀那部分）；已经存在的条目
+    /// 一律跳过，绝不覆盖本地内容。移除前全量校验：受版本控制的条目只要有本地改动
+    /// 或冲突就整笔拒绝，宁可让用户先提交 / 还原，也不静默删掉他的工作。
+    pub fn apply_sparse_rules(
+        &mut self,
+        rules: &SparseRules,
+        files: &[FlatEntry],
+        rev: u64,
+        store: &dyn ObjectStore,
+    ) -> Result<SparseOutcome> {
+        let old = self.sparse_rules()?;
+        let rules_json = rules.to_json()?;
+        let wc_root = self.root.clone();
+
+        let remove: Vec<String> = self
+            .all_paths()?
+            .into_iter()
+            .filter(|path| !rules.includes(path))
+            .collect();
+
+        if !remove.is_empty() {
+            let dirty: BTreeSet<String> = self
+                .status_with(true)?
+                .into_iter()
+                .filter(|entry| {
+                    matches!(
+                        entry.state,
+                        WcState::Added | WcState::Modified | WcState::Deleted | WcState::Conflicted
+                    )
+                })
+                .map(|entry| entry.path)
+                .collect();
+            let blocking: Vec<&str> = remove
+                .iter()
+                .filter(|path| dirty.iter().any(|d| crate::sparse::under(path.as_str(), d)))
+                .map(|path| path.as_str())
+                .collect();
+            if !blocking.is_empty() {
+                let shown = blocking
+                    .iter()
+                    .take(3)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("、");
+                let more = if blocking.len() > 3 { " 等" } else { "" };
+                return Err(Error::new(
+                    ErrorCode::PathConflict,
+                    format!(
+                        "这些路径里有未提交的本地改动，不能移出稀疏规则：{shown}{more}。请先提交或还原，再调整规则。"
+                    ),
+                ));
+            }
+        }
+
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| Error::new(ErrorCode::IoError, format!("开启事务失败：{e}")))?;
+        let mut outcome = SparseOutcome::default();
+
+        for entry in files {
+            if !rules.includes(&entry.path) || old.includes(&entry.path) {
+                continue;
+            }
+            let exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM entries WHERE path = ?1",
+                    params![entry.path],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(|e| Error::new(ErrorCode::IoError, format!("读取条目失败：{e}")))?
+                .unwrap_or(false);
+            if exists {
+                continue;
+            }
+            let target = wc_root.join(&entry.path);
+            if target.exists() {
+                return Err(Error::new(
+                    ErrorCode::PathConflict,
+                    format!("「{}」已有本地未受控文件挡路，不能补拉这个路径", entry.path),
+                ));
+            }
+            let data = store.get(&entry.hash)?;
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|e| io("创建目录失败", parent, e))?;
+            }
+            write_entry(&target, entry.kind, &data)?;
+            write_pristine(&wc_root, &entry.hash, &data)?;
+            let meta = fs::symlink_metadata(&target).map_err(|e| io("读取条目失败", &target, e))?;
+            tx.execute(
+                "INSERT INTO entries (path, kind, base_rev, base_hash, state, mtime, size, checksum)
+                 VALUES (?1, ?2, ?3, ?4, 'normal', ?5, ?6, ?7)",
+                params![
+                    entry.path,
+                    kind_str(entry.kind),
+                    rev as i64,
+                    to_hex(&entry.hash),
+                    mtime_nanos(&meta),
+                    data.len() as i64,
+                    to_hex(&entry.hash),
+                ],
+            )
+            .map_err(|e| Error::new(ErrorCode::IoError, format!("写 entries 失败：{e}")))?;
+            tx.execute(
+                "INSERT INTO pristine (hash, size_bytes, stored_size, ref_count, path_hint)
+                 VALUES (?1, ?2, ?2, 1, ?3)
+                 ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + 1",
+                params![to_hex(&entry.hash), data.len() as i64, entry.path],
+            )
+            .map_err(|e| Error::new(ErrorCode::IoError, format!("写 pristine 失败：{e}")))?;
+            outcome.added += 1;
+        }
+
+        for path in &remove {
+            let base_hash: Option<String> = tx
+                .query_row(
+                    "SELECT base_hash FROM entries WHERE path = ?1",
+                    params![path],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|e| Error::new(ErrorCode::IoError, format!("读取条目失败：{e}")))?
+                .flatten();
+            tx.execute("DELETE FROM entries WHERE path = ?1", params![path])
+                .map_err(|e| Error::new(ErrorCode::IoError, format!("删除条目失败：{e}")))?;
+            if let Some(hash) = base_hash {
+                tx.execute(
+                    "UPDATE pristine SET ref_count = ref_count - 1
+                     WHERE hash = ?1 AND ref_count > 0",
+                    params![hash],
+                )
+                .map_err(|e| Error::new(ErrorCode::IoError, format!("更新基线引用失败：{e}")))?;
+            }
+            remove_path(&wc_root.join(path))?;
+            outcome.removed += 1;
+        }
+
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SPARSE_META_KEY, rules_json],
+        )
+        .map_err(|e| Error::new(ErrorCode::IoError, format!("写稀疏规则失败：{e}")))?;
+        tx.commit()
+            .map_err(|e| Error::new(ErrorCode::IoError, format!("提交稀疏规则事务失败：{e}")))?;
+
+        // 只清理已经空掉的上层目录；remove_dir 遇到还有文件的目录会自己失败，
+        // 用户放在稀疏目录里的未受控文件一个都不会被删。
+        let mut parents = BTreeSet::new();
+        for path in &remove {
+            let mut parts: Vec<&str> = path.split('/').collect();
+            parts.pop();
+            while !parts.is_empty() {
+                parents.insert(parts.join("/"));
+                parts.pop();
+            }
+        }
+        let mut dirs: Vec<String> = parents.into_iter().collect();
+        dirs.sort_by_key(|dir| std::cmp::Reverse(dir.len()));
+        for dir in dirs {
+            let _ = fs::remove_dir(wc_root.join(dir));
+        }
+
+        Ok(outcome)
     }
 
     /// 离线状态比对：mtime/size 没变就跳过哈希，变了才算内容。
@@ -326,8 +539,10 @@ impl WorkingCopy {
         }
 
         // 工作副本里存在、但不在版本库中的文件：未纳入版本控制。
+        // 稀疏规则之外的目录不属于这份工作副本，里面的残留 / 用户文件不报变更。
+        let rules = self.sparse_rules()?;
         for path in self.walk_working_tree()? {
-            if known.contains(&path) {
+            if known.contains(&path) || !rules.includes(&path) {
                 continue;
             }
             // add/add 这类树冲突可能根本没有 `entries` 行（本地未受控文件挡路），
@@ -470,9 +685,15 @@ impl WorkingCopy {
             ..Default::default()
         };
         let wc_root = self.root.clone();
+        let rules = self.sparse_rules()?;
 
         for change in changes {
             let path = crate::normalize_path(&change.path)?;
+            // 稀疏副本只接受规则内的变化：上层即使忘了按路径过滤，也不能让一次
+            // update 把规则外的文件 materialize 进来，把稀疏副本撑成全量。
+            if !rules.includes(&path) {
+                continue;
+            }
             let target = wc_root.join(&path);
             let existing = self.entry(&path)?;
 
@@ -837,7 +1058,13 @@ impl WorkingCopy {
     /// 提交前会把新增列表打印出来。
     pub fn local_changes(&self) -> Result<Vec<LocalChange>> {
         let mut out = Vec::new();
+        // 稀疏副本里规则之外的磁盘文件（用户自己放的、或调整规则后残留的）不属于
+        // 这次提交范围，不能因为 status 把它们报成 unversioned 就一起推到服务端。
+        let rules = self.sparse_rules()?;
         for entry in self.status_with(true)? {
+            if !rules.includes(&entry.path) {
+                continue;
+            }
             let target = self.root.join(&entry.path);
             match entry.state {
                 WcState::Modified => {
@@ -1998,5 +2225,154 @@ mod tests {
         assert!(!wc.has_conflicts().unwrap());
         assert_eq!(fs::read(dir.0.join("wc/a.txt")).unwrap(), b"a\n");
         assert_eq!(wc.oldest_rev().unwrap(), 1);
+    }
+
+    // ---------------- 稀疏检出 ----------------
+
+    fn sparse_files(store: &MemoryObjectStore, items: &[(&str, &[u8])]) -> Vec<FlatEntry> {
+        items
+            .iter()
+            .map(|(path, content)| FlatEntry {
+                path: (*path).to_string(),
+                kind: EntryKind::File,
+                hash: seed_store(store, content),
+                size: content.len() as u64,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sparse_checkout_only_writes_selected_paths_and_persists_rules() {
+        let dir = TempDir::new("sparse-co");
+        let store = MemoryObjectStore::new();
+        let files = sparse_files(
+            &store,
+            &[
+                ("src/main.rs", b"main\n"),
+                ("src/api/v1.rs", b"v1\n"),
+                ("docs/readme.md", b"docs\n"),
+            ],
+        );
+        let rules = SparseRules::from_paths(["src"]).unwrap();
+        let wc_root = dir.0.join("wc");
+        let mut wc = WorkingCopy::create(&wc_root).unwrap();
+        let written = wc
+            .checkout_with_rules("repo-1", 5, &files, &store, &rules)
+            .unwrap();
+
+        assert_eq!(written, 2);
+        assert!(wc_root.join("src/main.rs").exists());
+        assert!(wc_root.join("src/api/v1.rs").exists());
+        assert!(!wc_root.join("docs/readme.md").exists());
+        assert_eq!(wc.sparse_rules().unwrap(), rules);
+        assert!(wc.status().unwrap().is_empty());
+        // 规则要能跨进程存活；没有这个 meta 键的老副本降级为全量。
+        assert_eq!(
+            WorkingCopy::open(&wc_root).unwrap().sparse_rules().unwrap(),
+            rules
+        );
+        assert_eq!(
+            WorkingCopy::create(dir.0.join("fresh"))
+                .unwrap()
+                .sparse_rules()
+                .unwrap(),
+            SparseRules::all()
+        );
+    }
+
+    #[test]
+    fn sparse_update_ignores_out_of_scope_changes() {
+        let dir = TempDir::new("sparse-up");
+        let store = MemoryObjectStore::new();
+        let files = sparse_files(&store, &[("src/main.rs", b"main\n")]);
+        let rules = SparseRules::from_paths(["src"]).unwrap();
+        let wc_root = dir.0.join("wc");
+        let mut wc = WorkingCopy::create(&wc_root).unwrap();
+        wc.checkout_with_rules("repo-1", 1, &files, &store, &rules)
+            .unwrap();
+
+        let in_scope = seed_store(&store, b"v2\n");
+        let out_scope = seed_store(&store, b"docs\n");
+        let outcome = wc
+            .apply_update(
+                "repo-1",
+                2,
+                &[
+                    remote("src/main.rs", ChangeKind::Modify, Some(in_scope), 3),
+                    remote("docs/new.md", ChangeKind::Add, Some(out_scope), 5),
+                ],
+                &store,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.updated, 1);
+        assert_eq!(outcome.added, 0);
+        assert_eq!(fs::read(wc_root.join("src/main.rs")).unwrap(), b"v2\n");
+        assert!(!wc_root.join("docs/new.md").exists());
+    }
+
+    #[test]
+    fn apply_sparse_rules_adds_then_removes_paths() {
+        let dir = TempDir::new("sparse-adj");
+        let store = MemoryObjectStore::new();
+        let all = sparse_files(
+            &store,
+            &[
+                ("src/main.rs", b"main\n"),
+                ("docs/readme.md", b"docs\n"),
+                ("README.md", b"root\n"),
+            ],
+        );
+        let rules = SparseRules::from_paths(["src"]).unwrap();
+        let wc_root = dir.0.join("wc");
+        let mut wc = WorkingCopy::create(&wc_root).unwrap();
+        wc.checkout_with_rules("repo-1", 1, &all, &store, &rules)
+            .unwrap();
+
+        let wider = SparseRules::all();
+        let added = wc.apply_sparse_rules(&wider, &all, 2, &store).unwrap();
+        assert_eq!(added.added, 2);
+        assert_eq!(added.removed, 0);
+        assert!(wc_root.join("docs/readme.md").exists());
+        assert!(wc_root.join("README.md").exists());
+        assert!(wc.status().unwrap().is_empty());
+        assert_eq!(wc.sparse_rules().unwrap(), wider);
+
+        let narrow = SparseRules::from_paths(["docs"]).unwrap();
+        let removed = wc.apply_sparse_rules(&narrow, &[], 3, &store).unwrap();
+        assert_eq!(removed.removed, 2);
+        assert_eq!(removed.added, 0);
+        assert!(!wc_root.join("src/main.rs").exists());
+        assert!(!wc_root.join("README.md").exists());
+        assert!(wc_root.join("docs/readme.md").exists());
+        assert_eq!(wc.sparse_rules().unwrap(), narrow);
+        assert!(wc.status().unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_sparse_rules_refuses_when_removed_paths_are_dirty() {
+        let dir = TempDir::new("sparse-dirty");
+        let store = MemoryObjectStore::new();
+        let all = sparse_files(
+            &store,
+            &[("src/main.rs", b"main\n"), ("docs/readme.md", b"docs\n")],
+        );
+        let rules = SparseRules::all();
+        let wc_root = dir.0.join("wc");
+        let mut wc = WorkingCopy::create(&wc_root).unwrap();
+        wc.checkout_with_rules("repo-1", 1, &all, &store, &rules)
+            .unwrap();
+
+        fs::write(wc_root.join("src/main.rs"), b"edited\n").unwrap();
+        let narrow = SparseRules::from_paths(["docs"]).unwrap();
+        let err = wc.apply_sparse_rules(&narrow, &[], 2, &store).unwrap_err();
+        assert_eq!(err.code, ErrorCode::PathConflict);
+        assert!(wc_root.join("src/main.rs").exists());
+        assert_eq!(wc.sparse_rules().unwrap(), rules);
+
+        wc.revert(&["src/main.rs".to_string()]).unwrap();
+        let outcome = wc.apply_sparse_rules(&narrow, &[], 2, &store).unwrap();
+        assert_eq!(outcome.removed, 1);
+        assert!(!wc_root.join("src/main.rs").exists());
     }
 }

@@ -431,6 +431,46 @@ async fn full_commit_round_trip_over_the_wire() {
         .unwrap();
     assert_eq!(first.objects.len(), 1);
     assert_eq!(first.objects[0].data, content);
+
+    // 稀疏路径：Checkout 流与 GetTree 都按前缀过滤，规则外的文件一个对象都不下发。
+    let mut sparse_stream = h
+        .repos()
+        .await
+        .checkout(bearer(
+            Request::new(pb::CheckoutRequest {
+                repo_id: repo_id.clone(),
+                rev: 0,
+                paths: vec!["docs".into()],
+                depth: pb::Depth::Infinity as i32,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut sparse_objects = 0usize;
+    while let Some(batch) = tokio_stream::StreamExt::next(&mut sparse_stream).await {
+        sparse_objects += batch.unwrap().objects.len();
+    }
+    assert_eq!(sparse_objects, 0);
+
+    let sparse_tree = h
+        .repos()
+        .await
+        .get_tree(bearer(
+            Request::new(pb::GetTreeRequest {
+                repo_id: repo_id.clone(),
+                rev: 0,
+                paths: vec!["202610".into()],
+                depth: pb::Depth::Infinity as i32,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(sparse_tree.entries.len(), 1);
+    assert_eq!(sparse_tree.entries[0].name, "202610/summary.txt");
 }
 
 #[tokio::test]

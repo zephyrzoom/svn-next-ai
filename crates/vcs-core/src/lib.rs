@@ -30,19 +30,21 @@ use std::sync::RwLock;
 
 pub mod auth;
 pub mod hash;
+pub mod sparse;
 pub mod store;
 pub mod tree;
 pub mod wc;
 
 pub use hash::{from_hex, hash_bytes, object_rel_path, to_hex};
+pub use sparse::{SparseRules, SPARSE_META_KEY};
 pub use store::FileObjectStore;
 pub use tree::{
     all_tree_hashes, apply_changes, apply_changes_tracked, build_tree, decode_tree, encode_tree,
     flatten_tree, read_tree, write_tree, FlatEntry, TreeOp,
 };
 pub use wc::{
-    ConflictChoice, ConflictRecord, LocalChange, RemoteChange, StatusEntry, UpdateOutcome, WcState,
-    WorkingCopy,
+    ConflictChoice, ConflictRecord, LocalChange, RemoteChange, SparseOutcome, StatusEntry,
+    UpdateOutcome, WcState, WorkingCopy,
 };
 
 pub const HASH_LEN: usize = 32;

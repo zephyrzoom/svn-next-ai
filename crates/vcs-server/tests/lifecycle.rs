@@ -692,6 +692,47 @@ fn get_changes_diffs_two_revisions() {
     );
 }
 
+/// 稀疏副本的 update 只该拿到规则内的差异；前缀必须按 `/` 边界匹配。
+#[test]
+fn get_changes_under_filters_by_sparse_paths() {
+    let sb = Sandbox::new("sparsechanges");
+    let store = sb.store();
+    let alice = admin(&store);
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
+    let src = sb.dir("src");
+    write_file(&src, "202610/a.txt", b"a\n");
+    write_file(&src, "202611/b.txt", b"b\n");
+    store.import_dir(&alice, &repo.repo_id, &src, "r1").unwrap();
+
+    write_file(&src, "202610/a.txt", b"a2\n");
+    write_file(&src, "202611/b.txt", b"b2\n");
+    store.import_dir(&alice, &repo.repo_id, &src, "r2").unwrap();
+
+    assert_eq!(
+        store
+            .get_changes(&alice, &repo.repo_id, 1, 2)
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let oct = store
+        .get_changes_under(&alice, &repo.repo_id, 1, 2, &["202610".to_string()])
+        .unwrap();
+    assert_eq!(oct.len(), 1);
+    assert_eq!(oct[0].path, "202610/a.txt");
+
+    let empty = store
+        .get_changes_under(&alice, &repo.repo_id, 1, 2, &["docs".to_string()])
+        .unwrap();
+    assert!(empty.is_empty());
+    // 2026100 不该命中 202610：前缀边界必须是 `/` 或路径结尾。
+    let boundary = store
+        .get_changes_under(&alice, &repo.repo_id, 1, 2, &["2026100".to_string()])
+        .unwrap();
+    assert!(boundary.is_empty());
+}
+
 // ---------------- 容量治理：清理与 GC ----------------
 
 /// 造一个典型按月归档的仓库：202610 与 202611 各有一份独有内容，

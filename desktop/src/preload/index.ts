@@ -94,6 +94,14 @@ export interface WorkingCopyInfoDto {
   rev: number;
   /** 最旧的条目基线版本（混合版本下 update 用）。 */
   oldestRev: number;
+  /** 稀疏检出路径前缀；空数组 = 全库检出。 */
+  sparseRules: string[];
+}
+
+export interface SparseResultDto {
+  added: number;
+  removed: number;
+  rules: string[];
 }
 
 export interface DiffEntryDto {
@@ -180,7 +188,12 @@ export interface VcsApi {
     repoId: string,
     dir: string,
     rev?: number,
-  ): Promise<Envelope<{ dir: string; rev: number; files: number }>>;
+    paths?: string[],
+  ): Promise<Envelope<{ dir: string; rev: number; files: number; paths: string[] }>>;
+  /** 仓库 HEAD 的完整相对路径清单，供稀疏检出目录树用。 */
+  tree(repoId: string): Promise<Envelope<string[]>>;
+  /** 调整已检出工作副本的稀疏规则；规则数组为空表示恢复全库。 */
+  setSparseRules(dir: string, rules: string[]): Promise<Envelope<SparseResultDto>>;
   status(
     dir: string,
   ): Promise<
@@ -252,7 +265,11 @@ const api: VcsApi = {
   wcInfo: (dir) => ipcRenderer.invoke('vcs:wcInfo', dir),
   loadRepoDirs: () => ipcRenderer.invoke('vcs:repoDirs'),
   saveRepoDirs: (dirs) => ipcRenderer.invoke('vcs:saveRepoDirs', dirs),
-  checkout: (repoId, dir, rev) => ipcRenderer.invoke('vcs:checkout', repoId, dir, rev),
+  checkout: (repoId, dir, rev, paths) =>
+    ipcRenderer.invoke('vcs:checkout', repoId, dir, rev, paths),
+  tree: (repoId) => ipcRenderer.invoke('vcs:tree', repoId),
+  setSparseRules: (dir, rules) =>
+    ipcRenderer.invoke('vcs:setSparseRules', dir, rules),
   status: (dir) => ipcRenderer.invoke('vcs:status', dir),
   diff: (dir) => ipcRenderer.invoke('vcs:diff', dir),
   commit: (dir, message) => ipcRenderer.invoke('vcs:commit', dir, message),

@@ -164,6 +164,38 @@
                 </div>
               </div>
 
+              <!-- 稀疏检出：检出时勾选目录；已检出后在同一处调整规则 -->
+              <div class="card" id="sparse-card">
+                <div class="card-head">
+                  <h2>稀疏检出</h2>
+                  <span id="sparse-summary" class="muted">全部目录</span>
+                  <span class="head-actions">
+                    <button
+                      id="sparse-toggle"
+                      class="ghost"
+                      type="button"
+                      aria-controls="sparse-body"
+                      aria-expanded="false"
+                    >
+                      选择目录
+                    </button>
+                    <button id="sparse-apply" class="primary hidden" type="button">应用规则</button>
+                  </span>
+                </div>
+                <div id="sparse-body" class="hidden">
+                  <p class="hint">
+                    不勾任何目录 = 检出整个仓库；勾选后只检出这些目录。规则保存在这份工作副本里，
+                    之后可以随时增删，更新也只拉这些目录的内容。
+                  </p>
+                  <div class="sparse-tools">
+                    <button id="sparse-all" class="ghost" type="button">全库检出</button>
+                    <button id="sparse-reload" class="ghost" type="button">刷新目录</button>
+                  </div>
+                  <div id="sparse-tree" class="sparse-tree"></div>
+                  <p id="sparse-rules" class="hint"></p>
+                </div>
+              </div>
+
               <!-- 变更与差异改成上下堆叠：变更独占整行，长文件路径才不会被右栏挤掉一半；
                    差异卡片默认收起，点变更条目或「查看差异」再展开，同样占整行。 -->
               <div class="workbench" id="workbench">

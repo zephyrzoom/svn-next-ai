@@ -1262,7 +1262,16 @@ impl RepoService for RepoApi {
             .min()
             .unwrap_or(repo.head_rev)
             .min(target);
-        match store.get_changes(&session, &repo.repo_id, from, target) {
+        // `bases[].path` 既表达混合版本的基线，也承载稀疏规则：客户端把每条稀疏
+        // 前缀都带上来，服务端就只算这些路径下的差异，不用把整库对象下载一遍。
+        // path 为空是老客户端的「整库」语义，paths 为空时 get_changes_under 不过滤。
+        let paths: Vec<String> = req
+            .bases
+            .iter()
+            .map(|b| b.path.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        match store.get_changes_under(&session, &repo.repo_id, from, target, &paths) {
             Ok(changes) => {
                 let required: Vec<String> = changes
                     .iter()

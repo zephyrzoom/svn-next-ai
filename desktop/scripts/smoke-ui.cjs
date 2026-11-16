@@ -105,14 +105,38 @@ function verify({ app, BrowserWindow, ipcMain }) {
   const stubData = {
     'vcs:loadPrefs': PREFS,
     'vcs:diff': [],
+    'vcs:log': [],
   };
   for (const channel of channels) {
     ipcMain.handle(channel, async (_event, ...args) => {
       if (channel === 'vcs:setTarget') setTargetCalls.push(args[0]);
-      if (channel === 'vcs:checkout') checkoutCalls.push(args);
+      if (channel === 'vcs:checkout') {
+        checkoutCalls.push(args);
+        // 稀疏检出回归要真的走完 checkout()，所以回一份合法的检出结果。
+        // args = [repoId, dir, rev, paths]，第 4 项正是界面勾选出来的稀疏规则。
+        return {
+          ok: true,
+          data: { dir: args[1], rev: 3, files: 1, paths: args[3] || [] },
+        };
+      }
       if (channel === 'vcs:pickDir') return { ok: true, data: ADOPT_DIR };
+      if (channel === 'vcs:tree') {
+        return {
+          ok: true,
+          data: ['src/main.rs', 'src/api/v1.rs', 'docs/readme.md', 'README.md'],
+        };
+      }
+      if (channel === 'vcs:setSparseRules') {
+        return { ok: true, data: { added: 1, removed: 0, rules: args[1] || [] } };
+      }
       if (channel === 'vcs:wcInfo') {
-        return { ok: true, data: args[0] === ADOPT_DIR ? { repoId: 'r1', rev: 9 } : null };
+        return {
+          ok: true,
+          data:
+            args[0] === ADOPT_DIR
+              ? { repoId: 'r1', rev: 9, sparseRules: [] }
+              : null,
+        };
       }
       if (channel === 'vcs:status') {
         return {
@@ -547,6 +571,8 @@ function verify({ app, BrowserWindow, ipcMain }) {
 
       // 「选择…」是唯一的目录选择入口：选到已有工作副本时只读探测后直接接进来，
       // 绝不调用 checkout 重铺；手敲同一个目录点「检出」也必须被挡住。
+      // 记录基线：后面的稀疏检出回归会真的检出一次，不该算进这组断言。
+      const adoptCheckoutBaseline = checkoutCalls.length;
       let adopt = {};
       try {
         adopt = await win.webContents.executeJavaScript(`(async () => {
@@ -606,6 +632,78 @@ function verify({ app, BrowserWindow, ipcMain }) {
         })()`);
       } catch (err) {
         problems.push(`接进已有工作副本求值失败：${err && err.message}`);
+      }
+
+      // 稀疏检出：懒加载目录树 → 勾选 → 规范化规则 → 检出时把规则带给主进程。
+      // 先固化 adopt 阶段的 checkout 次数，免得下面这次真实检出被算成「重铺」。
+      const adoptCheckoutCount = checkoutCalls.length;
+      let sparse = {};
+      try {
+        sparse = await win.webContents.executeJavaScript(`(async () => {
+          const shell = document.getElementById('view-repo');
+          shell.classList.remove('hidden');
+          const saved = {
+            repos: state.repos, selected: state.selectedRepoId, dirs: state.wcDirs,
+            wcDir: state.wcDir, checkoutOpen: state.checkoutOpen, tab: state.tab,
+            sparseOpen: state.sparse.open, sparsePaths: state.sparse.paths,
+            sparseChecked: new Set(state.sparse.checked),
+            sparseExpanded: new Set(state.sparse.expanded),
+            sparseRules: state.sparse.rules, sparseRepoId: state.sparse.repoId,
+          };
+          const wait = () => new Promise((resolve) => setTimeout(resolve, 250));
+          state.repos = [{ repoId: 'r1', name: '仓库一', headRev: 3 }];
+          state.selectedRepoId = 'r1';
+          state.wcDirs = {};
+          state.wcDir = '';
+          state.checkoutOpen = true;
+          state.sparse.repoId = null;
+          state.sparse.paths = [];
+          state.sparse.checked = new Set();
+          state.sparse.expanded = new Set(['src']);
+          state.sparse.rules = [];
+          state.sparse.open = true;
+          renderRepoNav();
+          renderWcBar();
+          await loadSparseTree(true);
+          const roots = Array.from(
+            document.querySelectorAll('#sparse-tree > .sparse-node > .sparse-row label .sparse-name'),
+          ).map((n) => n.textContent);
+          const labelFor = (path) => Array.from(
+            document.querySelectorAll('#sparse-tree .sparse-row label'),
+          ).find((l) => l.querySelector('.sparse-name').title === path);
+          labelFor('src').querySelector('input').click();
+          const afterSrc = {
+            rules: currentSparseRules(),
+            inherited: document.querySelectorAll('#sparse-tree input:checked:disabled').length,
+            summary: document.getElementById('sparse-summary').textContent,
+          };
+          labelFor('README.md').querySelector('input').click();
+          const finalRules = currentSparseRules();
+          // 真的检出一次：主进程 stub 会记下第 4 个参数（界面勾选出来的稀疏规则）。
+          document.getElementById('dir').value = '/tmp/sparse-new';
+          document.getElementById('checkout').click();
+          await wait();
+          const applyVisible = !document.getElementById('sparse-apply').classList.contains('hidden');
+          document.getElementById('sparse-all').click();
+          const cleared = currentSparseRules();
+          const normalized = normalizeSparsePaths(['src/api', 'src', 'docs/', 'docs', '/README.md']);
+          state.repos = saved.repos;
+          state.selectedRepoId = saved.selected;
+          state.wcDirs = saved.dirs;
+          state.wcDir = saved.wcDir;
+          state.checkoutOpen = saved.checkoutOpen;
+          state.tab = saved.tab;
+          state.sparse.open = saved.sparseOpen;
+          state.sparse.paths = saved.sparsePaths;
+          state.sparse.checked = saved.sparseChecked;
+          state.sparse.expanded = saved.sparseExpanded;
+          state.sparse.rules = saved.sparseRules;
+          state.sparse.repoId = saved.sparseRepoId;
+          shell.classList.add('hidden');
+          return { roots, afterSrc, finalRules, cleared, normalized, applyVisible };
+        })()`);
+      } catch (err) {
+        problems.push(`稀疏检出求值失败：${err && err.message}`);
       }
 
       const checks = {
@@ -726,11 +824,27 @@ function verify({ app, BrowserWindow, ipcMain }) {
           adopt.again?.dirs?.length === 2 &&
           adopt.typed?.dirs?.length === 2 &&
           adopt.typed?.active === '/tmp/wc-adopt' &&
-          checkoutCalls.length === 0,
+          adoptCheckoutCount === adoptCheckoutBaseline,
         别家仓库的工作副本以wc_db为准切上下文:
           adopt.cross?.selected === 'r2' &&
           adopt.cross?.active === '/tmp/wc-other' &&
           adopt.cross?.r2?.join(',') === '/tmp/wc-other',
+        稀疏目录树可勾选且规则被规范化:
+          sparse.roots?.join(',') === 'docs/,src/,README.md' &&
+          sparse.afterSrc?.rules?.join(',') === 'src' &&
+          sparse.afterSrc?.inherited >= 2 &&
+          sparse.afterSrc?.summary?.includes('已选 1 个目录') === true &&
+          sparse.finalRules?.join(',') === 'README.md,src' &&
+          sparse.normalized?.join(',') === 'README.md,docs,src' &&
+          sparse.cleared?.length === 0 &&
+          sparse.applyVisible === true,
+        检出时把勾选的稀疏规则传给主进程:
+          checkoutCalls.some(
+            (args) =>
+              args[1] === '/tmp/sparse-new' &&
+              Array.isArray(args[3]) &&
+              args[3].join(',') === 'README.md,src',
+          ),
       };
       for (const [name, ok] of Object.entries(checks)) {
         if (!ok) problems.push(`断言失败：${name}`);
@@ -746,6 +860,7 @@ function verify({ app, BrowserWindow, ipcMain }) {
         commitGuard,
         multiWc,
         adopt,
+        sparse,
         checkoutCalls: checkoutCalls.length,
       });
     })

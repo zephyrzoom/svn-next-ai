@@ -24,6 +24,13 @@ export interface WorkingCopyInfo {
    * 刚 revert 过的条目仍停在旧基线，只看 `rev` 会以为「已经最新」而漏拉内容。
    */
   oldestRev: number;
+  /** 稀疏检出路径前缀；空数组 = 全库检出。老副本读不到时按全量处理。 */
+  sparseRules: string[];
+}
+
+export interface SparseOutcome {
+  added: number;
+  removed: number;
 }
 
 export interface StatusEntry {
@@ -83,7 +90,16 @@ interface NativeBinding {
     entriesJson: string,
     hashes: string[],
     blobs: Buffer[],
+    rulesJson: string,
   ): number;
+  wcApplySparseRules(
+    dir: string,
+    rulesJson: string,
+    rev: number,
+    entriesJson: string,
+    hashes: string[],
+    blobs: Buffer[],
+  ): string;
   wcStatus(dir: string): string;
   wcDiff(dir: string): string;
   wcLocalChanges(dir: string): string;
@@ -164,6 +180,7 @@ export function checkout(
   rev: number,
   entries: CheckoutEntry[],
   contents: Map<string, Buffer>,
+  rules: string[] = [],
 ): number {
   const hashes: string[] = [];
   const blobs: Buffer[] = [];
@@ -175,7 +192,47 @@ export function checkout(
     hashes.push(entry.hash);
     blobs.push(data);
   }
-  return native.wcCheckout(dir, repoId, rev, JSON.stringify(entries), hashes, blobs);
+  return native.wcCheckout(
+    dir,
+    repoId,
+    rev,
+    JSON.stringify(entries),
+    hashes,
+    blobs,
+    JSON.stringify(rules),
+  );
+}
+
+/**
+ * 调整稀疏规则：把新增前缀下的文件与内容交给 core 增量铺盘 / 移除。
+ * 规则之外的干净条目会被删掉；有本地改动时 core 直接报错，一个文件都不会动。
+ */
+export function applySparseRules(
+  dir: string,
+  rules: string[],
+  rev: number,
+  entries: CheckoutEntry[],
+  contents: Map<string, Buffer>,
+): SparseOutcome {
+  const hashes: string[] = [];
+  const blobs: Buffer[] = [];
+  for (const entry of entries) {
+    const data = contents.get(entry.hash);
+    if (!data) {
+      throw new Error(`缺少对象 ${entry.hash}（${entry.path}），调整稀疏规则中断`);
+    }
+    hashes.push(entry.hash);
+    blobs.push(data);
+  }
+  const raw = native.wcApplySparseRules(
+    dir,
+    JSON.stringify(rules),
+    rev,
+    JSON.stringify(entries),
+    hashes,
+    blobs,
+  );
+  return JSON.parse(raw) as SparseOutcome;
 }
 
 /** 扫描工作副本（mtime 快路径 + 改动条目重算哈希）。 */

@@ -942,11 +942,12 @@ export class VcsClient {
     return { rev: resp.rev as number, rootTree: resp.rootTree as string };
   }
 
-  async getTree(repoId: string, rev = 0): Promise<TreeEntry[]> {
+  /** `paths` 为稀疏路径前缀；空数组表示整库。 */
+  async getTree(repoId: string, rev = 0, paths: string[] = []): Promise<TreeEntry[]> {
     const resp = await this.invoke<any>(this.repo, 'getTree', {
       repoId,
       rev,
-      paths: [],
+      paths,
       depth: 1, // DEPTH_INFINITY
     });
     assertOk(resp.status);
@@ -958,9 +959,13 @@ export class VcsClient {
     }));
   }
 
-  /** 拉取某个版本的全部 blob（对象流）。返回 哈希 → 内容。 */
-  async downloadObjects(repoId: string, rev: number): Promise<Map<string, Buffer>> {
-    const call = (this.repo as any).checkout({ repoId, rev, paths: [], depth: 1 }, this.metadata());
+  /** 拉取某个版本、某组稀疏路径下的全部 blob（对象流）。返回 哈希 → 内容。 */
+  async downloadObjects(
+    repoId: string,
+    rev: number,
+    paths: string[] = [],
+  ): Promise<Map<string, Buffer>> {
+    const call = (this.repo as any).checkout({ repoId, rev, paths, depth: 1 }, this.metadata());
     const contents = new Map<string, Buffer>();
     await new Promise<void>((resolve, reject) => {
       call.on('data', (batch: any) => {
@@ -1019,10 +1024,15 @@ export class VcsClient {
     repoId: string,
     baseRev: number,
     targetRev = 0,
+    paths: string[] = [],
   ): Promise<{ rev: number; changes: ChangePayload[] }> {
     const resp = await this.invoke<any>(this.repo, 'update', {
       repoId,
-      bases: [{ path: '', baseRev }],
+      // 稀疏副本把每条规则都作为一条基线带上：服务端据此只算这些路径的差异。
+      // 老语义（整库）用一条 path 为空的基线表示。
+      bases: paths.length
+        ? paths.map((p) => ({ path: p, baseRev }))
+        : [{ path: '', baseRev }],
       targetRev,
     });
     assertOk(resp.status);

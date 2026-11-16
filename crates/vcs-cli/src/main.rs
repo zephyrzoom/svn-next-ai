@@ -21,7 +21,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use vcs_core::{hash_bytes, ChangeKind, ObjectStore, WorkingCopy};
+use vcs_core::{hash_bytes, ChangeKind, ObjectStore, SparseRules, WorkingCopy};
 use vcs_server::{
     authenticate_ldap, test_ldap_connection, PendingChange, ServerStore, Session, TlsMode,
 };
@@ -39,6 +39,23 @@ struct Cli {
 
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum SparseCmd {
+    /// 查看当前稀疏规则
+    Show {
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+    },
+    /// 设置稀疏规则；不带 --paths 表示恢复全库检出
+    Set {
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// 路径前缀，可重复或用逗号分隔，例如 --paths src,docs/api.md
+        #[arg(long, value_delimiter = ',')]
+        paths: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -116,6 +133,14 @@ enum Cmd {
         /// 指定版本，默认取 head
         #[arg(short, long)]
         rev: Option<u64>,
+        /// 只检出这些路径前缀（可重复或逗号分隔）；不传 = 全库
+        #[arg(long, value_delimiter = ',')]
+        paths: Vec<String>,
+    },
+    /// 查看或调整工作副本的稀疏检出规则
+    Sparse {
+        #[command(subcommand)]
+        action: SparseCmd,
     },
     /// 离线查看工作副本状态
     Status {
@@ -626,20 +651,71 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Cmd::Checkout { repo, dir, rev } => {
+        Cmd::Checkout {
+            repo,
+            dir,
+            rev,
+            paths,
+        } => {
             let store = ServerStore::open(&store_root)?;
             let session = require_session(&store, &store_root)?;
+            let rules = SparseRules::from_paths(&paths)?;
             let (repo_info, rev, files) = store.files_at(&session, &repo, rev)?;
             let mut wc = WorkingCopy::create(&dir)?;
-            let written = wc.checkout(&repo_info.repo_id, rev, &files, store.objects())?;
+            let written =
+                wc.checkout_with_rules(&repo_info.repo_id, rev, &files, store.objects(), &rules)?;
             println!(
-                "已检出 {} r{} 到 {}（{} 个文件）",
+                "已检出 {} r{} 到 {}（{} 个文件{}）",
                 repo_info.name,
                 rev,
                 dir.display(),
-                written
+                written,
+                if rules.is_sparse() {
+                    format!("，稀疏路径：{}", rules.paths.join("、"))
+                } else {
+                    String::new()
+                }
             );
         }
+
+        Cmd::Sparse { action } => match action {
+            SparseCmd::Show { dir } => {
+                let wc = WorkingCopy::open(&dir)?;
+                let rules = wc.sparse_rules()?;
+                if rules.is_sparse() {
+                    println!("稀疏检出路径（{} 条）：", rules.paths.len());
+                    for path in &rules.paths {
+                        println!("  {path}");
+                    }
+                } else {
+                    println!("全库检出（未设置稀疏规则）");
+                }
+            }
+            SparseCmd::Set { dir, paths } => {
+                let store = ServerStore::open(&store_root)?;
+                let session = require_session(&store, &store_root)?;
+                let mut wc = WorkingCopy::open(&dir)?;
+                let repo_id = wc
+                    .get_meta("repo_id")?
+                    .ok_or("这个工作副本没有关联仓库，请先 checkout")?;
+                let rules = SparseRules::from_paths(&paths)?;
+                let info = store.find_repo(&repo_id)?;
+                // CLI 本地直连存储，全量清单直接交给 core：它会跳过已有条目、
+                // 只补新纳入的路径，并在移除前拦下所有本地改动。
+                let (_repo, rev, files) =
+                    store.files_at(&session, &repo_id, Some(info.head_rev))?;
+                let outcome = wc.apply_sparse_rules(&rules, &files, rev, store.objects())?;
+                println!(
+                    "已调整稀疏规则：新增 {} 个文件，移除 {} 个文件（r{}）",
+                    outcome.added, outcome.removed, rev
+                );
+                if rules.is_sparse() {
+                    println!("当前路径：{}", rules.paths.join("、"));
+                } else {
+                    println!("当前为全库检出");
+                }
+            }
+        },
 
         Cmd::Commit { dir, message } => {
             let store = ServerStore::open(&store_root)?;
@@ -744,7 +820,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
 
-            let changes = store.get_changes(&session, &repo_id, from_rev, target)?;
+            // 稀疏副本只拉规则内的差异；core 的 apply_update 还有一道同样的防线。
+            let rules = wc.sparse_rules()?;
+            let changes =
+                store.get_changes_under(&session, &repo_id, from_rev, target, &rules.paths)?;
             let remote: Vec<vcs_core::RemoteChange> = changes
                 .iter()
                 .map(|c| vcs_core::RemoteChange {

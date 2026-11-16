@@ -180,7 +180,7 @@ FinalizeCommit(session_id)
 
 ## 6. 核心流程
 
-- **checkout**：`GetHead` → 取目标 rev 的 `root_tree`（按 depth 与稀疏路径）→ 按哈希批量拉缺失对象 → 写工作文件 + `wc.db` + `pristine`，全程可断点续传。
+- **checkout**：`GetHead` → 取目标 rev 的 `root_tree`（按稀疏路径前缀过滤；`Depth` 四态暂未启用）→ 按哈希批量拉缺失对象 → 写工作文件 + `wc.db` + `pristine`，全程可断点续传。稀疏规则存在 `wc.db` 的 `meta.sparse_rules`，见 §36。
 - **status / diff**：纯本地，`imara-diff` 做行级 diff。
 - **commit**：`Finalize` 内事务用 `SELECT head FOR UPDATE`（SQLite `BEGIN IMMEDIATE`）保证单写者；`head != base_rev` 返回 `OUT_OF_DATE`，否则 copy-on-write 构建新 `root_tree`、写 revision、一次提交。冲突路径上不会出现「半合并」状态。
 - **update**：服务端算 tree diff，客户端做 base/mine/theirs 三方合并；树冲突（add/add、delete/modify 等）返回结构化错误，MVP 不自动解决。
@@ -1211,7 +1211,7 @@ bootstrap 管理员（CLI 直连存储根）→ 启动 vcs serve（真实端口�
 ### 22.4 本阶段未覆盖
 
 - **冲突只有元数据，没有三栏合并界面**：`wc.conflicts` 已能拿到 base/mine/theirs 三个哈希，界面还没做对比与手工合并；
-- **稀疏检出 / 单文件更新**：`GetTree` 仍返回扁平全量，update 只能整棵拉；
+- **稀疏检出** 已落地（见 §36）；**单文件 update**（对单个路径单独指定目标版本）仍未实现；
 - 注册、审批台、成员管理、配额配置页、空间面板、打包与自动更新都还没做；
 - 连接使用明文 HTTP/2（`createInsecure`）：仅限本机或内网，对外必须前置 TLS 网关；
 - token 只存在主进程内存，重启应用需要重新登录（后续接 `safeStorage`）。
@@ -1770,3 +1770,32 @@ SQLite 改不了已存在的 `CHECK`，所以 `migrate_user_roles()` 重建 `use
 | `npm run smoke` | 通过：审批通过后 `bob` 的 role 断言为 1（普通用户） |
 | `npm run smoke:admin` | 通过：直接建号改用 `role=user`，审批台 / 用户列表无角色下拉 |
 | 旧库升级 | 手工构造旧 schema 的 `server.db` 后 `vcs server info` 触发迁移，幂等 |
+
+## 36. 稀疏检出（2026-11-16）
+
+### 36.1 契约与规则
+
+proto 里 `CheckoutRequest.paths` / `GetTreeRequest.paths` 的「稀疏路径，空表示全部」语义从预留变成实装；**没有改 proto、没有加 RPC**。`UpdateRequest.bases[].path` 复用为稀疏前缀：客户端把每条规则作为一条基线送给服务端，服务端只算这些路径的差异；`path` 为空仍是老客户端的整库语义，向后兼容。`Depth` 四态仍未启用，`GetTree` 遇到非 `INFINITY` 依旧返回 `INVALID_ARGUMENT`。
+
+规则是「要检出的路径前缀」白名单，相对仓库根、`/` 分隔：`src` 覆盖整棵子树，`README.md` 也可以作为精确的单文件规则。**空规则 = 全量检出**，老工作副本读不到 `meta.sparse_rules` 时自然降级为全量，不需要数据迁移。规则在 `vcs-core::sparse::SparseRules` 里统一规范化（防目录穿越、去重、排序、删掉被更短前缀覆盖的冗余项），JSON 字符串数组存进 `wc.db` 的 `meta` 表——不新开表就是为了让老库零迁移。
+
+### 36.2 四层防线
+
+| 层 | 落点 | 作用 |
+| --- | --- | --- |
+| 服务端 | `vcs-server::get_changes_under` + `vcs-grpc` 的 `Checkout` / `GetTree` / `Update` | Checkout 对象流、GetTree 清单、Update 差异都按前缀过滤，稀疏副本不会下载整库对象 |
+| 工作副本 | `WorkingCopy::checkout_with_rules` / `apply_sparse_rules` / `apply_update` | 检出时再挡一道规则外文件；apply_update 也独立过滤，上层漏过滤也撑不成全量；status / local_changes 忽略规则外的磁盘文件 |
+| 客户端编排 | `desktop/src/main/flow.ts`、`client.ts` | `getTree` / `downloadObjects` / `update` 透传规则；调整规则时只补拉「新规则相对旧规则多出来」的前缀，收窄不联网 |
+| 界面 | 桌面端「稀疏检出」卡片 | 从仓库 HEAD 的扁平路径推导可展开目录树，勾选目录 → 规则；检出时带上，已检出后点「应用规则」增量调整 |
+
+`apply_sparse_rules` 是唯一能改动已有副本的入口：**绝不 `DELETE FROM entries` 重铺**。它只补拉「旧规则没有、新规则有、本地还没有条目」的路径，移除前用 `status_with(true)` 全量校验——受版本控制的条目只要有本地改动或冲突就整笔拒绝（`PathConflict`），用户自己的未受控文件不会被删，只清理空掉的上层目录。
+
+### 36.3 入口
+
+- CLI：`vcs checkout <repo> <dir> --paths src,docs/api.md`（可重复 / 逗号分隔）、`vcs sparse show <dir>`、`vcs sparse set <dir> --paths ...`（不带 `--paths` 恢复全库）。`vcs update` 自动按 `wc.db` 里的规则收敛。
+- 桌面端：「稀疏检出」卡片的目录树勾选；父目录勾中后子项自动选中且不可单独取消；「全库检出」一键清空；已检出副本修改后点「应用规则」。
+- 调整规则不属于管理员审批 / 配额范畴，纯客户端本地行为，服务端只按请求里的路径前缀提供数据。
+
+### 36.4 验收
+
+`cargo test --workspace`（core 新增 6 组规则单测 + 4 组工作副本稀疏单测；server 新增 `get_changes_under` 前缀边界用例；e2e 新增带 `paths` 的 Checkout 流 / GetTree 断言）、`cargo clippy -D warnings`、`cargo fmt --check`、`npm run build` / `smoke:ui`（新增目录树勾选、规则规范化、检出参数传递断言）/ `smoke` / `smoke:admin` 全通过；另用真实 CLI 走完「稀疏检出 → 扩大 → 恢复全库 → 收窄 → 造新版本后 update 仍稀疏 → 脏条目被拦下」闭环。

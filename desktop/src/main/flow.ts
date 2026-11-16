@@ -18,6 +18,13 @@ export interface CheckoutResult {
   dir: string;
   rev: number;
   files: number;
+  /** 本次检出的稀疏路径；空数组 = 全库。 */
+  paths: string[];
+}
+
+export interface SparseResult extends wc.SparseOutcome {
+  /** 实际写入 wc.db 的规则（已规范化、去掉被覆盖的冗余前缀）。 */
+  rules: string[];
 }
 
 export interface CommitResult {
@@ -30,25 +37,79 @@ export interface CommitResult {
   message: string;
 }
 
+/** 稀疏路径前缀匹配：`path === prefix` 或位于其下，边界必须是 `/`。 */
+export function sparseUnder(prefix: string, path: string): boolean {
+  return path === prefix || path.startsWith(`${prefix}/`);
+}
+
+/** 去掉被更短前缀覆盖的冗余项，与 core 的 SparseRules 规范化保持一致。 */
+export function normalizeSparsePaths(paths: string[]): string[] {
+  const sorted = [...new Set(paths.map((p) => p.trim().replace(/^\/+|\/+$/g, '')).filter(Boolean))].sort();
+  return sorted.filter((p) => !sorted.some((q) => q.length < p.length && sparseUnder(q, p)));
+}
+
+/** 新规则相对旧规则多出来的前缀；旧规则是全量时没有需要补拉的路径。 */
+export function addedSparsePrefixes(oldRules: string[], nextRules: string[]): string[] {
+  if (oldRules.length === 0) return [];
+  return nextRules.filter((p) => !oldRules.some((q) => sparseUnder(q, p)));
+}
+
 /** 检出到目录：先拿树，再拉对象流，最后铺盘并写基线。 */
 export async function checkoutRepo(
   client: VcsClient,
   repoId: string,
   dir: string,
   rev = 0,
+  paths: string[] = [],
 ): Promise<CheckoutResult> {
+  const rules = normalizeSparsePaths(paths);
   const head = await client.getHead(repoId);
   const target = rev === 0 ? head.rev : rev;
-  const entries = await client.getTree(repoId, target);
-  const contents = await client.downloadObjects(repoId, target);
+  const entries = await client.getTree(repoId, target, rules);
+  const contents = await client.downloadObjects(repoId, target, rules);
   const files = wc.checkout(
     dir,
     repoId,
     target,
     entries.map((entry) => ({ path: entry.path, hash: entry.hash, size: entry.size })),
     contents,
+    rules,
   );
-  return { dir, rev: target, files };
+  return { dir, rev: target, files, paths: rules };
+}
+
+/**
+ * 调整已检出工作副本的稀疏规则。
+ *
+ * 只补拉「新规则相对旧规则多出来」的前缀：扩大到全库时拉全量，收窄时不联网。
+ * 移除干净条目、拦下本地改动都在 vcs-core 里做，这里只负责把对象喂进去。
+ */
+export async function setSparseRules(
+  client: VcsClient,
+  dir: string,
+  rules: string[],
+): Promise<SparseResult> {
+  const info = wc.openInfo(dir);
+  const oldRules = info.sparseRules ?? [];
+  const nextRules = normalizeSparsePaths(rules);
+  const added = addedSparsePrefixes(oldRules, nextRules);
+  const needDownload = nextRules.length === 0 ? oldRules.length > 0 : added.length > 0;
+  const head = await client.getHead(info.repoId);
+
+  let entries: wc.CheckoutEntry[] = [];
+  let contents = new Map<string, Buffer>();
+  if (needDownload) {
+    const fetchPaths = nextRules.length === 0 ? [] : added;
+    const tree = await client.getTree(info.repoId, head.rev, fetchPaths);
+    entries = tree.map((entry) => ({
+      path: entry.path,
+      hash: entry.hash,
+      size: entry.size,
+    }));
+    contents = await client.downloadObjects(info.repoId, head.rev, fetchPaths);
+  }
+  const outcome = wc.applySparseRules(dir, nextRules, head.rev, entries, contents);
+  return { ...outcome, rules: nextRules };
 }
 
 /**
@@ -171,12 +232,14 @@ export async function updateWorkingCopy(
     throw new Error(`本地 r${info.oldestRev} 比服务端 r${head.rev} 还新，请重新检出`);
   }
 
-  const delta = await client.update(info.repoId, info.oldestRev, head.rev);
+  // 稀疏副本把规则带给服务端，只拉这些路径下的差异；全量副本传空数组 = 整库。
+  const rules = info.sparseRules ?? [];
+  const delta = await client.update(info.repoId, info.oldestRev, head.rev, rules);
   const needed = delta.changes.map((change) => change.hash).filter((h): h is string => !!h);
   const objects = await client.fetchObjects([...new Set(needed)]);
   const outcome = wc.applyUpdate(dir, info.repoId, head.rev, delta.changes, objects);
-  // 这次变更集覆盖整个仓库（Update 未做路径过滤），所以没出现在差异里的条目
-  // 一定与目标版本一致，可以安全地把它们的基线版本推进到 head。
+  // 这次变更集覆盖整份工作副本（全量副本覆盖整库，稀疏副本按规则覆盖规则内路径），
+  // 所以没出现在差异里的条目一定与目标版本一致，可以安全地把基线推进到 head。
   wc.advanceBase(dir, head.rev);
   return outcome;
 }

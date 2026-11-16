@@ -3,7 +3,13 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import { VcsError, VcsClient, type UserInfo } from './client';
-import { checkoutRepo, commitWorkingCopy, revertWorkingCopy, updateWorkingCopy } from './flow';
+import {
+  checkoutRepo,
+  commitWorkingCopy,
+  revertWorkingCopy,
+  setSparseRules,
+  updateWorkingCopy,
+} from './flow';
 import {
   clearToken,
   loadPrefs,
@@ -249,8 +255,22 @@ ipcMain.handle('vcs:saveRepoDirs', (_event, dirs: Record<string, string[]>) =>
   }),
 );
 
-ipcMain.handle('vcs:checkout', (_event, repoId: string, dir: string, rev = 0) =>
-  wrap(async () => checkoutRepo(requireClient(), repoId, dir, rev)),
+ipcMain.handle(
+  'vcs:checkout',
+  (_event, repoId: string, dir: string, rev = 0, paths: string[] = []) =>
+    wrap(async () => checkoutRepo(requireClient(), repoId, dir, rev, paths)),
+);
+
+/** 仓库 HEAD 的完整相对路径清单：渲染层据此推导目录树，供稀疏检出勾选。 */
+ipcMain.handle('vcs:tree', (_event, repoId: string) =>
+  wrap(async () =>
+    (await requireClient().getTree(repoId, 0)).map((entry) => entry.path),
+  ),
+);
+
+/** 调整已检出工作副本的稀疏规则（增量补拉 / 移除，不重新铺盘）。 */
+ipcMain.handle('vcs:setSparseRules', (_event, dir: string, rules: string[]) =>
+  wrap(async () => setSparseRules(requireClient(), dir, rules)),
 );
 
 ipcMain.handle('vcs:status', (_event, dir: string) =>

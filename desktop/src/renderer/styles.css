@@ -1144,3 +1144,75 @@ button.ghost:disabled:hover {
 .quota .bar #quota-fill.danger {
   background: var(--delete);
 }
+
+/* ---------- 稀疏检出：可展开的目录树勾选 ---------- */
+.sparse-tools {
+  display: flex;
+  gap: 8px;
+  margin: 4px 0 8px;
+}
+
+.sparse-tree {
+  max-height: 240px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--panel);
+}
+
+.sparse-node {
+  margin: 1px 0;
+}
+
+.sparse-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+}
+
+.sparse-caret {
+  width: 18px;
+  flex: 0 0 18px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.sparse-row label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.sparse-row input[type='checkbox'] {
+  accent-color: var(--accent);
+  flex: 0 0 auto;
+}
+
+.sparse-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sparse-name.file {
+  color: var(--muted);
+}
+
+.sparse-children {
+  margin-left: 18px;
+  border-left: 1px solid var(--line);
+  padding-left: 10px;
+}
+
+.sparse-empty {
+  color: var(--muted);
+  padding: 6px 2px;
+}

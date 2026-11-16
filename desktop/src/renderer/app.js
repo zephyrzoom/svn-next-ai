@@ -74,6 +74,20 @@ const state = {
   searchTimer: 0,
   /** 提交进行中：按钮禁用的同时用它挡住重复调用。 */
   committing: false,
+  /**
+   * 稀疏检出面板。`checked` 是界面里勾中的目录，`rules` 是当前工作副本里
+   * 真正生效的规则（从 wc.db 读回）；两者不一致时提示「待应用」。
+   */
+  sparse: {
+    open: false,
+    paths: [],
+    checked: new Set(),
+    expanded: new Set(),
+    rules: [],
+    repoId: null,
+    loading: false,
+    busy: false,
+  },
 };
 
 const el = (id) => document.getElementById(id);
@@ -424,6 +438,14 @@ function renderRepoNav() {
  */
 async function selectRepo(repoId) {
   state.selectedRepoId = repoId;
+  // 换仓库 = 换一份工作副本：稀疏勾选、目录树缓存、已生效规则全部重来，
+  // 绝不把上一个仓库的选择带过来（目录清单是按仓库缓存的）。
+  state.sparse.repoId = null;
+  state.sparse.paths = [];
+  state.sparse.checked = new Set();
+  state.sparse.expanded = new Set();
+  state.sparse.rules = [];
+  state.sparse.open = false;
   // 每个仓库记住一串目录，第一个是上次用的那份；没检出过就回到检出引导。
   state.wcDir = dirsFor(repoId)[0] || '';
   state.checkoutOpen = !state.wcDir;
@@ -596,6 +618,216 @@ function renderWcBar() {
   el('cancel-checkout').classList.toggle('hidden', !dir);
   renderWcDirOptions();
   renderWcDirList();
+  renderSparseSummary();
+}
+
+// ---------------- 稀疏检出 ----------------
+
+/** 与 Rust / flow 层同一套前缀语义：路径相等或位于该目录下，边界必须是 `/`。 */
+function sparseUnder(prefix, path) {
+  return path === prefix || path.startsWith(`${prefix}/`);
+}
+
+/** 去空、去重、排序，删掉被更短前缀覆盖的冗余项（src 已包含 src/api）。 */
+function normalizeSparsePaths(paths) {
+  const sorted = [
+    ...new Set(
+      (paths || [])
+        .map((p) => String(p).trim().replace(/^\/+|\/+$/g, ''))
+        .filter(Boolean),
+    ),
+  ].sort();
+  return sorted.filter(
+    (p) => !sorted.some((q) => q.length < p.length && sparseUnder(q, p)),
+  );
+}
+
+/** 界面勾选 → 本次要用的稀疏规则；空数组 = 全库。 */
+function currentSparseRules() {
+  return normalizeSparsePaths([...state.sparse.checked]);
+}
+
+/** 仓库 HEAD 的扁平相对路径 → 目录树，文件也作为可勾选的叶子。 */
+function buildSparseTree(paths) {
+  const root = { path: '', name: '', children: new Map(), file: false };
+  for (const raw of paths) {
+    const value = String(raw).replace(/\\/g, '/').replace(/^\/+/, '');
+    const parts = value.split('/').filter(Boolean);
+    if (!parts.length) continue;
+    let node = root;
+    for (let i = 0; i < parts.length - 1; i += 1) {
+      const name = parts[i];
+      const full = node.path ? `${node.path}/${name}` : name;
+      if (!node.children.has(name)) {
+        node.children.set(name, { path: full, name, children: new Map(), file: false });
+      }
+      node = node.children.get(name);
+    }
+    const leaf = parts[parts.length - 1];
+    node.children.set(leaf, { path: value, name: leaf, children: new Map(), file: true });
+  }
+  return root;
+}
+
+function sparseSort(a, b) {
+  return Number(a.file) - Number(b.file) || a.name.localeCompare(b.name);
+}
+
+/** 父目录已勾中时子节点自动跟着选中；不能单独取消，要先取消父目录。 */
+function sparseCheckboxState(path) {
+  const checked = [...state.sparse.checked].some((p) => sparseUnder(p, path));
+  return { checked, inherited: checked && !state.sparse.checked.has(path) };
+}
+
+function sparseTogglePath(node, checked) {
+  if (checked) {
+    const next = new Set(
+      [...state.sparse.checked].filter((p) => !sparseUnder(node.path, p)),
+    );
+    next.add(node.path);
+    state.sparse.checked = next;
+  } else {
+    state.sparse.checked.delete(node.path);
+  }
+  renderSparseTree();
+  renderSparseSummary();
+}
+
+function sparseNodeElement(node) {
+  const wrap = document.createElement('div');
+  wrap.className = 'sparse-node';
+  const row = document.createElement('div');
+  row.className = 'sparse-row';
+  const hasChildren = node.children.size > 0;
+
+  const caret = document.createElement('button');
+  caret.type = 'button';
+  caret.className = 'sparse-caret';
+  caret.textContent = hasChildren
+    ? state.sparse.expanded.has(node.path)
+      ? '▾'
+      : '▸'
+    : '';
+  caret.disabled = !hasChildren;
+  caret.addEventListener('click', () => {
+    if (state.sparse.expanded.has(node.path)) state.sparse.expanded.delete(node.path);
+    else state.sparse.expanded.add(node.path);
+    renderSparseTree();
+  });
+  row.appendChild(caret);
+
+  const label = document.createElement('label');
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  const mark = sparseCheckboxState(node.path);
+  input.checked = mark.checked;
+  input.disabled = mark.inherited;
+  input.addEventListener('change', () => sparseTogglePath(node, input.checked));
+  const name = document.createElement('span');
+  name.className = `sparse-name${node.file ? ' file' : ''}`;
+  name.textContent = node.file ? node.name : `${node.name}/`;
+  name.title = node.path;
+  label.append(input, name);
+  row.appendChild(label);
+  wrap.appendChild(row);
+
+  if (hasChildren && state.sparse.expanded.has(node.path)) {
+    const children = document.createElement('div');
+    children.className = 'sparse-children';
+    for (const child of [...node.children.values()].sort(sparseSort)) {
+      children.appendChild(sparseNodeElement(child));
+    }
+    wrap.appendChild(children);
+  }
+  return wrap;
+}
+
+function renderSparseTree() {
+  const box = el('sparse-tree');
+  box.innerHTML = '';
+  if (state.sparse.loading) {
+    box.innerHTML = '<div class="sparse-empty">正在读取仓库目录…</div>';
+    return;
+  }
+  if (!state.sparse.paths.length) {
+    box.innerHTML =
+      '<div class="sparse-empty">点「刷新目录」读取仓库结构；空仓库直接全库检出即可。</div>';
+    return;
+  }
+  const root = buildSparseTree(state.sparse.paths);
+  for (const node of [...root.children.values()].sort(sparseSort)) {
+    box.appendChild(sparseNodeElement(node));
+  }
+}
+
+/** 懒加载仓库 HEAD 的路径清单，只在打开面板或切换仓库后才拉。 */
+async function loadSparseTree(force = false) {
+  const repo = currentRepo();
+  if (!repo) return;
+  if (!force && state.sparse.repoId === repo.repoId && state.sparse.paths.length) return;
+  state.sparse.loading = true;
+  state.sparse.repoId = repo.repoId;
+  renderSparseTree();
+  const paths = unwrap(await api.tree(repo.repoId), '读取仓库目录');
+  state.sparse.paths = Array.isArray(paths) ? paths : [];
+  state.sparse.loading = false;
+  renderSparseTree();
+}
+
+/** 从 wc.db 读回真正生效的规则；切换目录 / 检出 / 更新后都要重新对齐。 */
+async function loadSparseRules() {
+  if (!state.wcDir) {
+    state.sparse.rules = [];
+    renderSparseSummary();
+    return;
+  }
+  const info = unwrap(await api.wcInfo(state.wcDir), '读取稀疏规则');
+  const rules = normalizeSparsePaths(info && info.sparseRules ? info.sparseRules : []);
+  state.sparse.rules = rules;
+  state.sparse.checked = new Set(rules);
+  renderSparseSummary();
+  renderSparseTree();
+}
+
+function renderSparseSummary() {
+  if (!state.wcDir) state.sparse.rules = [];
+  const rules = currentSparseRules();
+  const active = state.sparse.rules;
+  const pending = rules.join(',') !== active.join(',');
+  const label = rules.length ? `已选 ${rules.length} 个目录` : '全部目录';
+  el('sparse-summary').textContent = state.wcDir
+    ? `${active.length ? `已检出 ${active.length} 个目录` : '全库检出'}${pending ? ` · 待应用：${label}` : ''}`
+    : `${label}（检出时生效）`;
+  el('sparse-rules').textContent = rules.length
+    ? `当前选择：${rules.join('、')}`
+    : '当前选择：整个仓库（不勾任何目录）';
+  el('sparse-apply').classList.toggle('hidden', !state.wcDir);
+  el('sparse-apply').disabled = state.sparse.busy || !state.wcDir;
+  el('sparse-toggle').textContent = state.sparse.open ? '收起' : '选择目录';
+  el('sparse-toggle').setAttribute('aria-expanded', String(state.sparse.open));
+  el('sparse-body').classList.toggle('hidden', !state.sparse.open);
+  el('sparse-card').classList.toggle('hidden', !currentRepo());
+}
+
+/** 已检出的副本调整规则：只补拉新增前缀、移除干净条目，绝不重新铺盘。 */
+async function applySparseRules() {
+  if (!state.wcDir || state.sparse.busy) return;
+  state.sparse.busy = true;
+  renderSparseSummary();
+  try {
+    const rules = currentSparseRules();
+    const result = unwrap(await api.setSparseRules(state.wcDir, rules), '调整稀疏规则');
+    state.sparse.rules = normalizeSparsePaths(result && result.rules ? result.rules : rules);
+    state.sparse.checked = new Set(state.sparse.rules);
+    banner(
+      `稀疏规则已更新：补拉 ${result ? result.added : 0} 个文件，移除 ${result ? result.removed : 0} 个文件。`,
+    );
+    await guard('扫描工作副本', refreshStatus);
+  } finally {
+    state.sparse.busy = false;
+    renderSparseSummary();
+    renderSparseTree();
+  }
 }
 
 // ---------------- 检出、扫描与更新 ----------------
@@ -767,10 +999,11 @@ async function checkout() {
     );
     return;
   }
-  const result = unwrap(await api.checkout(repo.repoId, dir), '检出');
+  const rules = currentSparseRules();
+  const result = unwrap(await api.checkout(repo.repoId, dir, 0, rules), '检出');
   await bindWorkingCopy(repo.repoId, result.dir);
   banner(
-    `已把「${repo.name}」检出到 ${result.dir}（r${result.rev}，共 ${result.files} 个文件），` +
+    `已把「${repo.name}」检出到 ${result.dir}（r${result.rev}，共 ${result.files} 个文件${rules.length ? `，稀疏目录：${rules.join('、')}` : ''}），` +
       `这个仓库现在有 ${dirsFor(repo.repoId).length} 份本地工作副本。`,
   );
   await refreshStatus();
@@ -813,6 +1046,8 @@ async function refreshStatus() {
   }
   el('diff-path').textContent = '';
   el('diff-path').title = '';
+  // 规则存在 wc.db 里：切换副本 / 检出 / 更新后都重新对齐面板，避免显示旧规则。
+  await guard('读取稀疏规则', loadSparseRules);
 }
 
 function renderChanges() {
@@ -1464,6 +1699,23 @@ el('do-request').addEventListener('click', () => void guard('提交建库申请'
 el('do-expand').addEventListener('click', () => void guard('提交扩容申请', requestExpansion));
 el('disconnect').addEventListener('click', () => void guard('退出登录', disconnect));
 el('pick-checkout-dir').addEventListener('click', () => void guard('选择目录', pickCheckoutDir));
+// 稀疏检出：目录树按需加载，勾选只改界面状态，已检出后点「应用规则」才落盘。
+el('sparse-toggle').addEventListener('click', () => {
+  state.sparse.open = !state.sparse.open;
+  renderSparseSummary();
+  if (state.sparse.open) void guard('读取仓库目录', () => loadSparseTree());
+});
+el('sparse-reload').addEventListener('click', () =>
+  void guard('刷新仓库目录', () => loadSparseTree(true)),
+);
+el('sparse-all').addEventListener('click', () => {
+  state.sparse.checked = new Set();
+  renderSparseTree();
+  renderSparseSummary();
+});
+el('sparse-apply').addEventListener('click', () =>
+  void guard('应用稀疏规则', applySparseRules),
+);
 el('open-checkout').addEventListener('click', () => openCheckout());
 el('cancel-checkout').addEventListener('click', closeCheckout);
 el('wc-dir-select').addEventListener('change', (event) =>

@@ -112,6 +112,29 @@ jobs:
           echo "拒绝前: $before"; echo "拒绝后: $after"
           [ "$before" = "$after" ] || { echo "被拒绝的提交写了孤儿对象"; exit 1; }
 
+          # ---------------- 稀疏检出（独立仓库，不影响上面的版本断言） ----------------
+          SPARSE="$RUNNER_TEMP/sparse-demo"
+          mkdir -p "$SPARSE/src/202610" "$SPARSE/src/202611"
+          echo oct > "$SPARSE/src/202610/a.txt"
+          echo nov > "$SPARSE/src/202611/b.txt"
+          echo root > "$SPARSE/src/README.md"
+          "$BIN/vcs" repo-create --store "$DEMO/store" sparse-repo >/dev/null
+          "$BIN/vcs" import --store "$DEMO/store" sparse-repo "$SPARSE/src" -m "初始导入" >/dev/null
+          "$BIN/vcs" checkout --store "$DEMO/store" sparse-repo "$SPARSE/wc" --paths 202610 | grep -q "稀疏路径：202610"
+          { [ -f "$SPARSE/wc/202610/a.txt" ] && [ ! -e "$SPARSE/wc/202611" ] && [ ! -e "$SPARSE/wc/README.md" ]; } || { echo "稀疏检出铺多了文件"; exit 1; }
+          "$BIN/vcs" sparse show "$SPARSE/wc" | grep -q "202610"
+          "$BIN/vcs" sparse set --store "$DEMO/store" "$SPARSE/wc" --paths 202610,202611 | grep -q "新增 1 个文件"
+          { [ -f "$SPARSE/wc/202611/b.txt" ] && [ ! -e "$SPARSE/wc/README.md" ]; } || { echo "规则扩大未增量补拉"; exit 1; }
+          "$BIN/vcs" sparse set --store "$DEMO/store" "$SPARSE/wc" | grep -q "当前为全库检出"
+          [ -f "$SPARSE/wc/README.md" ] || { echo "恢复全库未补根目录文件"; exit 1; }
+          "$BIN/vcs" sparse set --store "$DEMO/store" "$SPARSE/wc" --paths 202610 | grep -q "移除 2 个文件"
+          { [ ! -e "$SPARSE/wc/README.md" ] && [ ! -e "$SPARSE/wc/202611" ]; } || { echo "规则收窄未移除干净条目"; exit 1; }
+          echo edited > "$SPARSE/wc/202610/a.txt"
+          sparse_out=$("$BIN/vcs" sparse set --store "$DEMO/store" "$SPARSE/wc" --paths 202611 2>&1) || true
+          echo "$sparse_out" | grep -q "未提交的本地改动" || { echo "脏条目未被拦下"; exit 1; }
+          [ -f "$SPARSE/wc/202610/a.txt" ] || { echo "本地改动被误删"; exit 1; }
+          echo "稀疏检出闭环通过"
+
           # ---------------- M2：写闭环 ----------------
           "$BIN/vcs" checkout --store "$DEMO/store" reports "$DEMO/wc1"
           "$BIN/vcs" checkout --store "$DEMO/store" reports "$DEMO/wc2"
