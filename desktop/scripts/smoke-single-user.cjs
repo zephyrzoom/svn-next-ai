@@ -258,6 +258,36 @@ async function main() {
     const after = wc.status(WC);
     if (after.length !== 0) fail(`更新后仍有变更：${JSON.stringify(after)}`);
 
+    step('删掉检出目录：只读接口报错，绝不凭空建回一份工作副本');
+    // 用户把检出的目录整个删掉之后，任何一次扫描 / 读信息都只能报错。过去原生层
+    // 遇到没有 wc.db 的目录会「没有就新建」，于是点一次「扫描」就把删掉的目录
+    // 连同 .vcs/wc.db 原样建了回来——这条断言钉住的就是这个反模式。
+    const gone = path.join(WORK, 'wc-deleted');
+    await flow.checkoutRepo(client, repo.repoId, gone);
+    fs.rmSync(gone, { recursive: true, force: true });
+    const probes = [
+      ['wcInfo', () => wc.openInfo(gone)],
+      ['status', () => wc.status(gone)],
+      ['diff', () => wc.diff(gone)],
+      ['conflicts', () => wc.conflicts(gone)],
+      ['update', () => flow.updateWorkingCopy(client, gone)],
+    ];
+    for (const [label, probe] of probes) {
+      let threw = false;
+      try {
+        const result = probe();
+        if (result && typeof result.then === 'function') await result;
+      } catch (err) {
+        threw = true;
+        if (!String(err.message).includes('不是有效的工作副本')) {
+          fail(`${label} 在已删除的目录上应提示「不是有效的工作副本」：${err.message}`);
+        }
+      }
+      if (!threw) fail(`${label} 在已删除的目录上竟然成功了`);
+      if (fs.existsSync(gone)) fail(`${label} 把删掉的检出目录重建了出来：${gone}`);
+    }
+    console.log('  5 个入口全部报错，且目录没有被重建');
+
     step('注册（自带密码）→ 审批：非管理员也能自己开通');
     const registered = await client.register('bob', '李波', 'Bobpass1!', '一起维护月度报表');
     console.log(`  已提交注册申请 ${registered.requestId}`);

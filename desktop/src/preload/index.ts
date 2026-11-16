@@ -183,6 +183,13 @@ export interface VcsApi {
   wcInfo(dir: string): Promise<Envelope<WorkingCopyInfoDto | null>>;
   /** 仓库 → 该仓库的全部工作副本目录（首个为最近使用的一份）。 */
   loadRepoDirs(): Promise<Envelope<Record<string, string[]>>>;
+  /**
+   * 校验绑定关系：把本地目录已经不存在的登记摘掉（并落盘）。
+   * 返回清理后的映射，以及这次被摘掉的路径，界面据此告诉用户「哪份不见了」。
+   */
+  verifyRepoDirs(): Promise<
+    Envelope<{ dirs: Record<string, string[]>; removed: Array<{ repoId: string; dir: string }> }>
+  >;
   saveRepoDirs(dirs: Record<string, string[]>): Promise<Envelope<null>>;
   checkout(
     repoId: string,
@@ -202,6 +209,8 @@ export interface VcsApi {
       rev: number;
       entries: StatusEntryDto[];
       conflicts: Array<{ path: string; kind: string }>;
+      /** 目录已不是一个工作副本（检出目录被删了）：界面要把这条登记摘掉。 */
+      missing: boolean;
     }>
   >;
   diff(dir: string): Promise<Envelope<DiffEntryDto[]>>;
@@ -264,6 +273,7 @@ const api: VcsApi = {
   pickDir: () => ipcRenderer.invoke('vcs:pickDir'),
   wcInfo: (dir) => ipcRenderer.invoke('vcs:wcInfo', dir),
   loadRepoDirs: () => ipcRenderer.invoke('vcs:repoDirs'),
+  verifyRepoDirs: () => ipcRenderer.invoke('vcs:verifyRepoDirs'),
   saveRepoDirs: (dirs) => ipcRenderer.invoke('vcs:saveRepoDirs', dirs),
   checkout: (repoId, dir, rev, paths) =>
     ipcRenderer.invoke('vcs:checkout', repoId, dir, rev, paths),

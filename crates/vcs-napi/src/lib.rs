@@ -30,7 +30,9 @@ fn bad(msg: impl Into<String>) -> napi::Error {
 }
 
 /// 打开工作副本：目录里已有 `.vcs/wc.db` 就沿用，否则新建。
-fn open(dir: &str) -> napi::Result<WorkingCopy> {
+///
+/// **只有检出（`wc_checkout`）可以用这个**：检出本来就要在空目录里铺一份。
+fn open_or_create(dir: &str) -> napi::Result<WorkingCopy> {
     let path = Path::new(dir);
     let existed = path.join(".vcs").join("wc.db").exists();
     if existed {
@@ -38,6 +40,15 @@ fn open(dir: &str) -> napi::Result<WorkingCopy> {
     } else {
         WorkingCopy::create(path).map_err(to_napi)
     }
+}
+
+/// 只打开**已经存在**的工作副本；`.vcs/wc.db` 不在就报错，磁盘上什么都不会创建。
+///
+/// 除了检出，其余所有操作都必须走这里。曾经的 `open` 会「没有就新建」，于是用户把
+/// 检出目录整个删掉之后，界面只要点一次「扫描」，被删的目录连同 `.vcs/wc.db` 就会被
+/// 原样建回来——一份空的工作副本凭空出现，比报错更难解释。
+fn open_existing(dir: &str) -> napi::Result<WorkingCopy> {
+    WorkingCopy::open(Path::new(dir)).map_err(to_napi)
 }
 
 fn state_str(state: WcState) -> &'static str {
@@ -196,9 +207,10 @@ pub fn hash_bytes_hex(data: Buffer) -> String {
 
 /// 工作副本归属与稀疏规则：
 /// `{"repoId":"...","rev":3,"oldestRev":1,"sparseRules":[]}`（空数组 = 全量检出）。
+/// 目录不是一个工作副本时直接报错——绝不顺手建一份。
 #[napi]
 pub fn wc_info(dir: String) -> napi::Result<String> {
-    let wc = open(&dir)?;
+    let wc = open_existing(&dir)?;
     let (repo_id, rev, oldest) = working_copy_info(&wc)?;
     let rules = wc.sparse_rules().map_err(to_napi)?;
     serde_json::to_string(&WcInfoJson {
@@ -251,7 +263,8 @@ pub fn wc_checkout(
     let store = memory_store(hashes, blobs)?;
     let files = parse_entries(&entries)?;
     let rules = parse_sparse_rules(&rules_json)?;
-    let mut wc = open(&dir)?;
+    // 检出是唯一允许「目录不存在就新建」的入口。
+    let mut wc = open_or_create(&dir)?;
     let written = wc
         .checkout_with_rules(&repo_id, rev as u64, &files, &store, &rules)
         .map_err(to_napi)?;
@@ -277,7 +290,7 @@ pub fn wc_apply_sparse_rules(
     let store = memory_store(hashes, blobs)?;
     let files = parse_entries(&entries)?;
     // 调整规则必须作用在已存在的工作副本上，绝不在空目录里凭空建一份。
-    let mut wc = WorkingCopy::open(Path::new(&dir)).map_err(to_napi)?;
+    let mut wc = open_existing(&dir)?;
     let outcome = wc
         .apply_sparse_rules(&rules, &files, rev as u64, &store)
         .map_err(to_napi)?;
@@ -291,7 +304,7 @@ pub fn wc_apply_sparse_rules(
 /// 扫描工作副本，返回 `[{path, kind}]`。走 core 的 mtime 快路径。
 #[napi]
 pub fn wc_status(dir: String) -> napi::Result<String> {
-    let wc = open(&dir)?;
+    let wc = open_existing(&dir)?;
     let entries = wc.status().map_err(to_napi)?;
     let out: Vec<StatusJson> = entries
         .into_iter()
@@ -307,7 +320,7 @@ pub fn wc_status(dir: String) -> napi::Result<String> {
 /// 采集待提交的变更（含内容地址）。以全量校验为准，不依赖 mtime 快路径。
 #[napi]
 pub fn wc_local_changes(dir: String) -> napi::Result<String> {
-    let wc = open(&dir)?;
+    let wc = open_existing(&dir)?;
     let changes = wc.local_changes().map_err(to_napi)?;
     let out: Vec<ChangeJson> = changes
         .into_iter()
@@ -324,7 +337,7 @@ pub fn wc_local_changes(dir: String) -> napi::Result<String> {
 /// 离线 diff（基线 vs 磁盘）。完全本地，不访问服务端。
 #[napi]
 pub fn wc_diff(dir: String) -> napi::Result<String> {
-    let wc = open(&dir)?;
+    let wc = open_existing(&dir)?;
     let diffs = wc.diff().map_err(to_napi)?;
     let out: Vec<DiffJson> = diffs
         .into_iter()
@@ -363,7 +376,7 @@ pub fn wc_mark_committed(dir: String, rev: u32, changes_json: String) -> napi::R
             size: change.size,
         });
     }
-    let mut wc = open(&dir)?;
+    let mut wc = open_existing(&dir)?;
     wc.mark_committed(rev as u64, &changes, &store)
         .map_err(to_napi)?;
     Ok(())
@@ -395,7 +408,7 @@ pub fn wc_apply_update(
             size: change.size,
         });
     }
-    let mut wc = open(&dir)?;
+    let mut wc = open_existing(&dir)?;
     let outcome = wc
         .apply_update(&repo_id, target_rev as u64, &remote, &store)
         .map_err(to_napi)?;
@@ -413,7 +426,7 @@ pub fn wc_apply_update(
 /// 全量 update 成功后推进干净条目的基线版本（调用方需确认变更集覆盖了整个仓库）。
 #[napi]
 pub fn wc_advance_base(dir: String, rev: u32) -> napi::Result<u32> {
-    let mut wc = open(&dir)?;
+    let mut wc = open_existing(&dir)?;
     let affected = wc.advance_normal_bases(rev as u64).map_err(to_napi)?;
     Ok(affected as u32)
 }
@@ -423,7 +436,7 @@ pub fn wc_advance_base(dir: String, rev: u32) -> napi::Result<u32> {
 pub fn wc_revert(dir: String, paths_json: String) -> napi::Result<u32> {
     let paths: Vec<String> =
         serde_json::from_str(&paths_json).map_err(|e| bad(format!("解析路径失败：{e}")))?;
-    let mut wc = open(&dir)?;
+    let mut wc = open_existing(&dir)?;
     let restored = wc.revert(&paths).map_err(to_napi)?;
     Ok(restored as u32)
 }
@@ -431,7 +444,7 @@ pub fn wc_revert(dir: String, paths_json: String) -> napi::Result<u32> {
 /// 未解决的冲突列表 `[{path, kind}]`。
 #[napi]
 pub fn wc_conflicts(dir: String) -> napi::Result<String> {
-    let wc = open(&dir)?;
+    let wc = open_existing(&dir)?;
     let conflicts = wc.conflicts().map_err(to_napi)?;
     let out: Vec<ConflictJson> = conflicts
         .into_iter()
@@ -462,7 +475,7 @@ fn pristine_or_none(wc: &WorkingCopy, hash: Option<Hash>) -> Option<Buffer> {
 
 #[napi]
 pub fn wc_conflict_detail(dir: String, path: String) -> napi::Result<ConflictDetail> {
-    let wc = open(&dir)?;
+    let wc = open_existing(&dir)?;
     let record = wc
         .conflict_record(&path)
         .map_err(to_napi)?
@@ -497,13 +510,13 @@ pub fn wc_resolve_conflict(
         "delete" => ConflictChoice::Delete,
         other => return Err(bad(format!("未知的冲突处理方式：{other}"))),
     };
-    let mut wc = open(&dir)?;
+    let mut wc = open_existing(&dir)?;
     wc.resolve_conflict(&path, choice, content.as_ref().map(|b| b.as_ref()))
         .map_err(to_napi)
 }
 
 #[napi]
 pub fn wc_has_conflicts(dir: String) -> napi::Result<bool> {
-    let wc = open(&dir)?;
+    let wc = open_existing(&dir)?;
     wc.has_conflicts().map_err(to_napi)
 }

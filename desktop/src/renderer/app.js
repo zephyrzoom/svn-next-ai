@@ -22,6 +22,10 @@
  * `.vcs/wc.db`：选到的目录若本来就是一份工作副本（例如从别处拷来的），直接把它
  * 接进来 / 切过去，绝不重新铺盘——原「更换目录」的绑定能力就收在这个入口里。
  *
+ * 工作副本是磁盘上的事实，不是界面上的一段记忆：`settings.json` 里记下的目录一旦
+ * 不存在（用户删掉了整个检出目录、或清掉了 `.vcs/`），刷新仓库页时就把它从列表里摘掉；
+ * 「扫描」遇到这种目录只回报 missing，绝不会把删掉的目录重新检出建回来。
+ *
  * 治理类的审批（用户与注册、仓库创建、扩容配额、空间治理、目录配置）由服务端
  * Web 管理端承载，桌面端只保留登录、账号自助、仓库使用与工作副本这条主线。
  * 唯一的例外是**仓库拥有者**：自己创建的仓库会多一个「成员」页，可以在客户端
@@ -383,6 +387,9 @@ function currentRepo() {
 async function loadRepos() {
   const repos = unwrap(await api.listRepos(), '加载仓库');
   state.repos = repos;
+  // 本地目录可能已经被删掉：每次刷新仓库页都先核对一遍绑定关系，
+  // 失效的登记就地摘掉——列表里不该留着一份不存在的工作副本。
+  await syncWorkingCopies();
   if (repos.length === 0) {
     state.selectedRepoId = null;
     state.wcDir = '';
@@ -832,6 +839,32 @@ async function applySparseRules() {
 
 // ---------------- 检出、扫描与更新 ----------------
 
+/**
+ * 核对本机记下的工作副本还在不在。
+ *
+ * 用户可能把检出目录整个删掉，此时 settings.json 里那条登记就成了一条虚空路径：
+ * 列表里不该再挂着它，点「扫描」更不该把目录重建出来。判据交给主进程去看
+ * `.vcs/wc.db`（渲染进程不碰文件系统），失效的登记当场摘掉并落盘。
+ */
+async function syncWorkingCopies() {
+  const res = await api.verifyRepoDirs();
+  // 拿不到校验结果（旧版主进程 / 磁盘只读）：保持原样，别把绑定关系误清成空。
+  if (!res || !res.ok || !res.data || !res.data.dirs) return;
+  state.wcDirs = res.data.dirs;
+  const removed = Array.isArray(res.data.removed) ? res.data.removed : [];
+  if (removed.length === 0) return;
+  // 正在用的那份也没了：退到同仓库剩下的第一份；一份不剩就回到检出引导。
+  if (state.wcDir && removed.some((item) => item.dir === state.wcDir)) {
+    state.wcDir = dirsFor(state.selectedRepoId)[0] || '';
+    state.checkoutOpen = !state.wcDir;
+    resetWorkingCopyState();
+  }
+  renderRepoNav();
+  renderWcBar();
+  banner(`本地目录已不存在，已从工作副本列表移除：${removed.map((item) => item.dir).join('、')}`);
+  if (state.wcDir) await guard('扫描工作副本', refreshStatus);
+}
+
 /** 把当前绑定关系落盘；失败不拦流程，只是下次打开要重新选目录。 */
 async function saveWorkingCopies() {
   const clean = {};
@@ -890,6 +923,23 @@ async function switchWorkingCopy(dir) {
 
 /** 把一份工作副本移出列表（只是不再记住它，本地文件一个字节都不删）。 */
 async function removeWorkingCopy(dir) {
+  await forgetWorkingCopy(dir, `已把「${dir}」移出列表（本地文件未删除）。`);
+}
+
+/**
+ * 扫描时发现目录已经不是工作副本（用户删掉了检出目录 / 清掉了 `.vcs/`）：
+ * 与「移出列表」一样只忘掉这条路径。磁盘上本来已经什么都没有了，
+ * **绝不在这里重新检出**——用户删掉的东西不该被一次「扫描」悄悄建回来。
+ */
+async function forgetMissingWorkingCopy(dir) {
+  await forgetWorkingCopy(
+    dir,
+    `「${dir}」已不是一个工作副本（本地目录不存在），已从列表移除。`,
+  );
+}
+
+/** 摘掉一条登记，切到同仓库剩下的那份；一份不剩就回到检出引导。 */
+async function forgetWorkingCopy(dir, message) {
   const repoId = state.selectedRepoId;
   const rest = dirsFor(repoId).filter((item) => item !== dir);
   if (rest.length) state.wcDirs[repoId] = rest;
@@ -902,7 +952,7 @@ async function removeWorkingCopy(dir) {
   renderRepoNav();
   renderWcBar();
   await saveWorkingCopies();
-  banner(`已把「${dir}」移出列表（本地文件未删除）。`);
+  banner(message);
   // 还有别的副本才需要重新扫描；一份不剩时界面已经回到检出引导。
   if (state.wcDir) await guard('扫描工作副本', refreshStatus);
 }
@@ -1021,6 +1071,12 @@ async function refreshStatus() {
     return;
   }
   const data = unwrap(await api.status(dir), '扫描工作副本');
+  // 目录已经不是一个工作副本（被删了 / `.vcs/` 被清掉）：先把这条登记摘掉，
+  // 绝不在这里重新检出——那正是「删掉的目录又长回来」的来源。
+  if (data && data.missing) {
+    await forgetMissingWorkingCopy(dir);
+    return;
+  }
   if (data.repoId && data.repoId !== state.selectedRepoId) {
     const owner = state.repos.find((repo) => repo.repoId === data.repoId);
     if (owner && owner.repoId !== state.selectedRepoId) {

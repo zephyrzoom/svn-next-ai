@@ -228,6 +228,17 @@ ipcMain.handle('vcs:pickDir', () =>
 );
 
 /**
+ * 目录是否仍是一份工作副本：`.vcs/wc.db` 就是唯一判据。
+ *
+ * 用户删掉检出目录、或者手滑清掉 `.vcs/`，登记在 `settings.json` 里的路径就失效了。
+ * 这类路径绝不能再交给原生的 `wc.*`：它们过去会「没有就新建」，等于把被删的工作副本
+ * 悄悄重建出来。所有读操作先过这一关。
+ */
+function isWorkingCopyAt(dir: string): boolean {
+  return fs.existsSync(path.join(dir, '.vcs', 'wc.db'));
+}
+
+/**
  * 目录属于哪个仓库。**不是工作副本时返回 null**，让界面能平静地引导「检出到这里」，
  * 而不是先弹一条「wc.db 不存在」的错误。
  *
@@ -236,7 +247,7 @@ ipcMain.handle('vcs:pickDir', () =>
  */
 ipcMain.handle('vcs:wcInfo', (_event, dir: string) =>
   wrap(async () => {
-    if (!fs.existsSync(path.join(dir, '.vcs', 'wc.db'))) return null;
+    if (!isWorkingCopyAt(dir)) return null;
     try {
       return wc.openInfo(dir);
     } catch {
@@ -247,6 +258,31 @@ ipcMain.handle('vcs:wcInfo', (_event, dir: string) =>
 
 /** 仓库 → 该仓库的全部工作副本目录，重启后仍能对上「哪个仓库在本地有几份」。 */
 ipcMain.handle('vcs:repoDirs', () => wrap(async () => loadRepoDirs()));
+
+/**
+ * 校验并清理绑定关系：本地目录已经不存在（或 `.vcs/wc.db` 没了）的登记就地摘掉。
+ *
+ * 界面每次刷新仓库页都会走一次。用户删掉检出目录之后，列表里不该还挂着一份虚拟的
+ * 工作副本，更不该因为随后的一次「扫描」把目录重建出来。清理结果立刻落盘，
+ * 同时把摘掉了哪些路径回给界面，让这次「消失」有据可查。
+ */
+ipcMain.handle('vcs:verifyRepoDirs', () =>
+  wrap(async () => {
+    const before = loadRepoDirs();
+    const kept: Record<string, string[]> = {};
+    const removed: Array<{ repoId: string; dir: string }> = [];
+    for (const [repoId, dirs] of Object.entries(before)) {
+      const alive = dirs.filter((dir) => {
+        if (isWorkingCopyAt(dir)) return true;
+        removed.push({ repoId, dir });
+        return false;
+      });
+      if (alive.length > 0) kept[repoId] = alive;
+    }
+    if (removed.length > 0) saveRepoDirs(kept);
+    return { dirs: removed.length > 0 ? kept : before, removed };
+  }),
+);
 
 ipcMain.handle('vcs:saveRepoDirs', (_event, dirs: Record<string, string[]>) =>
   wrap<null>(async () => {
@@ -273,8 +309,15 @@ ipcMain.handle('vcs:setSparseRules', (_event, dir: string, rules: string[]) =>
   wrap(async () => setSparseRules(requireClient(), dir, rules)),
 );
 
+/**
+ * 扫描工作副本。目录已经不是工作副本（用户删掉了检出目录）时回报 `missing`，
+ * 由界面把这条登记摘掉——**不在这里重新检出**，被删的目录不该被扫描悄悄建回来。
+ */
 ipcMain.handle('vcs:status', (_event, dir: string) =>
   wrap(async () => {
+    if (!isWorkingCopyAt(dir)) {
+      return { repoId: '', rev: 0, entries: [], conflicts: [], missing: true };
+    }
     const info = wc.openInfo(dir);
     return {
       repoId: info.repoId,
@@ -282,6 +325,7 @@ ipcMain.handle('vcs:status', (_event, dir: string) =>
       entries: wc.status(dir),
       // 冲突单独给出来：界面要用红点标出来，且带冲突时提交会被拦。
       conflicts: wc.conflicts(dir),
+      missing: false,
     };
   }),
 );
@@ -307,8 +351,9 @@ ipcMain.handle(
     }),
 );
 
+/** 离线差异；目录已不是工作副本时没有差异可言，返回空表而不是让原生层建目录。 */
 ipcMain.handle('vcs:diff', (_event, dir: string) =>
-  wrap(async () => wc.diff(dir)),
+  wrap(async () => (isWorkingCopyAt(dir) ? wc.diff(dir) : [])),
 );
 
 ipcMain.handle('vcs:commit', (_event, dir: string, message: string) =>

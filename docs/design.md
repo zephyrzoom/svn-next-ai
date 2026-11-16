@@ -1799,3 +1799,23 @@ proto 里 `CheckoutRequest.paths` / `GetTreeRequest.paths` 的「稀疏路径，
 ### 36.4 验收
 
 `cargo test --workspace`（core 新增 6 组规则单测 + 4 组工作副本稀疏单测；server 新增 `get_changes_under` 前缀边界用例；e2e 新增带 `paths` 的 Checkout 流 / GetTree 断言）、`cargo clippy -D warnings`、`cargo fmt --check`、`npm run build` / `smoke:ui`（新增目录树勾选、规则规范化、检出参数传递断言）/ `smoke` / `smoke:admin` 全通过；另用真实 CLI 走完「稀疏检出 → 扩大 → 恢复全库 → 收窄 → 造新版本后 update 仍稀疏 → 脏条目被拦下」闭环。
+
+## 37. 检出目录被删后的自愈（2026-11-16）
+
+### 37.1 问题
+
+用户检出后把整个检出目录删掉，回到仓库页刷新：界面上仍挂着一份「已检出」的工作副本；点「扫描」时，napi 里的 `open()` 是「没有 `.vcs/wc.db` 就 `WorkingCopy::create`」语义，于是**被删掉的目录连同 `.vcs/wc.db` 被原样建了回来**，凭空多出一份空工作副本——比直接报错更难解释，也让人以为文件还在。
+
+### 37.2 两条约束
+
+| 层 | 改动 | 理由 |
+| --- | --- | --- |
+| napi | 拆出 `open_or_create` / `open_existing`：只有 `wc_checkout` 能新建，`wc_info` / `status` / `diff` / `local_changes` / `conflicts` / `conflict_detail` / `mark_committed` / `apply_update` / `advance_base` / `revert` / `resolve_conflict` / `apply_sparse_rules` 一律走 `open_existing`，缺 `wc.db` 就报 `InvalidSession: … 不是有效的工作副本` | 读操作本来就不该写盘；把「建」的权限收在一个入口，别的地方想建也建不出来 |
+| 主进程 | 新增 `vcs:verifyRepoDirs`（逐个看 `.vcs/wc.db`，把失效登记摘掉并落盘，回传被摘掉的路径）；`vcs:status` 遇到失效目录回 `missing: true` 而不是抛错；`vcs:diff` 同理返回空表 | 渲染进程不碰文件系统，「目录还在不在」必须由主进程判；顺手把 `settings.json` 里的虚空路径清掉 |
+| 界面 | 刷新仓库页先 `syncWorkingCopies()`：被摘掉的是当前那份就退到同仓库剩下的第一份（一份不剩回到检出引导，并提示移除了哪些路径）；`refreshStatus` 见到 `missing` 走 `forgetMissingWorkingCopy` 摘登记，**绝不重新检出** | 删掉的东西不该被一次「扫描」悄悄建回来；「移出列表」「目录已失效」共用同一段摘登记逻辑，只差提示语 |
+
+权衡：外接卷没挂载时目录同样「不存在」，绑定会被一起摘掉。可以接受——重新挂载后用「选择…」选回该目录即可接上（只读探测 `wc.db`，不重铺），而留在列表里一条指向虚空的路径只会让人反复点到「扫描」。
+
+### 37.3 验收
+
+`cargo build -p vcs-napi` 后用原生模块直接验证：`wcStatus` / `wcInfo` / `wcDiff` / `wcConflicts` / `wcLocalChanges` 在不存在目录上均抛 `InvalidSession` 且**目录未被创建**，`wcCheckout` 仍能正常铺盘。`npm run smoke:ui` 新增两条断言（刷新只摘失效登记并退到 `/tmp/wc-live`；扫描已删除目录后登记清空、回到检出引导、`vcs:checkout` 一次都不多发）；`npm run smoke` 新增一步「删掉检出目录 → 5 个入口全部报错且目录没有被重建」。`cargo fmt --check` / `cargo clippy -p vcs-napi -D warnings` / `npm run typecheck` / `npm run build` 均通过。

@@ -98,6 +98,10 @@ function verify({ app, BrowserWindow, ipcMain }) {
   // 它返回合法的工作副本信息；vcs:checkout 一次都不许被调用（那意味着整盘重铺）。
   const ADOPT_DIR = '/tmp/wc-adopt';
   const OTHER_DIR = '/tmp/wc-other';
+  // 目录被用户删掉的回归：GONE_DIR 的 status 只回 missing（主进程不会把它重新建出来），
+  // verifyRepoDirs 也只把「还活着的那份」留在映射里。
+  const GONE_DIR = '/tmp/wc-gone';
+  const LIVE_DIR = '/tmp/wc-live';
   const checkoutCalls = [];
   // 多份工作副本的回归会真的走一遍「切换 / 移出」，那两条路径会扫描工作副本：
   // 给 status / diff 塞合法数据，免得断言被 null 数据带偏。status 的 repoId 跟着目录走，
@@ -139,6 +143,12 @@ function verify({ app, BrowserWindow, ipcMain }) {
         };
       }
       if (channel === 'vcs:status') {
+        if (args[0] === GONE_DIR) {
+          return {
+            ok: true,
+            data: { repoId: '', rev: 0, entries: [], conflicts: [], missing: true },
+          };
+        }
         return {
           ok: true,
           data: {
@@ -146,7 +156,14 @@ function verify({ app, BrowserWindow, ipcMain }) {
             rev: 2,
             entries: [],
             conflicts: [],
+            missing: false,
           },
+        };
+      }
+      if (channel === 'vcs:verifyRepoDirs') {
+        return {
+          ok: true,
+          data: { dirs: { r1: [LIVE_DIR] }, removed: [{ repoId: 'r1', dir: GONE_DIR }] },
         };
       }
       const data = Object.prototype.hasOwnProperty.call(stubData, channel)
@@ -706,6 +723,63 @@ function verify({ app, BrowserWindow, ipcMain }) {
         problems.push(`稀疏检出求值失败：${err && err.message}`);
       }
 
+      // 检出目录被用户删掉：刷新只摘登记（清单里不留虚空路径），扫描只回报 missing，
+      // 两条路径都不许重新检出——那会把删掉的目录连同 .vcs/wc.db 原样建回来。
+      const staleCheckoutBaseline = checkoutCalls.length;
+      let stale = {};
+      try {
+        stale = await win.webContents.executeJavaScript(`(async () => {
+          const shell = document.getElementById('view-repo');
+          shell.classList.remove('hidden');
+          const saved = {
+            repos: state.repos, selected: state.selectedRepoId, dirs: state.wcDirs,
+            wcDir: state.wcDir, checkoutOpen: state.checkoutOpen, tab: state.tab,
+          };
+          const wait = () => new Promise((resolve) => setTimeout(resolve, 250));
+          state.repos = [{ repoId: 'r1', name: '仓库一', headRev: 3 }];
+          state.selectedRepoId = 'r1';
+          // 1) 刷新仓库页：主进程核对后说 /tmp/wc-gone 已经不在了，/tmp/wc-live 还在。
+          state.wcDirs = { r1: ['/tmp/wc-gone', '/tmp/wc-live'] };
+          state.wcDir = '/tmp/wc-gone';
+          state.checkoutOpen = false;
+          renderRepoNav();
+          renderWcBar();
+          await syncWorkingCopies();
+          await wait();
+          const refreshed = {
+            dirs: (state.wcDirs.r1 || []).slice(),
+            active: state.wcDir,
+            navDot: document.querySelector('.repo-dot').classList.contains('on'),
+          };
+          // 2) 一份不剩：点「扫描」也要能自己收尾，回到检出引导而不是报错或重建目录。
+          state.wcDirs = { r1: ['/tmp/wc-gone'] };
+          state.wcDir = '/tmp/wc-gone';
+          state.checkoutOpen = false;
+          renderRepoNav();
+          renderWcBar();
+          await refreshStatus();
+          await wait();
+          const scanned = {
+            dirs: (state.wcDirs.r1 || []).slice(),
+            active: state.wcDir,
+            checkoutOpen: state.checkoutOpen,
+            cardHidden: document.getElementById('checkout-card').classList.contains('hidden'),
+            workbenchHidden: document.getElementById('workbench').classList.contains('hidden'),
+            navDot: document.querySelector('.repo-dot').classList.contains('on'),
+          };
+          state.repos = saved.repos;
+          state.selectedRepoId = saved.selected;
+          state.wcDirs = saved.dirs;
+          state.wcDir = saved.wcDir;
+          state.checkoutOpen = saved.checkoutOpen;
+          state.tab = saved.tab;
+          shell.classList.add('hidden');
+          return { refreshed, scanned };
+        })()`);
+      } catch (err) {
+        problems.push(`删除检出目录求值失败：${err && err.message}`);
+      }
+
       const checks = {
         页面标题: info.title === 'svn-next',
         // 桌面端剥离管理 UI 后 id 数下降，阈值按「仓库使用」客户端的实际结构设定。
@@ -845,6 +919,19 @@ function verify({ app, BrowserWindow, ipcMain }) {
               Array.isArray(args[3]) &&
               args[3].join(',') === 'README.md,src',
           ),
+        // 删掉检出目录之后：刷新只摘掉失效的登记并退到还在的那份；
+        // 扫描遇到不存在的目录也只摘登记、回到检出引导。
+        删除检出目录后刷新会摘掉失效登记:
+          stale.refreshed?.dirs?.join(',') === LIVE_DIR &&
+          stale.refreshed?.active === LIVE_DIR,
+        扫描已删除的目录不会重新检出:
+          stale.scanned?.dirs?.length === 0 &&
+          stale.scanned?.active === '' &&
+          stale.scanned?.checkoutOpen === true &&
+          stale.scanned?.cardHidden === false &&
+          stale.scanned?.workbenchHidden === true &&
+          stale.scanned?.navDot === false &&
+          checkoutCalls.length === staleCheckoutBaseline,
       };
       for (const [name, ok] of Object.entries(checks)) {
         if (!ok) problems.push(`断言失败：${name}`);
@@ -861,6 +948,7 @@ function verify({ app, BrowserWindow, ipcMain }) {
         multiWc,
         adopt,
         sparse,
+        stale,
         checkoutCalls: checkoutCalls.length,
       });
     })
