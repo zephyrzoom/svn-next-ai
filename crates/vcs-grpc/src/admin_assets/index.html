@@ -99,10 +99,11 @@
               <h3>直通新建</h3>
               <form id="create-repo-form" class="form-grid">
                 <label>仓库名<input name="name" placeholder="小写字母/数字/-" required /></label>
-                <label>配额上限（字节）<input name="quota_bytes" type="number" min="0" value="10737418240" /></label>
+                <label>配额上限（GB）<input id="create-quota-gb" name="quota_gb" type="number" min="0" step="any" value="10" />
+                  <span id="create-quota-note" class="unit-note"></span></label>
                 <button class="primary" type="submit">创建</button>
               </form>
-              <p class="hint">仅供紧急开通；日常建库走审批台，容量固定 10 GiB。配额只有一条线：超过即拒绝提交，填 0 表示继承全局默认。</p>
+              <p class="hint">仅供紧急开通；日常建库走审批台，容量固定 10 GiB。配额只有一条线：超过即拒绝提交。配额按 GB 填写（1 GB = 1024³ 字节，可带小数），填 0 表示继承全局默认。</p>
             </div>
             <div class="card">
               <h3>全部仓库</h3>
@@ -124,7 +125,8 @@
                   <h4>配额</h4>
                   <p id="repo-usage" class="muted"></p>
                   <form id="repo-quota-form" class="form-grid compact-grid">
-                    <label>配额上限（字节）<input name="quota_bytes" type="number" min="0" value="0" /></label>
+                    <label>配额上限（GB）<input id="repo-quota-gb" name="quota_gb" type="number" min="0" step="any" value="0" />
+                      <span id="repo-quota-note" class="unit-note"></span></label>
                     <button class="primary" type="submit">保存</button>
                     <button id="inherit-quota" class="ghost" type="button">恢复继承</button>
                   </form>
@@ -142,9 +144,10 @@
             <div class="page-head"><h2>全局配额</h2><button id="refresh-quota" class="ghost">刷新</button></div>
             <div class="card">
               <h3>继承默认配额</h3>
-              <p class="muted">只影响「继承全局默认」的仓库；审批通过的建库申请按固定 10 GiB 落库，不走这里。0 表示未配置，由内置兜底接管。</p>
+              <p class="muted">只影响「继承全局默认」的仓库；审批通过的建库申请按固定 10 GiB 落库，不走这里。按 GB 填写（1 GB = 1024³ 字节，可带小数），0 表示未配置，由内置兜底接管。</p>
               <form id="defaults-form" class="form-grid">
-                <label>配额上限（字节）<input name="quota_bytes" type="number" min="0" value="0" /></label>
+                <label>配额上限（GB）<input id="defaults-quota-gb" name="quota_gb" type="number" min="0" step="any" value="0" />
+                  <span id="defaults-quota-note" class="unit-note"></span></label>
                 <button class="primary" type="submit">保存</button>
               </form>
               <p id="defaults-note" class="hint"></p>

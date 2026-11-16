@@ -57,6 +57,7 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent-soft
 label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--muted); }
 label.check { flex-direction: row; align-items: center; gap: 6px; font-size: 13px; }
 label.check input { width: auto; }
+.unit-note { font-size: 11px; color: var(--muted); line-height: 1.4; }
 select { cursor: pointer; }
 
 /* 登录 */

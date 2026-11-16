@@ -62,6 +62,67 @@ function humanBytes(n) {
   return `${size.toFixed(1)} ${units[i]}`;
 }
 
+/* 配额在界面上统一按 GB 填写（1 GB = 1024³ 字节），接口仍按字节传递。 */
+const GIB = 1024 * 1024 * 1024;
+
+const QUOTA_FIELDS = [
+  { id: 'create-quota-gb', note: 'create-quota-note', zero: '0 = 继承全局默认配额' },
+  { id: 'repo-quota-gb', note: 'repo-quota-note', zero: '0 = 继承全局默认配额' },
+  { id: 'defaults-quota-gb', note: 'defaults-quota-note', zero: '0 = 未配置，按内置兜底 100 GiB' },
+];
+
+/* 服务端存的是字节，这里记住每个输入框「加载时的原文与原值」：
+   管理员没动过输入框就原样回传字节，避免 GB→字节 的二次取整把历史值改掉。 */
+const quotaLoaded = {};
+
+function gbFromBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!value) return '0';
+  const gb = value / GIB;
+  // 取「能还原回原始字节」的最短小数位，常见整 GB / 0.5 GB 都显示得很干净。
+  for (let digits = 0; digits <= 9; digits += 1) {
+    const text = gb.toFixed(digits);
+    if (Math.round(Number(text) * GIB) === value) return String(Number(text));
+  }
+  return String(Number(gb.toPrecision(12)));
+}
+
+function bytesFromGb(value) {
+  const gb = Number(String(value == null ? '' : value).trim());
+  if (!Number.isFinite(gb) || gb <= 0) return 0;
+  return Math.round(gb * GIB);
+}
+
+function quotaBytesFor(id, raw) {
+  const text = String(raw == null ? '' : raw).trim();
+  const loaded = quotaLoaded[id];
+  if (loaded && text === loaded.text) return loaded.bytes;
+  return bytesFromGb(text);
+}
+
+function syncQuotaNotes() {
+  QUOTA_FIELDS.forEach((field) => {
+    const input = $(field.id);
+    const note = $(field.note);
+    if (!input || !note) return;
+    const bytes = quotaBytesFor(field.id, input.value);
+    note.textContent = bytes ? `= ${humanBytes(bytes)}（${bytes} 字节）` : field.zero;
+  });
+}
+
+function setQuotaGb(id, bytes) {
+  const input = $(id);
+  const value = Number(bytes || 0);
+  if (input) input.value = gbFromBytes(value);
+  quotaLoaded[id] = { text: input ? String(input.value).trim() : '0', bytes: value };
+  syncQuotaNotes();
+}
+
+QUOTA_FIELDS.forEach((field) => {
+  const input = $(field.id);
+  if (input) input.addEventListener('input', syncQuotaNotes);
+});
+
 function fmtTime(seconds) {
   if (!seconds) return '—';
   return new Date(Number(seconds) * 1000).toLocaleString('zh-CN', { hour12: false });
@@ -415,8 +476,7 @@ async function loadRepoDetail() {
       </div>
     </div>`).join('') : empty('还没有成员');
   $('repo-usage').textContent = `已用 ${humanBytes(quota.usage.used_bytes)} / 上限 ${humanBytes(quota.effective.bytes)}（${esc(quota.effective.source)}）`;
-  const form = $('repo-quota-form');
-  form.quota_bytes.value = quota.quota_bytes;
+  setQuotaGb('repo-quota-gb', quota.quota_bytes);
 }
 
 $('repo-members').addEventListener('click', (event) => {
@@ -455,12 +515,13 @@ $('repo-quota-form').addEventListener('submit', (event) => {
   event.preventDefault();
   const form = event.target;
   const id = $('repo-detail').dataset.repo;
+  const bytes = quotaBytesFor('repo-quota-gb', form.quota_gb.value);
   void act(async () => {
     await put(`/repos/${encodeURIComponent(id)}/quota`, {
-      quota_bytes: Number(form.quota_bytes.value) || 0,
-      inherit: false,
+      quota_bytes: bytes,
+      inherit: bytes === 0,
     });
-    toast('仓库配额已保存');
+    toast(bytes ? `仓库配额已保存：${humanBytes(bytes)}` : '仓库配额已恢复继承全局默认');
     await loadRepoDetail();
   });
 });
@@ -486,12 +547,14 @@ $('save-repo-status').addEventListener('click', () => {
 $('create-repo-form').addEventListener('submit', (event) => {
   event.preventDefault();
   const form = event.target;
+  const bytes = quotaBytesFor('create-quota-gb', form.quota_gb.value);
   void act(async () => {
     await post('/repos', {
       name: form.name.value.trim(),
-      quota_bytes: Number(form.quota_bytes.value) || 0,
+      quota_bytes: bytes,
     });
     form.reset();
+    setQuotaGb('create-quota-gb', bytesFromGb(form.quota_gb.value));
     toast('仓库已创建');
     await loadRepos();
   });
@@ -503,19 +566,19 @@ $('refresh-repos').addEventListener('click', () => void act(loadRepos));
 
 async function loadQuota() {
   const data = await get('/quota-defaults');
-  const form = $('defaults-form');
-  form.quota_bytes.value = data.bytes;
+  setQuotaGb('defaults-quota-gb', data.bytes);
   $('defaults-note').textContent = `当前默认：${humanBytes(data.bytes)}（0 表示未配置，按内置兜底 100 GiB）`;
 }
 
 $('defaults-form').addEventListener('submit', (event) => {
   event.preventDefault();
   const form = event.target;
+  const bytes = quotaBytesFor('defaults-quota-gb', form.quota_gb.value);
   void act(async () => {
     await put('/quota-defaults', {
-      quota_bytes: Number(form.quota_bytes.value) || 0,
+      quota_bytes: bytes,
     });
-    toast('全局默认配额已保存');
+    toast(bytes ? `全局默认配额已保存：${humanBytes(bytes)}` : '全局默认配额已清空（按内置兜底）');
     await loadQuota();
   });
 });
@@ -713,6 +776,8 @@ $('apply-retention').addEventListener('click', () => void act(() => retention(fa
 $('refresh-space').addEventListener('click', () => void act(loadSpace));
 
 /* ---------------- 启动 ---------------- */
+
+syncQuotaNotes();
 
 async function bootstrap() {
   if (!token) return;
