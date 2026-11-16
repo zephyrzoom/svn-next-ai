@@ -826,9 +826,17 @@ async function applySparseRules() {
     const result = unwrap(await api.setSparseRules(state.wcDir, rules), '调整稀疏规则');
     state.sparse.rules = normalizeSparsePaths(result && result.rules ? result.rules : rules);
     state.sparse.checked = new Set(state.sparse.rules);
-    banner(
-      `稀疏规则已更新：补拉 ${result ? result.added : 0} 个文件，移除 ${result ? result.removed : 0} 个文件。`,
-    );
+    // 移走的文件连同空目录一起清；目录里还留着用户自己的文件时，必须说明为什么没删干净。
+    const parts = [
+      `补拉 ${result ? result.added : 0} 个文件`,
+      `移除 ${result ? result.removed : 0} 个文件`,
+      `清理 ${result ? result.prunedDirs : 0} 个空目录`,
+    ];
+    const kept = (result && result.keptDirs) || [];
+    const tail = kept.length
+      ? `；${kept.slice(0, 3).join('、')}${kept.length > 3 ? ' 等' : ''} 里还有未纳入版本控制的文件，已原样保留。`
+      : '。';
+    banner(`稀疏规则已更新：${parts.join('，')}${tail}`);
     await guard('扫描工作副本', refreshStatus);
   } finally {
     state.sparse.busy = false;

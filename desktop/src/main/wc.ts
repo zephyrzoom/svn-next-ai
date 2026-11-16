@@ -31,6 +31,10 @@ export interface WorkingCopyInfo {
 export interface SparseOutcome {
   added: number;
   removed: number;
+  /** 被顺带清掉的空目录数。 */
+  prunedDirs: number;
+  /** 里面还有未纳入版本控制的文件、被原样保留的目录。 */
+  keptDirs: string[];
 }
 
 export interface StatusEntry {

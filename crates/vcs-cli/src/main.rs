@@ -706,9 +706,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     store.files_at(&session, &repo_id, Some(info.head_rev))?;
                 let outcome = wc.apply_sparse_rules(&rules, &files, rev, store.objects())?;
                 println!(
-                    "已调整稀疏规则：新增 {} 个文件，移除 {} 个文件（r{}）",
-                    outcome.added, outcome.removed, rev
+                    "已调整稀疏规则：新增 {} 个文件，移除 {} 个文件（r{}），清理 {} 个空目录",
+                    outcome.added, outcome.removed, rev, outcome.pruned_dirs
                 );
+                if !outcome.kept_dirs.is_empty() {
+                    println!(
+                        "以下目录里还有未纳入版本控制的文件，已原样保留：{}",
+                        outcome.kept_dirs.join("、")
+                    );
+                }
                 if rules.is_sparse() {
                     println!("当前路径：{}", rules.paths.join("、"));
                 } else {

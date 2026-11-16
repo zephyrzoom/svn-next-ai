@@ -1788,7 +1788,9 @@ proto 里 `CheckoutRequest.paths` / `GetTreeRequest.paths` 的「稀疏路径，
 | 客户端编排 | `desktop/src/main/flow.ts`、`client.ts` | `getTree` / `downloadObjects` / `update` 透传规则；调整规则时只补拉「新规则相对旧规则多出来」的前缀，收窄不联网 |
 | 界面 | 桌面端「稀疏检出」卡片 | 从仓库 HEAD 的扁平路径推导可展开目录树，勾选目录 → 规则；检出时带上，已检出后点「应用规则」增量调整 |
 
-`apply_sparse_rules` 是唯一能改动已有副本的入口：**绝不 `DELETE FROM entries` 重铺**。它只补拉「旧规则没有、新规则有、本地还没有条目」的路径，移除前用 `status_with(true)` 全量校验——受版本控制的条目只要有本地改动或冲突就整笔拒绝（`PathConflict`），用户自己的未受控文件不会被删，只清理空掉的上层目录。
+`apply_sparse_rules` 是唯一能改动已有副本的入口：**绝不 `DELETE FROM entries` 重铺**。它只补拉「旧规则没有、新规则有、本地还没有条目」的路径，移除前用 `status_with(true)` 全量校验——受版本控制的条目只要有本地改动或冲突就整笔拒绝（`PathConflict`），用户自己的未受控文件不会被删。
+
+移除条目后目录由下往上收（`prune_empty_dir`）：**文件走了，空壳目录也跟着走**，多级子目录逐层递归，不是只试一次 `remove_dir`。判据刻意保守——子树里只要还有一个非操作系统文件（用户自己的产物、日志）就整棵保留、连里面的 `.DS_Store` 都不动，并在 `SparseOutcome.kept_dirs` 里点名，CLI / 桌面端据此提示「为什么这个文件夹还在」；只有「除了空子目录和操作系统元数据（`.DS_Store` / `Thumbs.db` / `desktop.ini`）之外什么都没有」时才连元数据一起删掉目录。macOS 的 Finder 只要打开过目录就会写 `.DS_Store`，不认这类文件，用户看到的就是「文件删了、空文件夹赖着不走」。
 
 ### 36.3 入口
 
@@ -1798,7 +1800,7 @@ proto 里 `CheckoutRequest.paths` / `GetTreeRequest.paths` 的「稀疏路径，
 
 ### 36.4 验收
 
-`cargo test --workspace`（core 新增 6 组规则单测 + 4 组工作副本稀疏单测；server 新增 `get_changes_under` 前缀边界用例；e2e 新增带 `paths` 的 Checkout 流 / GetTree 断言）、`cargo clippy -D warnings`、`cargo fmt --check`、`npm run build` / `smoke:ui`（新增目录树勾选、规则规范化、检出参数传递断言）/ `smoke` / `smoke:admin` 全通过；另用真实 CLI 走完「稀疏检出 → 扩大 → 恢复全库 → 收窄 → 造新版本后 update 仍稀疏 → 脏条目被拦下」闭环。
+`cargo test --workspace`（core 新增 6 组规则单测 + 7 组工作副本稀疏单测，含「多级空目录逐层收干净」「只剩 `.DS_Store` 也算空」「目录里还有用户文件则保留并点名」三条回归；server 新增 `get_changes_under` 前缀边界用例；e2e 新增带 `paths` 的 Checkout 流 / GetTree 断言）、`cargo clippy -D warnings`、`cargo fmt --check`、`npm run build` / `smoke:ui`（新增目录树勾选、规则规范化、检出参数传递断言）/ `smoke` / `smoke:admin` 全通过；另用真实 CLI 走完「稀疏检出 → 扩大 → 恢复全库 → 收窄 → 造新版本后 update 仍稀疏 → 脏条目被拦下」闭环。
 
 ## 37. 检出目录被删后的自愈（2026-11-16）
 

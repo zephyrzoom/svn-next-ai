@@ -165,6 +165,11 @@ struct WcInfoJson {
 struct SparseJson {
     added: usize,
     removed: usize,
+    #[serde(rename = "prunedDirs")]
+    pruned_dirs: usize,
+    /// 因里面还有未纳入版本控制的文件、被原样保留的目录（相对工作副本根）。
+    #[serde(rename = "keptDirs")]
+    kept_dirs: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -297,6 +302,8 @@ pub fn wc_apply_sparse_rules(
     serde_json::to_string(&SparseJson {
         added: outcome.added,
         removed: outcome.removed,
+        pruned_dirs: outcome.pruned_dirs,
+        kept_dirs: outcome.kept_dirs,
     })
     .map_err(|e| bad(format!("序列化稀疏结果失败：{e}")))
 }

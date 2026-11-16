@@ -67,12 +67,16 @@ pub struct StatusEntry {
 }
 
 /// 调整稀疏规则后的增量结果。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SparseOutcome {
     /// 新补拉落盘的条目数。
     pub added: usize,
     /// 因规则收窄而移除的条目数。
     pub removed: usize,
+    /// 被顺带清掉的空目录数（父目录由下往上逐个收，属于「文件移走了，壳也该走」）。
+    pub pruned_dirs: usize,
+    /// 因为里面还有未纳入版本控制的文件、所以原样保留的目录。
+    pub kept_dirs: Vec<String>,
 }
 
 pub struct WorkingCopy {
@@ -438,8 +442,9 @@ impl WorkingCopy {
         tx.commit()
             .map_err(|e| Error::new(ErrorCode::IoError, format!("提交稀疏规则事务失败：{e}")))?;
 
-        // 只清理已经空掉的上层目录；remove_dir 遇到还有文件的目录会自己失败，
-        // 用户放在稀疏目录里的未受控文件一个都不会被删。
+        // 文件走了，空壳目录也要走：从最深的父目录往上收，直到某一层还有别的东西。
+        // 判定见 `prune_empty_dir`——目录里除了操作系统自动生成的元数据（.DS_Store 之类）
+        // 还有任何文件，就整层保留，用户自己放进去的东西一个都不删，只在结果里点名让他知道。
         let mut parents = BTreeSet::new();
         for path in &remove {
             let mut parts: Vec<&str> = path.split('/').collect();
@@ -452,7 +457,12 @@ impl WorkingCopy {
         let mut dirs: Vec<String> = parents.into_iter().collect();
         dirs.sort_by_key(|dir| std::cmp::Reverse(dir.len()));
         for dir in dirs {
-            let _ = fs::remove_dir(wc_root.join(dir));
+            let target = wc_root.join(&dir);
+            if prune_empty_dir(&target) {
+                outcome.pruned_dirs += 1;
+            } else if target.exists() {
+                outcome.kept_dirs.push(dir);
+            }
         }
 
         Ok(outcome)
@@ -1298,6 +1308,50 @@ fn remove_path(path: &Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(io("删除文件失败", path, e)),
+    }
+}
+
+/// 操作系统 / 资源管理器自动写进目录的元数据文件。
+///
+/// 它们不是用户的内容：macOS 的 Finder 只要打开过目录就会写 `.DS_Store`，
+/// Windows 的 Explorer 会写 `Thumbs.db` / `desktop.ini`。稀疏规则把目录移出时，
+/// 这些垃圾文件不该让空目录「删不掉」——否则用户看到的正是一个空文件夹赖在那里。
+fn is_os_metadata(name: &str) -> bool {
+    matches!(name, ".DS_Store" | "Thumbs.db" | "desktop.ini")
+}
+
+/// 递归收掉空目录，返回「这个目录是否已经不在了」。
+///
+/// 语义刻意保守：子树里只要还有**一个**非操作系统的文件（用户自己的产物、日志、
+/// 或者规则外但被忽略的东西），整棵子树原样保留，连里面的 `.DS_Store` 都不动；
+/// 只有「除了空子目录和操作系统元数据之外什么都没有」时才连元数据一起删掉目录。
+fn prune_empty_dir(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        // 已经不在了 = 目标达成；读不动（权限等）就当保留，不冒险。
+        return !dir.exists();
+    };
+    let mut metadata = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            if !prune_empty_dir(&path) {
+                return false;
+            }
+            continue;
+        }
+        if is_os_metadata(&entry.file_name().to_string_lossy()) {
+            metadata.push(path);
+            continue;
+        }
+        return false;
+    }
+    for path in metadata {
+        let _ = fs::remove_file(path);
+    }
+    match fs::remove_dir(dir) {
+        Ok(()) => true,
+        Err(_) => !dir.exists(),
     }
 }
 
@@ -2345,6 +2399,11 @@ mod tests {
         assert!(!wc_root.join("src/main.rs").exists());
         assert!(!wc_root.join("README.md").exists());
         assert!(wc_root.join("docs/readme.md").exists());
+        // 移出的目录本身也要清干净，不能留下空壳文件夹。
+        assert!(
+            !wc_root.join("src").exists(),
+            "src 目录应随规则移除一起删掉"
+        );
         assert_eq!(wc.sparse_rules().unwrap(), narrow);
         assert!(wc.status().unwrap().is_empty());
     }
@@ -2373,6 +2432,81 @@ mod tests {
         wc.revert(&["src/main.rs".to_string()]).unwrap();
         let outcome = wc.apply_sparse_rules(&narrow, &[], 2, &store).unwrap();
         assert_eq!(outcome.removed, 1);
+        assert!(outcome.kept_dirs.is_empty());
         assert!(!wc_root.join("src/main.rs").exists());
+        assert!(!wc_root.join("src").exists());
+    }
+
+    /// 移出整棵子树时，多级目录要一层层收干净：不能只剩下一堆空壳文件夹。
+    #[test]
+    fn apply_sparse_rules_prunes_nested_dirs() {
+        let dir = TempDir::new("sparse-prune");
+        let store = MemoryObjectStore::new();
+        let all = sparse_files(
+            &store,
+            &[
+                ("src/main.rs", b"main\n"),
+                ("docs/api/v1/spec.md", b"spec\n"),
+                ("docs/img/logo.png", b"png\n"),
+            ],
+        );
+        let rules = SparseRules::all();
+        let wc_root = dir.0.join("wc");
+        let mut wc = WorkingCopy::create(&wc_root).unwrap();
+        wc.checkout_with_rules("repo-1", 1, &all, &store, &rules)
+            .unwrap();
+        assert!(wc_root.join("docs/api/v1/spec.md").exists());
+
+        let narrow = SparseRules::from_paths(["src"]).unwrap();
+        let outcome = wc.apply_sparse_rules(&narrow, &[], 2, &store).unwrap();
+        assert_eq!(outcome.removed, 2);
+        assert!(!wc_root.join("docs").exists(), "docs 整棵子树都应删掉");
+        assert_eq!(
+            outcome.pruned_dirs, 4,
+            "docs/api/v1、docs/api、docs/img、docs 四层都要收掉"
+        );
+        assert!(outcome.kept_dirs.is_empty());
+        assert!(wc_root.join("src/main.rs").exists());
+    }
+
+    /// macOS 的 Finder 会在目录里留下 `.DS_Store`，Windows 留下 `Thumbs.db`：
+    /// 这些元数据不该让「已经空了的目录」删不掉，否则用户看到的正是空文件夹赖着不走。
+    #[test]
+    fn apply_sparse_rules_ignores_os_metadata_when_pruning() {
+        let dir = TempDir::new("sparse-ds-store");
+        let store = MemoryObjectStore::new();
+        let all = sparse_files(&store, &[("src/main.rs", b"main\n"), ("docs/a.md", b"a\n")]);
+        let wc_root = dir.0.join("wc");
+        let mut wc = WorkingCopy::create(&wc_root).unwrap();
+        wc.checkout_with_rules("repo-1", 1, &all, &store, &SparseRules::all())
+            .unwrap();
+        fs::write(wc_root.join("docs/.DS_Store"), b"junk").unwrap();
+
+        let narrow = SparseRules::from_paths(["src"]).unwrap();
+        let outcome = wc.apply_sparse_rules(&narrow, &[], 2, &store).unwrap();
+        assert_eq!(outcome.removed, 1);
+        assert!(!wc_root.join("docs").exists(), "只剩系统元数据也算空目录");
+        assert!(outcome.kept_dirs.is_empty());
+    }
+
+    /// 目录里还有用户自己的文件（未纳入版本控制）时，目录必须留着，并且在结果里点名，
+    /// 让界面能解释「为什么这个文件夹还在」——绝不为了好看把用户的东西删掉。
+    #[test]
+    fn apply_sparse_rules_keeps_dirs_with_untracked_files() {
+        let dir = TempDir::new("sparse-keep");
+        let store = MemoryObjectStore::new();
+        let all = sparse_files(&store, &[("src/main.rs", b"main\n"), ("docs/a.md", b"a\n")]);
+        let wc_root = dir.0.join("wc");
+        let mut wc = WorkingCopy::create(&wc_root).unwrap();
+        wc.checkout_with_rules("repo-1", 1, &all, &store, &SparseRules::all())
+            .unwrap();
+        fs::write(wc_root.join("docs/notes.txt"), b"mine\n").unwrap();
+
+        let narrow = SparseRules::from_paths(["src"]).unwrap();
+        let outcome = wc.apply_sparse_rules(&narrow, &[], 2, &store).unwrap();
+        assert!(!wc_root.join("docs/a.md").exists());
+        assert_eq!(fs::read(wc_root.join("docs/notes.txt")).unwrap(), b"mine\n");
+        assert_eq!(outcome.kept_dirs, vec!["docs".to_string()]);
+        assert_eq!(outcome.pruned_dirs, 0);
     }
 }

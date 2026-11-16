@@ -131,7 +131,16 @@ function verify({ app, BrowserWindow, ipcMain }) {
         };
       }
       if (channel === 'vcs:setSparseRules') {
-        return { ok: true, data: { added: 1, removed: 0, rules: args[1] || [] } };
+        return {
+          ok: true,
+          data: {
+            added: 1,
+            removed: 3,
+            prunedDirs: 2,
+            keptDirs: ['docs'],
+            rules: args[1] || [],
+          },
+        };
       }
       if (channel === 'vcs:wcInfo') {
         return {
@@ -701,6 +710,14 @@ function verify({ app, BrowserWindow, ipcMain }) {
           document.getElementById('checkout').click();
           await wait();
           const applyVisible = !document.getElementById('sparse-apply').classList.contains('hidden');
+          // 应用规则：回报里的「清理了几个空目录 / 哪些目录因为还有用户文件被保留」
+          // 必须落到提示语上，否则用户只会看到空文件夹赖着不走却不知道原因。
+          state.wcDir = '/tmp/sparse-new';
+          state.sparse.rules = ['src'];
+          state.sparse.checked = new Set(['src']);
+          document.getElementById('sparse-apply').click();
+          await wait();
+          const applyBanner = document.getElementById('banner').textContent;
           document.getElementById('sparse-all').click();
           const cleared = currentSparseRules();
           const normalized = normalizeSparsePaths(['src/api', 'src', 'docs/', 'docs', '/README.md']);
@@ -717,7 +734,7 @@ function verify({ app, BrowserWindow, ipcMain }) {
           state.sparse.rules = saved.sparseRules;
           state.sparse.repoId = saved.sparseRepoId;
           shell.classList.add('hidden');
-          return { roots, afterSrc, finalRules, cleared, normalized, applyVisible };
+          return { roots, afterSrc, finalRules, cleared, normalized, applyVisible, applyBanner };
         })()`);
       } catch (err) {
         problems.push(`稀疏检出求值失败：${err && err.message}`);
@@ -912,6 +929,10 @@ function verify({ app, BrowserWindow, ipcMain }) {
           sparse.normalized?.join(',') === 'README.md,docs,src' &&
           sparse.cleared?.length === 0 &&
           sparse.applyVisible === true,
+        应用规则后提示空目录已清理并说明保留原因:
+          String(sparse.applyBanner || '').includes('清理 2 个空目录') &&
+          String(sparse.applyBanner || '').includes('docs') &&
+          String(sparse.applyBanner || '').includes('未纳入版本控制'),
         检出时把勾选的稀疏规则传给主进程:
           checkoutCalls.some(
             (args) =>

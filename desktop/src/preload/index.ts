@@ -101,6 +101,8 @@ export interface WorkingCopyInfoDto {
 export interface SparseResultDto {
   added: number;
   removed: number;
+  prunedDirs: number;
+  keptDirs: string[];
   rules: string[];
 }
 
