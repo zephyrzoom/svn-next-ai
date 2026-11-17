@@ -183,7 +183,7 @@ export interface VcsApi {
   pickDir(): Promise<Envelope<string | null>>;
   /** 目录是哪个仓库的工作副本；不是工作副本（还没有 wc.db）时返回 null。 */
   wcInfo(dir: string): Promise<Envelope<WorkingCopyInfoDto | null>>;
-  /** 仓库 → 该仓库的全部工作副本目录（首个为最近使用的一份）。 */
+  /** 仓库 → 该仓库在当前账号名下的全部工作副本目录（首个为最近使用的一份）。 */
   loadRepoDirs(): Promise<Envelope<Record<string, string[]>>>;
   /**
    * 校验绑定关系：把本地目录已经不存在的登记摘掉（并落盘）。
@@ -192,6 +192,7 @@ export interface VcsApi {
   verifyRepoDirs(): Promise<
     Envelope<{ dirs: Record<string, string[]>; removed: Array<{ repoId: string; dir: string }> }>
   >;
+  /** 保存当前账号的工作副本登记（账号由主进程按登录身份决定，界面不传）。 */
   saveRepoDirs(dirs: Record<string, string[]>): Promise<Envelope<null>>;
   checkout(
     repoId: string,

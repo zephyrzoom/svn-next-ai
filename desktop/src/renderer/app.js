@@ -25,6 +25,7 @@
  * 工作副本是磁盘上的事实，不是界面上的一段记忆：`settings.json` 里记下的目录一旦
  * 不存在（用户删掉了整个检出目录、或清掉了 `.vcs/`），刷新仓库页时就把它从列表里摘掉；
  * 扫描遇到这种目录只回报 missing，绝不会把删掉的目录重新检出建回来。
+ * 这份记忆按账号隔离（服务端地址 + 用户名），同一台机器上换账号登录看不到别人的目录。
  * 变更同理——改完文件切回窗口、切回工作副本 tab、以及可见时每 8 秒，界面都会自己
  * 对一次盘（见文件末尾「工作副本自动刷新」），所以没有「重新扫描」这个按钮。
  *
@@ -51,7 +52,7 @@ const state = {
 
   repos: [],
   selectedRepoId: null,
-  /** 仓库 → 该仓库在本机的所有工作副本目录（首个为最近使用的一份），持久化在 settings.json。 */
+  /** 仓库 → 该仓库在**当前账号**名下的所有工作副本目录（首个为最近使用的一份），持久化在 settings.json。 */
   wcDirs: {},
   /** 当前仓库正在操作的那一份工作副本目录；空串表示还没有本地工作副本。 */
   wcDir: '',
@@ -363,7 +364,8 @@ async function applySession(session, { target = '', resumed = false } = {}) {
   // 右上角只这个人的姓名：角色与免登录到期都不在界面上出现。
   el('who').textContent = user.displayName || user.username;
   showApp();
-  // 工作副本目录属于「这台机器」的记忆，与账号无关：登录后一次性读回来。
+  // 工作副本目录是「我用这个账号在这台机器上检出的」，按账号隔离：主进程按当前
+  // 登录身份（地址 + 用户名）取，A 在 s1、B 在 s2，切回 A 读回来的还是 s1。
   // 读不到（旧版客户端留下的设置、磁盘只读）不该挡住登录，只是这次要重新选目录。
   const dirs = await api.loadRepoDirs();
   state.wcDirs = dirs && dirs.ok && dirs.data ? dirs.data : {};
@@ -1866,7 +1868,8 @@ async function disconnect() {
   el('diff-path').textContent = '';
   el('diff-path').title = '';
   el('diff').textContent = '点击上方变更查看差异';
-  // 目录记忆留在 settings.json，清的只是内存状态；下次登录会重新读回来。
+  // 目录记忆留在 settings.json 的**这个账号名下**，清的只是内存状态；
+  // 下次同一个人登录会重新读回来，换成别人的账号则读不到这一份。
   state.wcDirs = {};
   state.checkoutOpen = false;
   el('dir').value = '';

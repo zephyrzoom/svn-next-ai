@@ -8,6 +8,10 @@
  *     加密后再落盘。加密不可用时宁可不存——把凭证明文写进磁盘是最不该做的妥协。
  *
  * 注意这里从不向渲染进程返回 token：渲染进程只需要知道「连没连上、我是谁」。
+ *
+ * 另一条分界线是**人**：连接信息与长期会话是「这台机器上次用的账号」，只有一份；
+ * 而工作副本登记属于账号（`accounts[地址][用户名]`），同一台机器上换账号登录不会
+ * 互相看到对方的目录。
  */
 import { app, safeStorage } from 'electron';
 import * as fs from 'node:fs';
@@ -23,22 +27,47 @@ interface SettingsFile {
   /** 该 token 的过期时间（Unix 秒），仅「30 天免登录」会话会写入。 */
   sessionExpiresAt?: number;
   /**
-   * 仓库 → 本地工作副本目录列表（首个是最近使用的那份）。
-   * 旧版本写的是单个字符串，读的时候统一升级成列表，避免老配置丢绑定。
+   * **旧版本**的仓库 → 目录映射：机器级、不分账号，谁登录都看得见。
+   * 现在只在新旧过渡时读一次（见 `migrateLegacyDirs`），迁移完立刻删掉。
    */
   repoDirs?: Record<string, string | string[]>;
+  /** 按账号隔离的本机登记：`accounts[服务端地址][用户名]`。 */
+  accounts?: AccountBook;
 }
+
+/** 一个账号在本机留下的、与具体仓库无关的设置（目前只有工作副本登记）。 */
+interface AccountSettings {
+  /** 仓库 → 本地工作副本目录列表（首个是最近使用的那份）。 */
+  repoDirs?: RepoDirMap;
+}
+
+/** 服务端地址 → 用户名 → 该账号的本机设置。 */
+type AccountBook = Record<string, Record<string, AccountSettings>>;
 
 function settingsPath(): string {
   return path.join(app.getPath('userData'), 'settings.json');
 }
 
-function read(): SettingsFile {
+function readRaw(): SettingsFile {
   try {
     return JSON.parse(fs.readFileSync(settingsPath(), 'utf8')) as SettingsFile;
   } catch {
     return {};
   }
+}
+
+function read(): SettingsFile {
+  const file = readRaw();
+  // 迁移只做一次（做完全局字段就没了）。写盘失败也不能挡住读：内存里已经是新结构，
+  // 本次会话照常工作，下次读到时再迁一次。
+  if (migrateLegacyDirs(file)) {
+    try {
+      write(file);
+    } catch {
+      /* 磁盘只读之类：本次会话内照常使用 */
+    }
+  }
+  return file;
 }
 
 function write(next: SettingsFile): void {
@@ -158,10 +187,18 @@ export function clearToken(): void {
  * 仓库 → 该仓库在本机的**所有**工作副本目录；第一个是最近使用的一份。
  *
  * 一个仓库可以检出多份（不同目录、各自的本地改动互不影响），所以这里是一对多。
- * 工作副本是「这台机器上的一份拷贝」，这份记忆跟着机器走、不跟账号走：换个账号
- * 登录，同一个仓库的目录依然对得上。里面没有任何凭证，只有路径。
+ * 这份登记**按账号隔离**：工作副本目录是「我用这个账号在这台机器上检出的目录」，
+ * 不是这台机器的公共资产。A 在 s1、B 在 s2 检出同一个仓库，切回 A 必须还是 s1——
+ * 一台机器上换账号登录（共用工作站很常见）不该把别人的目录、更不该把别人的
+ * 本地改动带过来。
  */
 export type RepoDirMap = Record<string, string[]>;
+
+/** 一份登录身份：服务端地址 + 服务端确认过的用户名。 */
+export interface Account {
+  target: string;
+  username: string;
+}
 
 /** 只收绝对路径：界面可能传来误填的相对路径，写进设置下次就对不上了。 */
 function absoluteDir(value: unknown): string | null {
@@ -194,15 +231,76 @@ function normalizeRepoDirs(dirs: unknown): RepoDirMap {
   return clean;
 }
 
-export function loadRepoDirs(): RepoDirMap {
-  return normalizeRepoDirs(read().repoDirs);
+/** 账号名与地址都可能来自界面输入，先去掉首尾空格；缺一半就当作「没有身份」。 */
+function normalizeAccount(account: Account | null | undefined): Account | null {
+  if (!account) return null;
+  const target = (account.target ?? '').trim();
+  const username = (account.username ?? '').trim();
+  if (!target || !username) return null;
+  return { target, username };
 }
 
-/** 保存绑定关系；列表顺序即最近使用顺序，重启后仍停在上次那份工作副本上。 */
-export function saveRepoDirs(dirs: RepoDirMap): void {
+function readAccount(file: SettingsFile, account: Account): AccountSettings | null {
+  const users = file.accounts?.[account.target];
+  return (users && users[account.username]) || null;
+}
+
+function ensureAccount(file: SettingsFile, account: Account): AccountSettings {
+  const book = (file.accounts ??= {});
+  const users = (book[account.target] ??= {});
+  return (users[account.username] ??= {});
+}
+
+/**
+ * 旧版本把工作副本登记当成机器级的：一个全局 `repoDirs`，谁登录都看得见——这正是
+ * 「A 在 s1、B 在 s2，切回 A 却看到 s2」的原因。
+ *
+ * 老数据只有一份，只能归给**上次登录的那个账号**：`target` / `username` 就是那次
+ * 登录写下的。归不出来时（设置文件被手工改过）宁可丢掉——把上一个账号的目录塞给
+ * 下一个登录的人，正是要修的问题。
+ */
+function migrateLegacyDirs(file: SettingsFile): boolean {
+  const legacy = file.repoDirs;
+  if (!legacy) return false;
+  delete file.repoDirs;
+  const account = normalizeAccount({ target: file.target ?? '', username: file.username ?? '' });
+  const dirs = normalizeRepoDirs(legacy);
+  if (account && Object.keys(dirs).length > 0) {
+    const slot = ensureAccount(file, account);
+    // 已经有账号级登记时不覆盖：那份是更可信的新数据。
+    if (!slot.repoDirs) slot.repoDirs = dirs;
+  }
+  return true;
+}
+
+/** 当前账号在本机记住的工作副本登记；没有登录身份时返回空表（什么都不给看）。 */
+export function loadRepoDirs(account: Account | null): RepoDirMap {
+  const who = normalizeAccount(account);
+  if (!who) return {};
+  const slot = readAccount(read(), who);
+  return normalizeRepoDirs(slot ? slot.repoDirs : undefined);
+}
+
+/**
+ * 保存**当前账号**的登记；列表顺序即最近使用顺序，重启后仍停在上次那份工作副本上。
+ *
+ * 没有身份就不写：一份没有主人的目录记忆，下次只会变成别人的。
+ */
+export function saveRepoDirs(account: Account | null, dirs: RepoDirMap): void {
+  const who = normalizeAccount(account);
+  if (!who) throw new Error('尚未登录，工作副本登记无处可存');
   const file = read();
   const clean = normalizeRepoDirs(dirs);
-  if (Object.keys(clean).length === 0) delete file.repoDirs;
-  else file.repoDirs = clean;
+  const slot = ensureAccount(file, who);
+  if (Object.keys(clean).length === 0) {
+    // 一个目录都不剩：把整个账号的条目收掉，别在设置里留一个空壳。
+    const users = file.accounts?.[who.target];
+    if (users) {
+      delete users[who.username];
+      if (Object.keys(users).length === 0) delete file.accounts![who.target];
+    }
+  } else {
+    slot.repoDirs = clean;
+  }
   write(file);
 }

@@ -18,6 +18,7 @@ import {
   saveLogin,
   saveRepoDirs,
   saveTarget,
+  type Account,
 } from './settings';
 import * as wc from './wc';
 import type { ConflictChoice } from './wc';
@@ -52,6 +53,14 @@ async function wrap<T>(run: () => Promise<T>): Promise<Envelope<T>> {
 }
 
 let client: VcsClient | null = null;
+
+/**
+ * 当前登录身份（服务端地址 + 服务端确认过的用户名）。
+ *
+ * 只由主进程维护：渲染进程传什么都不会改变它。工作副本登记按它隔离——界面上
+ * 传来的目录列表只写进这个账号名下，读也只读这个账号的，A / B 各看各的。
+ */
+let session: Account | null = null;
 
 function requireClient(): VcsClient {
   if (!client) {
@@ -126,6 +135,8 @@ ipcMain.handle(
       }
       client?.close();
       client = next;
+      // 身份以服务端返回的 user 为准（LDAP 的 JIT 建号会把用户名规范化）。
+      session = { target, username: user.username };
       const expiresAt = next.expiresAtValue;
       // 登录响应带姓名就顺手缓存：旧服务端的 WhoAmI 不返回姓名，恢复会话时要用它兜底。
       // 没拿到（旧服务端）就传 undefined，保留上次的缓存，不要把姓名清掉。
@@ -154,6 +165,7 @@ ipcMain.handle('vcs:setTarget', (_event, target: string) =>
     // 换了服务端就别把旧地址的会话留在内存里。
     client?.close();
     client = null;
+    session = null;
     saveTarget(target);
     return null;
   }),
@@ -189,6 +201,7 @@ ipcMain.handle('vcs:tryResume', (_event, target: string = '') =>
       }
       client?.close();
       client = next;
+      session = { target: resolved, username: user.username };
       // 不带 expiresAt 调用：刷新用户名与姓名，但保留原来的到期时间。
       saveLogin(resolved, user.username, {
         token,
@@ -207,6 +220,7 @@ ipcMain.handle('vcs:disconnect', () =>
   wrap<null>(async () => {
     client?.close();
     client = null;
+    session = null;
     // 主动断开就不要再记住凭证；服务端地址与用户名保留，方便下次登录。
     clearToken();
     return null;
@@ -256,8 +270,11 @@ ipcMain.handle('vcs:wcInfo', (_event, dir: string) =>
   }),
 );
 
-/** 仓库 → 该仓库的全部工作副本目录，重启后仍能对上「哪个仓库在本地有几份」。 */
-ipcMain.handle('vcs:repoDirs', () => wrap(async () => loadRepoDirs()));
+/**
+ * 当前账号记住的工作副本登记。**按账号读**：目录是「我用这个账号在这台机器上
+ * 检出的」，别人的账号看不到，也就不会在别人的界面里冒出来。
+ */
+ipcMain.handle('vcs:repoDirs', () => wrap(async () => loadRepoDirs(session)));
 
 /**
  * 校验并清理绑定关系：本地目录已经不存在（或 `.vcs/wc.db` 没了）的登记就地摘掉。
@@ -268,7 +285,7 @@ ipcMain.handle('vcs:repoDirs', () => wrap(async () => loadRepoDirs()));
  */
 ipcMain.handle('vcs:verifyRepoDirs', () =>
   wrap(async () => {
-    const before = loadRepoDirs();
+    const before = loadRepoDirs(session);
     const kept: Record<string, string[]> = {};
     const removed: Array<{ repoId: string; dir: string }> = [];
     for (const [repoId, dirs] of Object.entries(before)) {
@@ -279,14 +296,15 @@ ipcMain.handle('vcs:verifyRepoDirs', () =>
       });
       if (alive.length > 0) kept[repoId] = alive;
     }
-    if (removed.length > 0) saveRepoDirs(kept);
+    if (removed.length > 0) saveRepoDirs(session, kept);
     return { dirs: removed.length > 0 ? kept : before, removed };
   }),
 );
 
 ipcMain.handle('vcs:saveRepoDirs', (_event, dirs: Record<string, string[]>) =>
   wrap<null>(async () => {
-    saveRepoDirs(dirs);
+    // 账号由主进程的 session 决定，渲染进程只能写「自己那份」。
+    saveRepoDirs(session, dirs);
     return null;
   }),
 );

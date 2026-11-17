@@ -9,6 +9,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "check:assets": "node scripts/check-startup-assets.cjs",
     "smoke:ui": "node scripts/smoke-ui.cjs",
+    "smoke:accounts": "node scripts/smoke-accounts.cjs",
+    "smoke:switch": "node scripts/smoke-account-switch.cjs",
     "start": "npm run build:native && npm run build && electron .",
     "smoke": "npm run build:native && npm run build && node scripts/smoke-single-user.cjs",
     "smoke:bigfile": "node scripts/smoke-bigfile.cjs",
