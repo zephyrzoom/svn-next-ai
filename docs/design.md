@@ -1822,3 +1822,34 @@ proto 里 `CheckoutRequest.paths` / `GetTreeRequest.paths` 的「稀疏路径，
 ### 37.3 验收
 
 `cargo build -p vcs-napi` 后用原生模块直接验证：`wcStatus` / `wcInfo` / `wcDiff` / `wcConflicts` / `wcLocalChanges` 在不存在目录上均抛 `InvalidSession` 且**目录未被创建**，`wcCheckout` 仍能正常铺盘。`npm run smoke:ui` 新增两条断言（刷新只摘失效登记并退到 `/tmp/wc-live`；扫描已删除目录后登记清空、回到检出引导、`vcs:checkout` 一次都不多发）；`npm run smoke` 新增一步「删掉检出目录 → 5 个入口全部报错且目录没有被重建」。`cargo fmt --check` / `cargo clippy -p vcs-napi -D warnings` / `npm run typecheck` / `npm run build` 均通过。
+
+## 38. 工作副本自动刷新，去掉「重新扫描」（2026-11-17）
+
+### 38.1 问题
+
+上下文条上原本并排两个「刷新一次」的入口：仓库标题行的「刷新」（重拉仓库列表 + 容量 + 历史 + 顺带扫描）和工作副本条上的「重新扫描」（只扫当前目录）。前者是后者的超集，用户看不出重轻，而**真正每天要做的那件事——「我在外面改完文件，界面跟上」——却要点一次按钮**。把「看新状态」交给用户记着，本身就是设计错误：变更由磁盘上的文件决定，不由界面决定。
+
+### 38.2 做法
+
+| 时机 | 说明 |
+| --- | --- |
+| `window.focus` / `visibilitychange` | 从编辑器 / 终端切回窗口，最常见的一次刷新 |
+| 切回「工作副本」tab | 在历史 / 容量页停留一阵后回来 |
+| 可见时每 8 秒轮询 | 窗口一直开着、文件由构建脚本改写时也能跟上 |
+
+按钮直接删掉（`#refresh-status`），仓库标题行的「刷新」保留为需要重拉元数据时的手动入口。
+
+自动刷新能一直开着，靠三条约束：
+
+| 约束 | 做法 | 理由 |
+| --- | --- | --- |
+| 不重绘没变的界面 | `statusSignature(rev, entries, conflicts)` 做指纹，指纹相同就不碰 DOM（`renderChanges` / `renderWcBar` 都不调用） | 轮询每 8 秒重建一次列表会把滚动位置和选中态冲掉，比不刷新更烦人；指纹相同还意味着可以放心用长轮询 |
+| 不读没必要的盘 | 差异卡片收起时只把 `diffDirty` 标脏，点开某条变更时 `showDiff` 再补拉一次 `vcs:diff` | `wc.diff()` 会把整棵工作树读一遍（含未受控文件）算 unified diff，8 秒一次是不可接受的成本；`status` 则是 stat 快路径（mtime + size 没变就不算哈希） |
+| 不打断正在做的事 | `canAutoScan()` 排除提交中、改稀疏规则中、扫描中、以及**冲突编辑器打开时**；扫描期间换了仓库 / 工作副本的结果直接丢弃 | 三栏里可能是用户手打了一半的合并结果；一个过期的扫描结果写进去会把人踢回上一个上下文 |
+
+错误处理：自动刷新用 `unwrapMaybe(res, action, quiet=true)` 解包——认证失效仍照常退回登录页（这件事必须让人知道），其余错误静默，下一轮自己重试；手动扫描的错误仍然由 `guard` 弹提示。
+
+### 38.3 验收
+
+`npm run smoke:ui` 新增三条断言：`#refresh-status` 已不存在且变更列表随 `vcs:status` 变化自动出现（`0 个待提交变更` → `1 个待提交变更 @ r2`）；结果没变时再扫一次列表节点**原地不动**（`kept === true`）；自动刷新前后提示浮层一字不变。`npm run build` / `npm run typecheck` 通过。
+

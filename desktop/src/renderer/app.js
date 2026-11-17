@@ -24,7 +24,9 @@
  *
  * 工作副本是磁盘上的事实，不是界面上的一段记忆：`settings.json` 里记下的目录一旦
  * 不存在（用户删掉了整个检出目录、或清掉了 `.vcs/`），刷新仓库页时就把它从列表里摘掉；
- * 「扫描」遇到这种目录只回报 missing，绝不会把删掉的目录重新检出建回来。
+ * 扫描遇到这种目录只回报 missing，绝不会把删掉的目录重新检出建回来。
+ * 变更同理——改完文件切回窗口、切回工作副本 tab、以及可见时每 8 秒，界面都会自己
+ * 对一次盘（见文件末尾「工作副本自动刷新」），所以没有「重新扫描」这个按钮。
  *
  * 治理类的审批（用户与注册、仓库创建、扩容配额、空间治理、目录配置）由服务端
  * Web 管理端承载，桌面端只保留登录、账号自助、仓库使用与工作副本这条主线。
@@ -62,6 +64,14 @@ const state = {
   conflict: null,
   /** 差异卡片是否展开：默认收起，点变更条目或「查看差异」再打开。 */
   diffOpen: false,
+  /** 变更集合的指纹（版本 + 路径 + 冲突）：一样就不重绘，自动刷新才敢频繁跑。 */
+  statusSig: '',
+  /** 差异是否已过期：卡片收着时不读盘，点开某条变更时再重新生成。 */
+  diffDirty: false,
+  /** 差异卡片当前展示的路径：扫描后据此把高亮与内容接续回来。 */
+  detailPath: '',
+  /** 扫描进行中：自动刷新撞上就跳过，避免同一份目录被并发扫。 */
+  scanning: false,
   tab: 'wc',
   /** 当前仓库的成员列表（仅 owner 打开成员页时会加载）。 */
   members: [],
@@ -78,6 +88,8 @@ const state = {
   searchTimer: 0,
   /** 提交进行中：按钮禁用的同时用它挡住重复调用。 */
   committing: false,
+  /** 更新进行中：自动刷新避开它，别在盘被改到一半的时候去扫。 */
+  updating: false,
   /**
    * 稀疏检出面板。`checked` 是界面里勾中的目录，`rules` 是当前工作副本里
    * 真正生效的规则（从 wc.db 读回）；两者不一致时提示「待应用」。
@@ -154,6 +166,17 @@ function unwrap(res, action) {
 }
 
 /**
+ * 解包信封，`quiet = true` 时只对认证失效出声：后台自动刷新失败不该每几秒
+ * 弹一条提示，下一轮会自己重试；而登录失效必须让人看见，所以照常退回登录页。
+ */
+function unwrapMaybe(res, action, quiet) {
+  if (!quiet) return unwrap(res, action);
+  if (res && res.ok) return res.data;
+  if (res && AUTH_CODES.has(res.code)) return unwrap(res, action);
+  return null;
+}
+
+/**
  * 已经展示过的错误。`guard` 靠这个标记决定要不要再补一条提示——
  * 提示是会自动消失的浮层，用「界面上还有没有字」来判断会误判。
  */
@@ -202,6 +225,8 @@ function setTab(name) {
   if (next === 'history') void guard('加载历史', loadLog);
   if (next === 'quota') void guard('加载容量', loadQuota);
   if (next === 'members') void guard('加载成员', loadMembers);
+  // 回到工作副本页顺手对一次盘：人可能刚在编辑器里改完文件。
+  if (next === 'wc') autoScan();
 }
 
 for (const tab of document.querySelectorAll('.tab')) {
@@ -461,6 +486,11 @@ async function selectRepo(repoId) {
   state.conflicts = [];
   state.diff = [];
   state.conflict = null;
+  // 换了上下文：扫描指纹、选中路径、差异缓存全部作废，
+  // 否则新上下文的指纹万一撞上旧的，界面就不会重绘了。
+  state.statusSig = '';
+  state.diffDirty = true;
+  state.detailPath = '';
   // 输入框只用于「再检出一份」的新目录，绝不预填现有工作副本路径：
   // 预填后误点检出会把那一份的本地改动整盘覆盖掉。
   el('dir').value = '';
@@ -526,6 +556,11 @@ function resetWorkingCopyState() {
   state.conflicts = [];
   state.diff = [];
   state.conflict = null;
+  // 换了上下文：扫描指纹、选中路径、差异缓存全部作废，
+  // 否则新上下文的指纹万一撞上旧的，界面就不会重绘了。
+  state.statusSig = '';
+  state.diffDirty = true;
+  state.detailPath = '';
   el('changes').innerHTML = '';
   el('diff-path').textContent = '';
   el('diff-path').title = '';
@@ -608,9 +643,7 @@ function renderWcBar() {
   el('wc-status').classList.toggle('warn', conflicts > 0);
   // 已有工作副本照样能再检出一份；切换已登记的目录统一走上下文条的下拉。
   el('open-checkout').disabled = !hasRepo;
-  for (const id of ['refresh-status', 'update']) {
-    el(id).disabled = !dir;
-  }
+  el('update').disabled = !dir;
   el('commit').disabled = !dir || state.committing;
   el('checkout-card').classList.toggle('hidden', Boolean(dir) && !state.checkoutOpen);
   el('workbench').classList.toggle('hidden', !dir);
@@ -1071,50 +1104,142 @@ async function checkout() {
   await loadLog();
 }
 
+/** 变更集合的指纹：版本 + 每条路径的状态 + 冲突集合。指纹没变，界面就不用动。 */
+function statusSignature(rev, entries, conflicts) {
+  return [
+    `r${rev}`,
+    ...entries.map((entry) => `${entry.kind}:${entry.path}`),
+    '--',
+    ...conflicts.map((item) => item.path),
+  ].join('\n');
+}
+
 /**
  * 扫描工作副本。目录里记录的 repoId 与当前仓库不一致时，以目录为准切过去：
  * 宁可换上下文，也不让「提交」把 A 仓库的改动推到 B 仓库。
+ *
+ * `{ auto: true }` 供后台自动刷新使用（窗口回前台、切 tab、定时器）：结果指纹
+ * 没变就一个 DOM 都不碰；差异卡片收着时不读盘；出错也不弹提示——用户没动手，
+ * 界面不该自己出声，也不该自己闪。
  */
-async function refreshStatus() {
+async function refreshStatus({ auto = false } = {}) {
   const dir = state.wcDir;
+  const repoId = state.selectedRepoId;
   if (!dir) {
-    banner('这个仓库还没有本地工作副本，请先检出', 'error');
+    if (!auto) banner('这个仓库还没有本地工作副本，请先检出', 'error');
     return;
   }
-  const data = unwrap(await api.status(dir), '扫描工作副本');
-  // 目录已经不是一个工作副本（被删了 / `.vcs/` 被清掉）：先把这条登记摘掉，
-  // 绝不在这里重新检出——那正是「删掉的目录又长回来」的来源。
-  if (data && data.missing) {
-    await forgetMissingWorkingCopy(dir);
+  // 自动刷新撞上已经在跑的扫描就跳过：下一轮会把这次的改动一起看到。
+  if (auto && state.scanning) return;
+  state.scanning = true;
+  try {
+    const data = unwrapMaybe(await api.status(dir), '扫描工作副本', auto);
+    if (!data) return;
+    // 扫描期间换了仓库 / 工作副本：这份结果属于上一个上下文，丢掉。
+    if (state.wcDir !== dir || state.selectedRepoId !== repoId) return;
+    // 目录已经不是一个工作副本（被删了 / `.vcs/` 被清掉）：先把这条登记摘掉，
+    // 绝不在这里重新检出——那正是「删掉的目录又长回来」的来源。
+    if (data.missing) {
+      await forgetMissingWorkingCopy(dir);
+      return;
+    }
+    if (data.repoId && data.repoId !== state.selectedRepoId) {
+      const owner = state.repos.find((repo) => repo.repoId === data.repoId);
+      if (owner && owner.repoId !== state.selectedRepoId) {
+        await bindWorkingCopy(owner.repoId, dir);
+        banner(`「${dir}」属于仓库「${owner.name}」，已切换到该仓库。`);
+        await selectRepo(owner.repoId);
+        return;
+      }
+    }
+    const conflicts = data.conflicts || [];
+    const sig = statusSignature(data.rev, data.entries, conflicts);
+    const changed = sig !== state.statusSig;
+    state.wcRev = data.rev;
+    state.changes = data.entries;
+    state.conflicts = conflicts;
+    state.statusSig = sig;
+    if (changed) {
+      renderWcBar();
+      renderChanges();
+    }
+    // 差异是整棵树读盘算出来的：卡片收着就先标脏，点开某条变更时再生成。
+    // 收起状态下自动刷新完全不碰文件内容，轮询才敢一直开着。
+    if (state.diffOpen && !state.conflict) {
+      const diffs = unwrapMaybe(await api.diff(dir), '生成差异', auto);
+      if (diffs) {
+        state.diff = diffs;
+        state.diffDirty = false;
+      }
+    } else {
+      state.diffDirty = true;
+    }
+    // 变更列表重建后，把正在看的那条接续回来，差异不跟着被清空。
+    if (changed || state.diffOpen) syncDiffPanel();
+    // 规则存在 wc.db 里，只会被本客户端改动：自动刷新不必去读，
+    // 也避免把用户正在勾选的目录冲掉。
+    if (!auto) await guard('读取稀疏规则', loadSparseRules);
+  } catch (error) {
+    // 手动扫描的失败交给 guard 提示；自动刷新静默（认证失效已在解包处退回登录页）。
+    if (!auto) throw error;
+  } finally {
+    state.scanning = false;
+  }
+}
+
+/**
+ * 扫描完把右侧差异卡片对齐到新的变更列表：
+ * - 正在看的那条冲突还在：三栏原样留着（里面可能是手打了一半的合并结果）。
+ * - 看的那条已经不在变更里：退回提示态，列表高亮一起清掉。
+ * - 其余按最新的 diff 重绘文本。
+ */
+function syncDiffPanel() {
+  const path = state.detailPath;
+  if (state.conflict) {
+    if (path && state.conflicts.some((item) => item.path === path)) {
+      highlightPath(path);
+      return;
+    }
+    closeConflict();
+  }
+  if (!path || !state.changes.some((change) => change.path === path)) {
+    state.detailPath = '';
+    highlightPath('');
+    el('diff-path').textContent = '';
+    el('diff-path').title = '';
+    el('diff').textContent =
+      state.changes.length === 0 && state.conflicts.length === 0
+        ? '工作副本干净'
+        : '点击上方变更查看差异';
     return;
   }
-  if (data.repoId && data.repoId !== state.selectedRepoId) {
-    const owner = state.repos.find((repo) => repo.repoId === data.repoId);
-    if (owner && owner.repoId !== state.selectedRepoId) {
-      await bindWorkingCopy(owner.repoId, dir);
-      banner(`「${dir}」属于仓库「${owner.name}」，已切换到该仓库。`);
-      await selectRepo(owner.repoId);
+  highlightPath(path);
+  if (!state.diffOpen) return;
+  el('diff-path').textContent = path;
+  el('diff-path').title = path;
+  paintDiffText(path);
+}
+
+/** 把某条变更的差异文本填进卡片；拿不到时说明为什么是空的。 */
+function paintDiffText(path) {
+  const entry = state.diff.find((item) => item.path === path);
+  el('diff').textContent = entry
+    ? entry.text
+    : '（无文本差异，可能是二进制文件或新增/删除）';
+}
+
+/** 按路径点亮变更列表里的那一条：列表重建之后靠它把选中态接回来。 */
+function highlightPath(path) {
+  for (const active of el('changes').querySelectorAll('li.active')) {
+    active.classList.remove('active');
+  }
+  if (!path) return;
+  for (const li of el('changes').querySelectorAll('li')) {
+    if (li.title === path) {
+      li.classList.add('active');
       return;
     }
   }
-  state.wcRev = data.rev;
-  state.changes = data.entries;
-  state.conflicts = data.conflicts || [];
-  renderWcBar();
-  renderChanges();
-  closeConflict();
-  const diffs = unwrap(await api.diff(dir), '生成差异');
-  state.diff = diffs;
-  // 重新扫描会重建变更列表，之前查看的那条不一定还在，差异区回到提示态。
-  if (state.changes.length === 0) {
-    el('diff').textContent = '工作副本干净';
-  } else {
-    el('diff').textContent = '点击上方变更查看差异';
-  }
-  el('diff-path').textContent = '';
-  el('diff-path').title = '';
-  // 规则存在 wc.db 里：切换副本 / 检出 / 更新后都重新对齐面板，避免显示旧规则。
-  await guard('读取稀疏规则', loadSparseRules);
 }
 
 function renderChanges() {
@@ -1143,7 +1268,7 @@ function renderChanges() {
       if (marker === 'C') {
         void guard('读取冲突', () => showConflict(change.path, li));
       } else {
-        showDiff(change.path, li);
+        void guard('读取差异', () => showDiff(change.path, li));
       }
     });
     list.appendChild(li);
@@ -1556,6 +1681,7 @@ async function showConflict(path, node) {
   highlight(node);
   const detail = unwrap(await api.conflictDetail(state.wcDir, path), '读取冲突内容');
   state.conflict = { path, kind: detail.kind };
+  state.detailPath = path;
   // 冲突编辑器住在差异卡片里：看冲突就是「需要看差异」，先把卡片展开。
   setDiffOpen(true);
   const label = `${path}（${detail.kind} 冲突）`;
@@ -1579,6 +1705,8 @@ async function showConflict(path, node) {
 
 function closeConflict() {
   state.conflict = null;
+  // 冲突编辑器收起 = 差异卡片上没有再看具体哪一条了，选中路径一并清掉。
+  state.detailPath = '';
   el('conflict-editor').classList.add('hidden');
   el('diff').classList.remove('hidden');
 }
@@ -1603,15 +1731,28 @@ async function resolveConflict(choice) {
   await refreshStatus();
 }
 
-function showDiff(path, node) {
+/**
+ * 看差异。差异文本按需生成：自动刷新只把 diff 标脏、不读盘，所以这里可能
+ * 要先补拉一次——打开某条变更才付出读整棵树的代价。
+ */
+async function showDiff(path, node) {
   highlight(node);
   // 从冲突编辑器切回普通差异：先把三栏收掉，否则 diff 还被 hidden 着。
   closeConflict();
   setDiffOpen(true);
+  state.detailPath = path;
   el('diff-path').textContent = path;
   el('diff-path').title = path;
-  const entry = state.diff.find((item) => item.path === path);
-  el('diff').textContent = entry ? entry.text : '（无文本差异，可能是二进制文件或新增/删除）';
+  if (state.diffDirty) {
+    el('diff').textContent = '正在读取差异…';
+    const dir = state.wcDir;
+    const diffs = unwrap(await api.diff(dir), '生成差异');
+    state.diff = diffs;
+    state.diffDirty = false;
+    // 读盘期间又点了别的条目：让最后一次点击说了算。
+    if (state.detailPath !== path) return;
+  }
+  paintDiffText(path);
 }
 
 // ---------------- 提交 / 更新 / 还原 ----------------
@@ -1668,19 +1809,25 @@ async function update() {
     banner('请先检出工作副本', 'error');
     return;
   }
-  const result = unwrap(await api.update(dir), '更新');
-  const parts = [
-    `更新 ${result.updated}`,
-    `新增 ${result.added}`,
-    `删除 ${result.removed}`,
-  ];
-  if (result.conflicts || result.treeConflicts) {
-    parts.push(`冲突 ${result.conflicts} 处内容 / ${result.treeConflicts} 处树`);
-    parts.push('本地改动保持原样，可在变更列表里核对后还原或手工合并');
+  if (state.updating) return;
+  state.updating = true;
+  try {
+    const result = unwrap(await api.update(dir), '更新');
+    const parts = [
+      `更新 ${result.updated}`,
+      `新增 ${result.added}`,
+      `删除 ${result.removed}`,
+    ];
+    if (result.conflicts || result.treeConflicts) {
+      parts.push(`冲突 ${result.conflicts} 处内容 / ${result.treeConflicts} 处树`);
+      parts.push('本地改动保持原样，可在变更列表里核对后还原或手工合并');
+    }
+    banner(`已更新到 r${result.rev}：${parts.join('，')}`);
+    await refreshStatus();
+    await loadRepos();
+  } finally {
+    state.updating = false;
   }
-  banner(`已更新到 r${result.rev}：${parts.join('，')}`);
-  await refreshStatus();
-  await loadRepos();
 }
 
 async function revertAll() {
@@ -1702,6 +1849,9 @@ async function disconnect() {
   state.changes = [];
   state.conflicts = [];
   state.diff = [];
+  state.statusSig = '';
+  state.diffDirty = true;
+  state.detailPath = '';
   el('who').textContent = '';
   el('repo-nav').innerHTML = '';
   el('changes').innerHTML = '';
@@ -1723,6 +1873,42 @@ async function disconnect() {
   renderWcBar();
   showLogin('已退出登录。');
 }
+
+// ---------------- 工作副本自动刷新 ----------------
+/**
+ * 变更是磁盘上的事实，不是界面里的一段记忆：在外面改完文件切回来，列表就该是新的。
+ * 原来要人手动点一下「重新扫描」，那等于把「看新状态」这件事交给用户记着。
+ *
+ * 三个时机够覆盖全部日常场景：
+ * 1. 窗口回到前台（focus / visibilitychange）——改完文件切回来最常见；
+ * 2. 切回「工作副本」tab——在历史 / 容量页停了一会儿回来；
+ * 3. 可见时每 8 秒一次轮询——窗口一直开着、文件被构建脚本改写。
+ *
+ * 扫描走 status 的 stat 快路径（mtime + size 没变就不算哈希），结果指纹没变时
+ * 一个 DOM 都不碰，差异卡片收着时也不读文件内容，所以轮询开着界面不会自己闪。
+ */
+const AUTO_SCAN_INTERVAL_MS = 8000;
+
+/** 自动刷新的前置条件：登录了、在仓库页、有工作副本、没有正在动盘或正在合并。 */
+function canAutoScan() {
+  if (!state.user || document.hidden) return false;
+  if (!state.wcDir || !currentRepo()) return false;
+  if (state.scanning || state.committing || state.updating || state.sparse.busy) return false;
+  // 正在手动解决冲突时不打断：三栏里可能是打了一半的合并结果。
+  if (state.conflict) return false;
+  return true;
+}
+
+function autoScan() {
+  if (!canAutoScan()) return;
+  void refreshStatus({ auto: true });
+}
+
+window.addEventListener('focus', autoScan);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) autoScan();
+});
+window.setInterval(autoScan, AUTO_SCAN_INTERVAL_MS);
 
 // ---------------- 绑定 ----------------
 
@@ -1789,7 +1975,6 @@ el('wc-dir-select').addEventListener('change', (event) =>
   void guard('切换工作副本', () => switchWorkingCopy(event.target.value)),
 );
 el('checkout').addEventListener('click', () => void guard('检出', checkout));
-el('refresh-status').addEventListener('click', () => void guard('扫描', refreshStatus));
 el('update').addEventListener('click', () => void guard('更新', update));
 el('revert').addEventListener('click', () => void guard('还原', revertAll));
 el('toggle-diff').addEventListener('click', () => setDiffOpen(!state.diffOpen));

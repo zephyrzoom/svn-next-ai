@@ -111,6 +111,9 @@ function verify({ app, BrowserWindow, ipcMain }) {
     'vcs:diff': [],
     'vcs:log': [],
   };
+  // 自动刷新回归用：vcs:status 的变更条目从这里取，测试中途改它来模拟
+  // 「用户在外面改了文件」。默认空表，不影响其它用例。
+  const liveStatus = { entries: [], conflicts: [] };
   for (const channel of channels) {
     ipcMain.handle(channel, async (_event, ...args) => {
       if (channel === 'vcs:setTarget') setTargetCalls.push(args[0]);
@@ -163,8 +166,8 @@ function verify({ app, BrowserWindow, ipcMain }) {
           data: {
             repoId: args[0] === OTHER_DIR ? 'r2' : 'r1',
             rev: 2,
-            entries: [],
-            conflicts: [],
+            entries: liveStatus.entries.slice(),
+            conflicts: liveStatus.conflicts.slice(),
             missing: false,
           },
         };
@@ -806,6 +809,79 @@ function verify({ app, BrowserWindow, ipcMain }) {
         problems.push(`删除检出目录求值失败：${err && err.message}`);
       }
 
+      // 自动刷新回归：「重新扫描」按钮已经不在了，改完文件不点任何按钮，界面自己就得跟上；
+      // 结果没变时连列表节点都不该重建（否则自动刷新会把手动滚动 / 选中冲掉）。
+      const auto = {};
+      try {
+        auto.setup = await win.webContents.executeJavaScript(`(() => {
+          const shell = document.getElementById('view-repo');
+          shell.classList.remove('hidden');
+          window.__smokeAutoSaved = {
+            repos: state.repos, selected: state.selectedRepoId, dirs: state.wcDirs,
+            wcDir: state.wcDir, checkoutOpen: state.checkoutOpen, tab: state.tab,
+          };
+          state.repos = [{ repoId: 'r1', name: '仓库一', headRev: 2 }];
+          state.selectedRepoId = 'r1';
+          state.wcDirs = { r1: ['/tmp/wc-live'] };
+          state.wcDir = '/tmp/wc-live';
+          state.checkoutOpen = false;
+          state.changes = [];
+          state.conflicts = [];
+          state.statusSig = '';
+          state.diffOpen = false;
+          state.detailPath = '';
+          renderRepoNav();
+          renderWcBar();
+          return { buttonGone: document.getElementById('refresh-status') === null };
+        })()`);
+        // 第一轮：干净的工作副本。
+        auto.clean = await win.webContents.executeJavaScript(`(async () => {
+          await refreshStatus({ auto: true });
+          return {
+            empty: document.querySelectorAll('#changes li.empty').length,
+            status: document.getElementById('wc-status').textContent,
+          };
+        })()`);
+        // 模拟用户在外面改了文件：status 多出一条 MODIFY，再触发一次自动刷新。
+        liveStatus.entries = [{ path: 'src/app.js', kind: 'MODIFY' }];
+        auto.changed = await win.webContents.executeJavaScript(`(async () => {
+          // 前面几步可能还挂着一条提示浮层：自动刷新前后它不该有任何变化。
+          const bannerOf = () => {
+            const node = document.getElementById('banner');
+            return node.className + '|' + node.textContent;
+          };
+          const bannerBefore = bannerOf();
+          await refreshStatus({ auto: true });
+          const first = document.querySelector('#changes li');
+          // 同样的结果再扫一次：指纹没变，节点必须原地不动。
+          await refreshStatus({ auto: true });
+          const result = {
+            items: document.querySelectorAll('#changes li').length,
+            title: first && first.title,
+            text: first && first.textContent,
+            kept: first === document.querySelector('#changes li'),
+            status: document.getElementById('wc-status').textContent,
+            bannerSame: bannerOf() === bannerBefore,
+          };
+          const saved = window.__smokeAutoSaved;
+          state.repos = saved.repos;
+          state.selectedRepoId = saved.selected;
+          state.wcDirs = saved.dirs;
+          state.wcDir = saved.wcDir;
+          state.checkoutOpen = saved.checkoutOpen;
+          state.tab = saved.tab;
+          state.changes = [];
+          state.conflicts = [];
+          state.statusSig = '';
+          delete window.__smokeAutoSaved;
+          document.getElementById('view-repo').classList.add('hidden');
+          return result;
+        })()`);
+        liveStatus.entries = [];
+      } catch (err) {
+        problems.push(`自动刷新求值失败：${err && err.message}`);
+      }
+
       const checks = {
         页面标题: info.title === 'svn-next',
         // 桌面端剥离管理 UI 后 id 数下降，阈值按「仓库使用」客户端的实际结构设定。
@@ -964,6 +1040,18 @@ function verify({ app, BrowserWindow, ipcMain }) {
           stale.scanned?.workbenchHidden === true &&
           stale.scanned?.navDot === false &&
           checkoutCalls.length === staleCheckoutBaseline,
+        // 自动刷新接过「重新扫描」的班：按钮没了，改完文件界面自己跟上，
+        // 结果没变时不重建列表（否则会冲掉滚动与选中）。
+        扫描按钮已由自动刷新取代:
+          auto.setup?.buttonGone === true &&
+          auto.clean?.empty === 1 &&
+          String(auto.clean?.status || '').includes('0 个待提交变更') &&
+          auto.changed?.items === 1 &&
+          auto.changed?.title === 'src/app.js' &&
+          String(auto.changed?.text || '').includes('src/app.js') &&
+          String(auto.changed?.status || '').includes('1 个待提交变更'),
+        自动刷新结果没变时不重建列表: auto.changed?.kept === true,
+        自动刷新不弹提示: auto.changed?.bannerSame === true,
       };
       for (const [name, ok] of Object.entries(checks)) {
         if (!ok) problems.push(`断言失败：${name}`);
@@ -981,6 +1069,7 @@ function verify({ app, BrowserWindow, ipcMain }) {
         adopt,
         sparse,
         stale,
+        auto,
         checkoutCalls: checkoutCalls.length,
       });
     })
