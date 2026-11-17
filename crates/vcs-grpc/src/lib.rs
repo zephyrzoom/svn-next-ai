@@ -44,8 +44,19 @@ mod admin;
 pub type Store = Arc<Mutex<ServerStore>>;
 
 /// 单批对象大小：与 CLI 的推送分片保持一致，避免两套「批量」定义。
+///
+/// 这里只是**目标**大小：单个对象超过它时会独占一批（对象是 protobuf 的一条
+/// `bytes`，拆不开），所以真正兜住传输的是 [`MAX_MESSAGE_BYTES`]。
 const BATCH_OBJECTS: usize = 32;
 const BATCH_BYTES: usize = 4 * 1024 * 1024;
+
+/// 单条 gRPC 消息的收发上限。
+///
+/// tonic 与 @grpc/grpc-js 的默认上限都只有 4 MiB：仓库里只要有一个大文件，
+/// 「检出」就会直接报 `Received message larger than max`；GetTree 在多文件仓库里
+/// 也会撞同一堵墙。对象流没法把**单个**对象拆成多条消息（一条 `Change` 只带一个
+/// 完整 `bytes`），因此只能把上限抬到足够大，并让客户端用同一个常量。
+pub const MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 
 /// 把 `ServerStore` 包成三个 gRPC service。
 #[derive(Clone)]
@@ -411,21 +422,28 @@ fn quota_source_to_pb(source: vcs_core::QuotaSource) -> i32 {
     }
 }
 
-/// 把对象列表切成批次：单批 32 个 / 4 MiB，与 CLI 推送节奏一致。
+/// 把对象列表切成批次：单批 32 个 / 4 MiB（单个超大对象独占一批）。
+///
+/// 判定必须在**放入之前**做：先累加再判满，会让 3 MiB + 3 MiB 挤进同一批变成
+/// 6 MiB，越过默认的 4 MiB 消息上限——这正是检出大文件时客户端报
+/// `Received message larger than max` 的原因。
 fn batches(objects: Vec<pb::Object>) -> Vec<pb::ObjectBatch> {
     let mut out = Vec::new();
     let mut current: Vec<pb::Object> = Vec::new();
     let mut bytes = 0usize;
     for object in objects {
-        bytes += object.data.len();
-        current.push(object);
-        if current.len() >= BATCH_OBJECTS || bytes >= BATCH_BYTES {
+        let size = object.data.len();
+        let full =
+            !current.is_empty() && (current.len() >= BATCH_OBJECTS || bytes + size > BATCH_BYTES);
+        if full {
             out.push(pb::ObjectBatch {
                 session_id: String::new(),
                 objects: std::mem::take(&mut current),
             });
             bytes = 0;
         }
+        bytes += size;
+        current.push(object);
     }
     if !current.is_empty() {
         out.push(pb::ObjectBatch {
@@ -2501,11 +2519,26 @@ fn now_secs() -> i64 {
 ///
 /// 单独暴露 `router` 是为了测试能在进程内起服务：`serve_with_incoming` 可以用
 /// 内核分配的端口（`:0`），不必在 CI 上抢固定端口。
+///
+/// 每个 service 都要显式抬 `max_decoding_message_size`：tonic 的默认值是 4 MiB，
+/// 桌面端一次 PushObjects 的批量对象很容易超过它，服务端会直接拒收整条流。
 pub fn router(store: Store) -> tonic::transport::server::Router {
     tonic::transport::Server::builder()
-        .add_service(AuthServiceServer::new(AuthApi::new(store.clone())))
-        .add_service(RepoServiceServer::new(RepoApi::new(store.clone())))
-        .add_service(RepoAdminServiceServer::new(RepoAdminApi::new(store)))
+        .add_service(
+            AuthServiceServer::new(AuthApi::new(store.clone()))
+                .max_decoding_message_size(MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_MESSAGE_BYTES),
+        )
+        .add_service(
+            RepoServiceServer::new(RepoApi::new(store.clone()))
+                .max_decoding_message_size(MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_MESSAGE_BYTES),
+        )
+        .add_service(
+            RepoAdminServiceServer::new(RepoAdminApi::new(store))
+                .max_decoding_message_size(MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_MESSAGE_BYTES),
+        )
 }
 
 type RepoAdminApi = AdminApi;
@@ -2710,6 +2743,49 @@ mod tests {
         assert_eq!(batches.len(), 3);
         assert_eq!(batches[0].objects.len(), 32);
         assert_eq!(batches[2].objects.len(), 6);
+    }
+
+    /// 中等体积对象不能被凑进同一批：3 MiB + 3 MiB 曾经合成一条 6 MiB 的消息，
+    /// 直接越过默认 4 MiB 上限，客户端报 `Received message larger than max`。
+    #[test]
+    fn batches_never_exceed_target_bytes() {
+        let objects: Vec<pb::Object> = (0..3)
+            .map(|i| pb::Object {
+                hash: format!("{i:064x}"),
+                kind: pb::ObjectKind::Blob as i32,
+                data: vec![0u8; 3 * 1024 * 1024],
+                compressed: false,
+            })
+            .collect();
+        let batches = batches(objects);
+        assert_eq!(batches.len(), 3, "每个 3 MiB 对象都该独占一批");
+        for batch in &batches {
+            let bytes: usize = batch.objects.iter().map(|o| o.data.len()).sum();
+            assert_eq!(bytes, 3 * 1024 * 1024);
+        }
+    }
+
+    /// 单个对象大于目标批量时也不能拆，只能独占一批——上限由 MAX_MESSAGE_BYTES 兜住。
+    #[test]
+    fn batches_keep_oversized_object_alone() {
+        let objects: Vec<pb::Object> = vec![
+            pb::Object {
+                hash: "a".repeat(64),
+                kind: pb::ObjectKind::Blob as i32,
+                data: vec![0u8; 6 * 1024 * 1024],
+                compressed: false,
+            },
+            pb::Object {
+                hash: "b".repeat(64),
+                kind: pb::ObjectKind::Blob as i32,
+                data: vec![0u8; 1024],
+                compressed: false,
+            },
+        ];
+        let batches = batches(objects);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].objects.len(), 1);
+        assert_eq!(batches[1].objects.len(), 1);
     }
 
     #[test]

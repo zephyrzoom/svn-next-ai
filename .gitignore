@@ -14,6 +14,7 @@ desktop/proto/
 
 # 本地服务端存储目录与工作副本元数据，不入库
 /.vcs-server/
+/vcs-data/
 .vcs/
 # 工作副本元数据目录（桌面端早期版本用过 .vcs-desktop，保留忽略以免误提交）
 .vcs-desktop/

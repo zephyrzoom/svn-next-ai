@@ -165,6 +165,8 @@ count                 u32 LE
 
 **两阶段提交**：对象先落 CAS（此时是孤儿，GC 可回收），只有 `FinalizeCommit` 才在单事务里分配版本号。因此断网或中断不会产生半个版本，支持断点续传，重复哈希可秒级跳过。
 
+**传输分片与消息上限**：对象流按「32 个 / 4 MiB」双阈值切批，判定在放入前做（否则 3 MiB + 3 MiB 会拼成 6 MiB 的单条消息）。对象本身拆不开——一条 `Object` 只带一个完整 `bytes`——所以单条消息上限统一抬到 256 MiB（服务端 `vcs_grpc::MAX_MESSAGE_BYTES`，桌面端 `client.ts` 的 `MAX_MESSAGE_BYTES`，同时设 `max_decoding/encoding_message_size` 与 `grpc.max_receive/send_message_length`）。tonic 与 grpc-js 默认只有 4 MiB，不抬就会在检出稍大的文件时报 `Received message larger than max`。
+
 ```
 BeginCommit(base_rev, changeset, estimated_new_bytes)
   ← session_id + 缺失对象哈希清单 + quota_hint

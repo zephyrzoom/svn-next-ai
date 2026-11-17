@@ -351,6 +351,33 @@ type Unary = (
   callback: (err: grpc.ServiceError | null, response: any) => void,
 ) => void;
 
+/**
+ * 单条 gRPC 消息的收发上限，与服务端 `vcs_grpc::MAX_MESSAGE_BYTES` 保持一致。
+ *
+ * grpc-js 默认只肯收 4 MiB：仓库里放一个稍大的文件，检出就会直接失败在
+ * `Received message larger than max`——此时对象其实已经传到了本地，只是客户端
+ * 拒绝接收。对象流没法把单个对象拆成多条消息（一条 Object 只带一个完整 data），
+ * 所以只能把这个上限一起抬上去。
+ */
+const MAX_MESSAGE_BYTES = 256 * 1024 * 1024;
+
+/** 推送时单批的目标体积（与服务端分批节奏一致，避免一条消息过大）。 */
+const PUSH_BATCH_BYTES = 4 * 1024 * 1024;
+const PUSH_BATCH_OBJECTS = 32;
+
+/** 把 grpc-js / 服务端的传输层错误翻成能看懂的中文提示。 */
+function toVcsError(err: grpc.ServiceError): VcsError {
+  const detail = err.details || err.message || '';
+  if (/larger than max|message length too large/i.test(detail)) {
+    return new VcsError(
+      err.code,
+      `单个文件超过 ${MAX_MESSAGE_BYTES / 1024 / 1024} MiB 的传输上限，` +
+        '请用「稀疏检出」只取需要的目录，或先把大文件从仓库里挪走',
+    );
+  }
+  return new VcsError(err.code, detail);
+}
+
 export class VcsClient {
   private readonly auth: Record<string, Unary>;
   private readonly repo: Record<string, Unary>;
@@ -370,9 +397,14 @@ export class VcsClient {
     const pkg = grpc.loadPackageDefinition(definition) as any;
     const v1 = pkg.vcs.repo.v1;
     const credentials = grpc.credentials.createInsecure();
-    const auth = new v1.AuthService(target, credentials);
-    const repo = new v1.RepoService(target, credentials);
-    const admin = new v1.RepoAdminService(target, credentials);
+    // 收发上限都抬到 256 MiB：默认 4 MiB 会让「检出」在大文件或大仓库上直接失败。
+    const options: grpc.ChannelOptions = {
+      'grpc.max_receive_message_length': MAX_MESSAGE_BYTES,
+      'grpc.max_send_message_length': MAX_MESSAGE_BYTES,
+    };
+    const auth = new v1.AuthService(target, credentials, options);
+    const repo = new v1.RepoService(target, credentials, options);
+    const admin = new v1.RepoAdminService(target, credentials, options);
     this.raw = [auth, repo, admin];
     this.auth = auth as Record<string, Unary>;
     this.repo = repo as Record<string, Unary>;
@@ -398,7 +430,7 @@ export class VcsClient {
     return new Promise<T>((resolve, reject) => {
       client[method].call(client, request, this.metadata(), (err, response) => {
         if (err) {
-          reject(new VcsError(err.code, err.details || err.message));
+          reject(toVcsError(err));
           return;
         }
         resolve(response as T);
@@ -973,9 +1005,7 @@ export class VcsClient {
           contents.set(object.hash as string, Buffer.from(object.data));
         }
       });
-      call.on('error', (err: grpc.ServiceError) =>
-        reject(new VcsError(err.code, err.details || err.message)),
-      );
+      call.on('error', (err: grpc.ServiceError) => reject(toVcsError(err)));
       call.on('end', () => resolve());
     });
     return contents;
@@ -1004,9 +1034,7 @@ export class VcsClient {
           contents.set(object.hash as string, Buffer.from(object.data));
         }
       });
-      call.on('error', (err: grpc.ServiceError) =>
-        reject(new VcsError(err.code, err.details || err.message)),
-      );
+      call.on('error', (err: grpc.ServiceError) => reject(toVcsError(err)));
       call.on('end', () => resolve());
       call.write({ sessionId: '', hashes });
       call.end();
@@ -1077,7 +1105,7 @@ export class VcsClient {
     };
   }
 
-  /** 客户端流：把对象分批推上去。分片大小与 CLI 保持一致（32 个/批）。 */
+  /** 客户端流：把对象分批推上去。按「32 个 + 4 MiB」双阈值切，与服务端节奏一致。 */
   async pushObjects(
     sessionId: string,
     objects: Array<{ hash: string; data: Buffer }>,
@@ -1087,24 +1115,34 @@ export class VcsClient {
         this.metadata(),
         (err: grpc.ServiceError | null, response: any) => {
           if (err) {
-            reject(new VcsError(err.code, err.details || err.message));
+            reject(toVcsError(err));
             return;
           }
           resolve(response);
         },
       );
-      const BATCH = 32;
-      for (let i = 0; i < objects.length; i += BATCH) {
-        call.write({
-          sessionId,
-          objects: objects.slice(i, i + BATCH).map((object) => ({
-            hash: object.hash,
-            kind: 1, // OBJECT_KIND_BLOB
-            data: object.data,
-            compressed: false,
-          })),
+      // 只按个数切会在「32 个各 1 MiB」时拼出 32 MiB 的单条消息，所以还要看体积。
+      let batch: any[] = [];
+      let bytes = 0;
+      const flush = () => {
+        if (batch.length === 0) return;
+        call.write({ sessionId, objects: batch });
+        batch = [];
+        bytes = 0;
+      };
+      for (const object of objects) {
+        if (batch.length >= PUSH_BATCH_OBJECTS || bytes + object.data.length > PUSH_BATCH_BYTES) {
+          flush();
+        }
+        batch.push({
+          hash: object.hash,
+          kind: 1, // OBJECT_KIND_BLOB
+          data: object.data,
+          compressed: false,
         });
+        bytes += object.data.length;
       }
+      flush();
       call.end();
     });
     // PushAck 也带业务 Status：内容与地址不符等错误在这里暴露，而不是等到 Finalize。
