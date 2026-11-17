@@ -351,7 +351,7 @@ npm run smoke:ui                       # 可选：真启动 Electron，验证页
 | 管理端提示「仅管理员可登录」 | 该入口只接受全局 `admin`。空库第一个注册 / LDAP 登录用户自动成为管理员；也可在服务器本机用 `vcs init-admin` 预置 |
 | 8080 端口被占用 | 启动会直接报错退出（不会半残启动）；换端口用 `--admin-listen 127.0.0.1:8081`，或加 `--no-admin` 只跑 gRPC |
 | 提示「尚未连接服务端」 | 先在登录页登录；凭证过期会自动退回登录页，重新登录即可 |
-| 检出报 `Received message larger than max` | 单条 gRPC 消息超过上限。现已把服务端与桌面端的消息上限统一抬到 256 MiB，并按「32 个 / 4 MiB」正确切批；若仍报错，说明单个文件就超过 256 MiB，请用「稀疏检出」只取需要的目录 |
+| 检出报 `Received message larger than max` | 说明客户端或服务端还是「一个对象一条消息」的老版本。现在大对象按 1 MiB 分块（`ObjectChunk`）传输，**单文件没有大小上限**；把服务端与桌面端都升级到同一版本即可 |
 | 每次启动都要重新登录 | 桌面端默认 30 天免登录、无需勾选：确认系统支持加密存储（钥匙串 / DPAPI / libsecret），且登录页底部没有出现「不支持加密存储」提示。主动点过「退出登录」或 30 天到期也会要求重新登录 |
 | 启动报找不到 `vcs-napi.node` | 执行 `npm run build:native`（需要本机有 Cargo），确认 `desktop/native/` 下有产物 |
 | 桌面端窗口白屏 | 先 `npm run check:assets` 定位（页面 / preload / html 引用 / 源码一致性）；通常是没跑过 `npm run build` 或 `dist/` 被清过，重新执行 `npm run start` 即可。加载失败现在也会弹错误框说明原因 |
@@ -367,7 +367,7 @@ npm run smoke:ui                       # 可选：真启动 Electron，验证页
 
 - 安装包**未签名、无自动更新**，仅用于内部试用；macOS CI 产物目前是 arm64。
 - 服务端**无内置 TLS**，明文 gRPC 与明文 HTTP 管理端；公网部署必须前置 TLS 网关。管理端登录令牌存在浏览器 `localStorage`，无服务端会话撤销能力（停用账号会递增 `token_version` 使令牌立即失效）。桌面端默认的 30 天免登录同样只靠 `token_version` 撤销，**没有 refresh / 服务端会话表**：本机凭证泄露后需管理员停用账号或改角色才能立刻下线。
-- 单机 SQLite，无多机 / 高可用；大文件不分块（一个对象必须装进一条 gRPC 消息，单文件上限 256 MiB）、路径级 ACL、锁尚未实现。LDAP 已接入（LDAPS / StartTLS），但目录连接池、嵌套组解析与真机目录集成测试仍待补。
+- 单机 SQLite，无多机 / 高可用；路径级 ACL、锁尚未实现。大对象按 1 MiB 分块传输，单文件没有大小上限，但检出时服务端与客户端都按「一个对象整体在内存」处理，**峰值内存约等于最大的那个文件**。LDAP 已接入（LDAPS / StartTLS），但目录连接池、嵌套组解析与真机目录集成测试仍待补。
 - 不兼容 SVN 协议，无历史仓库导入能力；`import` 只是内容初始化。
 
 设计与决策细节、里程碑与验收记录见 [`docs/design.md`](docs/design.md)。

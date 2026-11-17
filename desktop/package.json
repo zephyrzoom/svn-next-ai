@@ -11,6 +11,7 @@
     "smoke:ui": "node scripts/smoke-ui.cjs",
     "start": "npm run build:native && npm run build && electron .",
     "smoke": "npm run build:native && npm run build && node scripts/smoke-single-user.cjs",
+    "smoke:bigfile": "node scripts/smoke-bigfile.cjs",
     "smoke:admin": "node scripts/smoke-admin.cjs",
     "build:native": "node scripts/build-native.cjs",
     "build:native:release": "node scripts/build-native.cjs --release",

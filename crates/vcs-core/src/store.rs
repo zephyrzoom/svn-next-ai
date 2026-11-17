@@ -78,7 +78,9 @@ impl FileObjectStore {
             .ok_or_else(|| Error::new(ErrorCode::ObjectMissing, "对象文件为空"))?;
         match *flag {
             FLAG_RAW => Ok(body.to_vec()),
-            FLAG_ZSTD => zstd::bulk::decompress(body, 512 * 1024 * 1024)
+            // 流式解码：`bulk::decompress` 必须给一个固定上限（原来是 512 MiB），
+            // 等于给单个对象强加一个大小上限。流式解码按需增长，没有这个天花板。
+            FLAG_ZSTD => zstd::stream::decode_all(std::io::Cursor::new(body))
                 .map_err(|e| Error::new(ErrorCode::ObjectMissing, format!("zstd 解压失败：{e}"))),
             other => Err(Error::new(
                 ErrorCode::ObjectMissing,
@@ -289,6 +291,23 @@ mod tests {
         store.put(&hash, &data).unwrap();
         let stored = store.stored_size(&hash).unwrap();
         assert!(stored < data.len() as u64 / 10, "压缩未生效：{stored}");
+        assert_eq!(store.get(&hash).unwrap().len(), data.len());
+    }
+
+    /// 单个对象没有大小上限：解压不再用「固定输出上限」的 bulk 接口。
+    ///
+    /// 520 MiB 超过原来 `bulk::decompress(…, 512 MiB)` 的天花板，标了 `ignore`
+    /// 以免 CI 常态吃 500+ MiB 内存；需要时手动跑
+    /// `cargo test -p vcs-core -- --ignored big_object_has_no_size_cap`。
+    #[test]
+    #[ignore = "需要 500 MiB 以上内存与磁盘，手动执行"]
+    fn big_object_has_no_size_cap() {
+        let dir = TempDir::new("big");
+        let store = FileObjectStore::open(dir.0.join("cas")).unwrap();
+        // 全零内容压缩率极高，落盘只有几百 KB，但解压后是 520 MiB。
+        let data = vec![0u8; 520 * 1024 * 1024];
+        let hash = hash_bytes(&data);
+        store.put(&hash, &data).unwrap();
         assert_eq!(store.get(&hash).unwrap().len(), data.len());
     }
 

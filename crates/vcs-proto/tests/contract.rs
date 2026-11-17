@@ -86,3 +86,38 @@ fn quota_source_enum_matches_core() {
     assert_eq!(pb::QuotaSource::GlobalDefault as i32, 2);
     assert_eq!(pb::QuotaSource::Fallback as i32, 3);
 }
+
+#[test]
+fn object_batch_carries_chunks_for_large_objects() {
+    // 大对象靠 ObjectChunk 分块传输，单文件因此不受单条消息上限约束。
+    // 老实现会忽略 chunks 字段（proto3 未知字段），于是报缺对象而不是写坏数据。
+    let batch = pb::ObjectBatch {
+        session_id: "s".into(),
+        objects: Vec::new(),
+        chunks: vec![
+            pb::ObjectChunk {
+                hash: "a".repeat(64),
+                kind: pb::ObjectKind::Blob as i32,
+                index: 0,
+                data: vec![1, 2, 3],
+                last: false,
+            },
+            pb::ObjectChunk {
+                hash: "a".repeat(64),
+                kind: pb::ObjectKind::Blob as i32,
+                index: 1,
+                data: vec![4, 5],
+                last: true,
+            },
+        ],
+    };
+    use prost::Message as _;
+    let encoded = batch.encode_to_vec();
+    let decoded = pb::ObjectBatch::decode(encoded.as_slice()).unwrap();
+    assert_eq!(decoded.chunks.len(), 2);
+    assert_eq!(decoded.chunks[0].index, 0);
+    assert!(decoded.chunks[1].last);
+    assert_eq!(decoded.chunks[1].data, vec![4, 5]);
+    // 第 3 号字段是 chunks：编号被改会在这里暴露。
+    assert!(decoded.objects.is_empty());
+}

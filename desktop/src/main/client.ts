@@ -354,16 +354,20 @@ type Unary = (
 /**
  * 单条 gRPC 消息的收发上限，与服务端 `vcs_grpc::MAX_MESSAGE_BYTES` 保持一致。
  *
- * grpc-js 默认只肯收 4 MiB：仓库里放一个稍大的文件，检出就会直接失败在
- * `Received message larger than max`——此时对象其实已经传到了本地，只是客户端
- * 拒绝接收。对象流没法把单个对象拆成多条消息（一条 Object 只带一个完整 data），
- * 所以只能把这个上限一起抬上去。
+ * **与单文件大小无关**：对象内容按 {@link CHUNK_BYTES} 分块传输，所以这个数值只兜
+ * 元数据类的大响应（如 `GetTree`）。grpc-js 默认只有 4 MiB，多文件仓库的树就会撞上。
  */
-const MAX_MESSAGE_BYTES = 256 * 1024 * 1024;
+const MAX_MESSAGE_BYTES = 32 * 1024 * 1024;
 
-/** 推送时单批的目标体积（与服务端分批节奏一致，避免一条消息过大）。 */
+/** 单个对象超过它就切成 `ObjectChunk` 发送：单文件因此没有大小上限。 */
+const CHUNK_BYTES = 1024 * 1024;
+
+/** 推送时单条消息的目标体积与条数（与服务端分批节奏一致）。 */
 const PUSH_BATCH_BYTES = 4 * 1024 * 1024;
 const PUSH_BATCH_OBJECTS = 32;
+/** 单条消息的 protobuf 开销余量，避免「负载刚好 4 MiB + 开销」贴到上限。 */
+const PUSH_MESSAGE_HEADROOM = 64 * 1024;
+const PUSH_PAYLOAD_BYTES = PUSH_BATCH_BYTES - PUSH_MESSAGE_HEADROOM;
 
 /** 把 grpc-js / 服务端的传输层错误翻成能看懂的中文提示。 */
 function toVcsError(err: grpc.ServiceError): VcsError {
@@ -371,11 +375,85 @@ function toVcsError(err: grpc.ServiceError): VcsError {
   if (/larger than max|message length too large/i.test(detail)) {
     return new VcsError(
       err.code,
-      `单个文件超过 ${MAX_MESSAGE_BYTES / 1024 / 1024} MiB 的传输上限，` +
-        '请用「稀疏检出」只取需要的目录，或先把大文件从仓库里挪走',
+      '服务端返回的数据超过单条消息上限（大文件本身已按 1 MiB 分块传输，' +
+        '不受此限制）；通常是服务端版本过旧，升级后重试',
     );
   }
   return new VcsError(err.code, detail);
+}
+
+/**
+ * 分块对象的重组：同一个哈希收齐到 `last` 才算完整。
+ *
+ * 大对象在线上被拆成多条 `ObjectChunk`，这里攒回整份内容；序号必须连续，
+ * 否则宁可报错也不把错位的片段拼成一份「内容对不上哈希」的文件。
+ */
+class ChunkAssembler {
+  private readonly partial = new Map<string, Buffer[]>();
+
+  /** 吃掉一条 `ObjectBatch`，完整的对象写进 `out`。 */
+  absorb(batch: any, out: Map<string, Buffer>): void {
+    for (const object of batch.objects ?? []) {
+      out.set(object.hash as string, Buffer.from(object.data));
+    }
+    for (const chunk of batch.chunks ?? []) {
+      const hash = chunk.hash as string;
+      const pieces = this.partial.get(hash) ?? [];
+      if (Number(chunk.index ?? 0) !== pieces.length) {
+        throw new VcsError(
+          ErrorCode.INVALID_ARGUMENT,
+          `对象 ${hash} 的分块序号不连续：期望第 ${pieces.length} 块，收到第 ${chunk.index} 块`,
+        );
+      }
+      pieces.push(Buffer.from(chunk.data));
+      if (chunk.last) {
+        this.partial.delete(hash);
+        out.set(hash, Buffer.concat(pieces));
+      } else {
+        this.partial.set(hash, pieces);
+      }
+    }
+  }
+
+  /** 流结束时检查有没有只收了一半的对象。 */
+  finish(): void {
+    const [hash] = this.partial.keys();
+    if (hash) {
+      throw new VcsError(ErrorCode.INVALID_ARGUMENT, `对象 ${hash} 的分块没有收全`);
+    }
+  }
+}
+
+/** 把一条对象流收成「哈希 → 内容」，分块与整包两种形态都能吃。 */
+function drainObjects(call: any): Promise<Map<string, Buffer>> {
+  return new Promise((resolve, reject) => {
+    const contents = new Map<string, Buffer>();
+    const assembler = new ChunkAssembler();
+    let failure: VcsError | null = null;
+    call.on('data', (batch: any) => {
+      if (failure) return;
+      try {
+        assembler.absorb(batch, contents);
+      } catch (err) {
+        // 事件回调里抛错不会 reject 这个 Promise，只能记下来并主动取消流。
+        failure = err as VcsError;
+        call.cancel();
+      }
+    });
+    call.on('error', (err: grpc.ServiceError) => reject(failure ?? toVcsError(err)));
+    call.on('end', () => {
+      if (failure) {
+        reject(failure);
+        return;
+      }
+      try {
+        assembler.finish();
+        resolve(contents);
+      } catch (err) {
+        reject(err as Error);
+      }
+    });
+  });
 }
 
 export class VcsClient {
@@ -397,7 +475,7 @@ export class VcsClient {
     const pkg = grpc.loadPackageDefinition(definition) as any;
     const v1 = pkg.vcs.repo.v1;
     const credentials = grpc.credentials.createInsecure();
-    // 收发上限都抬到 256 MiB：默认 4 MiB 会让「检出」在大文件或大仓库上直接失败。
+    // 收发上限与单文件大小无关（大对象会分块），只是给 GetTree 这类大响应留余量。
     const options: grpc.ChannelOptions = {
       'grpc.max_receive_message_length': MAX_MESSAGE_BYTES,
       'grpc.max_send_message_length': MAX_MESSAGE_BYTES,
@@ -998,17 +1076,7 @@ export class VcsClient {
     paths: string[] = [],
   ): Promise<Map<string, Buffer>> {
     const call = (this.repo as any).checkout({ repoId, rev, paths, depth: 1 }, this.metadata());
-    const contents = new Map<string, Buffer>();
-    await new Promise<void>((resolve, reject) => {
-      call.on('data', (batch: any) => {
-        for (const object of batch.objects ?? []) {
-          contents.set(object.hash as string, Buffer.from(object.data));
-        }
-      });
-      call.on('error', (err: grpc.ServiceError) => reject(toVcsError(err)));
-      call.on('end', () => resolve());
-    });
-    return contents;
+    return drainObjects(call);
   }
 
   async getLog(repoId: string, limit = 20): Promise<RevisionInfo[]> {
@@ -1025,21 +1093,12 @@ export class VcsClient {
 
   /** 按哈希批量拉对象内容（FetchObjects 双向流）。update 前补对象用。 */
   async fetchObjects(hashes: string[]): Promise<Map<string, Buffer>> {
-    const contents = new Map<string, Buffer>();
-    if (hashes.length === 0) return contents;
-    await new Promise<void>((resolve, reject) => {
-      const call = (this.repo as any).fetchObjects(this.metadata());
-      call.on('data', (batch: any) => {
-        for (const object of batch.objects ?? []) {
-          contents.set(object.hash as string, Buffer.from(object.data));
-        }
-      });
-      call.on('error', (err: grpc.ServiceError) => reject(toVcsError(err)));
-      call.on('end', () => resolve());
-      call.write({ sessionId: '', hashes });
-      call.end();
-    });
-    return contents;
+    if (hashes.length === 0) return new Map<string, Buffer>();
+    const call = (this.repo as any).fetchObjects(this.metadata());
+    const done = drainObjects(call);
+    call.write({ sessionId: '', hashes });
+    call.end();
+    return done;
   }
 
   /**
@@ -1105,7 +1164,12 @@ export class VcsClient {
     };
   }
 
-  /** 客户端流：把对象分批推上去。按「32 个 + 4 MiB」双阈值切，与服务端节奏一致。 */
+  /**
+   * 客户端流：把对象推上去。
+   *
+   * 小对象按「32 个 + 4 MiB」攒批；超过 {@link CHUNK_BYTES} 的对象切成连续的
+   * `ObjectChunk` 发送，因此**单文件多大都能推**，不受单条消息上限约束。
+   */
   async pushObjects(
     sessionId: string,
     objects: Array<{ hash: string; data: Buffer }>,
@@ -1124,14 +1188,45 @@ export class VcsClient {
       // 只按个数切会在「32 个各 1 MiB」时拼出 32 MiB 的单条消息，所以还要看体积。
       let batch: any[] = [];
       let bytes = 0;
+      let chunks: any[] = [];
+      let chunkBytes = 0;
+      const flushChunks = () => {
+        if (chunks.length === 0) return;
+        call.write({ sessionId, objects: [], chunks });
+        chunks = [];
+        chunkBytes = 0;
+      };
       const flush = () => {
         if (batch.length === 0) return;
-        call.write({ sessionId, objects: batch });
+        call.write({ sessionId, objects: batch, chunks: [] });
         batch = [];
         bytes = 0;
       };
       for (const object of objects) {
-        if (batch.length >= PUSH_BATCH_OBJECTS || bytes + object.data.length > PUSH_BATCH_BYTES) {
+        if (object.data.length > CHUNK_BYTES) {
+          // 大对象独占若干条分块消息，先把手上的小对象发掉。
+          flush();
+          let index = 0;
+          for (let offset = 0; offset < object.data.length; offset += CHUNK_BYTES) {
+            const end = Math.min(offset + CHUNK_BYTES, object.data.length);
+            const data = object.data.subarray(offset, end);
+            if (chunks.length > 0 && chunkBytes + data.length > PUSH_PAYLOAD_BYTES) {
+              flushChunks();
+            }
+            chunks.push({
+              hash: object.hash,
+              kind: 1, // OBJECT_KIND_BLOB
+              index,
+              data,
+              last: end === object.data.length,
+            });
+            chunkBytes += data.length;
+            index += 1;
+          }
+          flushChunks();
+          continue;
+        }
+        if (batch.length >= PUSH_BATCH_OBJECTS || bytes + object.data.length > PUSH_PAYLOAD_BYTES) {
           flush();
         }
         batch.push({

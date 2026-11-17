@@ -334,5 +334,8 @@ jobs:
         name: 单人提交闭环冒烟
         run: npm run smoke
       - working-directory: desktop
+        name: 大文件分块冒烟（单文件无大小上限）
+        run: npm run smoke:bigfile
+      - working-directory: desktop
         name: 内置 Web 管理端冒烟
         run: npm run smoke:admin

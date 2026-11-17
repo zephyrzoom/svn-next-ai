@@ -165,7 +165,7 @@ count                 u32 LE
 
 **两阶段提交**：对象先落 CAS（此时是孤儿，GC 可回收），只有 `FinalizeCommit` 才在单事务里分配版本号。因此断网或中断不会产生半个版本，支持断点续传，重复哈希可秒级跳过。
 
-**传输分片与消息上限**：对象流按「32 个 / 4 MiB」双阈值切批，判定在放入前做（否则 3 MiB + 3 MiB 会拼成 6 MiB 的单条消息）。对象本身拆不开——一条 `Object` 只带一个完整 `bytes`——所以单条消息上限统一抬到 256 MiB（服务端 `vcs_grpc::MAX_MESSAGE_BYTES`，桌面端 `client.ts` 的 `MAX_MESSAGE_BYTES`，同时设 `max_decoding/encoding_message_size` 与 `grpc.max_receive/send_message_length`）。tonic 与 grpc-js 默认只有 4 MiB，不抬就会在检出稍大的文件时报 `Received message larger than max`。
+**传输分片与消息上限**：对象流按「32 个 / 4 MiB」双阈值攒批，判定在放入前做（否则 3 MiB + 3 MiB 会拼成 6 MiB 的单条消息）。单个对象超过 1 MiB（`vcs_grpc::CHUNK_BYTES`）时改走 `ObjectChunk` 分块：同一哈希切成连续编号的多条消息，最后一块带 `last`，接收方攒齐后校验内容哈希——**单文件大小因此没有上限**，也不受任何语言 4 MiB 默认消息上限的约束。小对象仍走 `ObjectBatch.objects`，未实现分块的实现会忽略 `chunks` 而报缺对象，不会写坏数据。消息上限（`MAX_MESSAGE_BYTES` = 32 MiB，服务端 `max_decoding/encoding_message_size` 与桌面端 `grpc.max_receive/send_message_length` 同值）只兜 `GetTree` 这类元数据大响应，与文件大小无关。服务端 `Checkout` / `FetchObjects` 边读边发，内存只压着「一条消息 + 正在切的大对象」。
 
 ```
 BeginCommit(base_rev, changeset, estimated_new_bytes)

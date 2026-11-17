@@ -21,6 +21,7 @@
 // clippy 建议装箱，但那会与生成的 trait 签名打架，逐处转换只会更难读，因此整体放行。
 #![allow(clippy::result_large_err)]
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -43,20 +44,30 @@ mod admin;
 
 pub type Store = Arc<Mutex<ServerStore>>;
 
-/// 单批对象大小：与 CLI 的推送分片保持一致，避免两套「批量」定义。
-///
-/// 这里只是**目标**大小：单个对象超过它时会独占一批（对象是 protobuf 的一条
-/// `bytes`，拆不开），所以真正兜住传输的是 [`MAX_MESSAGE_BYTES`]。
+/// 小对象攒批的目标条数与字节数：只用来减少消息条数，不是大小限制。
 const BATCH_OBJECTS: usize = 32;
 const BATCH_BYTES: usize = 4 * 1024 * 1024;
 
+/// 一条消息里除负载之外的 protobuf 开销余量（每个条目还带 64 字节哈希与字段标记）。
+///
+/// 不留余量就会出现「负载刚好 4 MiB + 开销 300 字节」，贴着消息上限反而更容易被打回。
+const FRAME_OVERHEAD: usize = 64 * 1024;
+
+/// 一条消息能装的负载上限。
+const PAYLOAD_BYTES: usize = BATCH_BYTES - FRAME_OVERHEAD;
+
+/// 单个对象超过这个体积就改走 `ObjectChunk` 分块传输。
+///
+/// **单文件大小没有上限**：一个对象被切成任意多片，每片独立成消息，所以既不必
+/// 给「文件有多大」设限，也不用把 gRPC 的消息上限抬到几百 MiB。
+pub const CHUNK_BYTES: usize = 1024 * 1024;
+
 /// 单条 gRPC 消息的收发上限。
 ///
-/// tonic 与 @grpc/grpc-js 的默认上限都只有 4 MiB：仓库里只要有一个大文件，
-/// 「检出」就会直接报 `Received message larger than max`；GetTree 在多文件仓库里
-/// 也会撞同一堵墙。对象流没法把**单个**对象拆成多条消息（一条 `Change` 只带一个
-/// 完整 `bytes`），因此只能把上限抬到足够大，并让客户端用同一个常量。
-pub const MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
+/// 与单文件大小无关：对象内容由 [`CHUNK_BYTES`] 保证不会撑大单条消息，这里只是
+/// 兜住元数据类的大响应（如 `GetTree`）。tonic 与 @grpc/grpc-js 的默认值都是
+/// 4 MiB，不抬会让多文件仓库的 `GetTree` 直接失败。
+pub const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
 /// 把 `ServerStore` 包成三个 gRPC service。
 #[derive(Clone)]
@@ -422,36 +433,212 @@ fn quota_source_to_pb(source: vcs_core::QuotaSource) -> i32 {
     }
 }
 
-/// 把对象列表切成批次：单批 32 个 / 4 MiB（单个超大对象独占一批）。
+/// 小对象攒批器：攒到「32 个 / 4 MiB」就吐一条消息。
 ///
 /// 判定必须在**放入之前**做：先累加再判满，会让 3 MiB + 3 MiB 挤进同一批变成
-/// 6 MiB，越过默认的 4 MiB 消息上限——这正是检出大文件时客户端报
-/// `Received message larger than max` 的原因。
-fn batches(objects: Vec<pb::Object>) -> Vec<pb::ObjectBatch> {
-    let mut out = Vec::new();
-    let mut current: Vec<pb::Object> = Vec::new();
-    let mut bytes = 0usize;
-    for object in objects {
-        let size = object.data.len();
-        let full =
-            !current.is_empty() && (current.len() >= BATCH_OBJECTS || bytes + size > BATCH_BYTES);
-        if full {
-            out.push(pb::ObjectBatch {
-                session_id: String::new(),
-                objects: std::mem::take(&mut current),
-            });
-            bytes = 0;
+/// 6 MiB，越过默认的 4 MiB 消息上限。
+struct BatchAccumulator {
+    objects: Vec<pb::Object>,
+    bytes: usize,
+}
+
+impl BatchAccumulator {
+    fn new() -> Self {
+        Self {
+            objects: Vec::new(),
+            bytes: 0,
         }
-        bytes += size;
-        current.push(object);
     }
-    if !current.is_empty() {
-        out.push(pb::ObjectBatch {
+
+    fn would_overflow(&self, size: usize) -> bool {
+        !self.objects.is_empty()
+            && (self.objects.len() >= BATCH_OBJECTS || self.bytes + size > PAYLOAD_BYTES)
+    }
+
+    fn push(&mut self, object: pb::Object) {
+        self.bytes += object.data.len();
+        self.objects.push(object);
+    }
+
+    fn take(&mut self) -> Option<pb::ObjectBatch> {
+        if self.objects.is_empty() {
+            return None;
+        }
+        self.bytes = 0;
+        Some(pb::ObjectBatch {
             session_id: String::new(),
-            objects: current,
-        });
+            objects: std::mem::take(&mut self.objects),
+            chunks: Vec::new(),
+        })
     }
-    out
+}
+
+/// 正在分块发送的大对象：剩余未发字节 + 下一片序号。
+struct PendingChunks {
+    hash: String,
+    kind: i32,
+    rest: Vec<u8>,
+    next_index: u32,
+}
+
+impl PendingChunks {
+    fn new(hash: &vcs_core::Hash, data: Vec<u8>) -> Self {
+        Self {
+            hash: vcs_core::to_hex(hash),
+            kind: pb::ObjectKind::Blob as i32,
+            rest: data,
+            next_index: 0,
+        }
+    }
+
+    /// 取出一条消息的分块：装到 [`PAYLOAD_BYTES`] 为止，避免一条消息过胖。
+    fn take_message(&mut self) -> pb::ObjectBatch {
+        let mut chunks = Vec::new();
+        let mut bytes = 0usize;
+        while !self.rest.is_empty() {
+            let take = self.rest.len().min(CHUNK_BYTES);
+            // 放不下就留给下一条消息；但至少装一块，否则大对象永远发不出去。
+            if !chunks.is_empty() && bytes + take > PAYLOAD_BYTES {
+                break;
+            }
+            let tail = self.rest.split_off(take);
+            let data = std::mem::replace(&mut self.rest, tail);
+            bytes += data.len();
+            let last = self.rest.is_empty();
+            chunks.push(pb::ObjectChunk {
+                hash: self.hash.clone(),
+                kind: self.kind,
+                index: self.next_index,
+                data,
+                last,
+            });
+            self.next_index += 1;
+        }
+        pb::ObjectBatch {
+            session_id: String::new(),
+            objects: Vec::new(),
+            chunks,
+        }
+    }
+}
+
+/// 按需读对象、边读边发：内存里只压着「当前这一批 + 正在切的大对象」，
+/// 不再像以前那样先把整个仓库读进内存再发包。
+struct ObjectStream {
+    api: Api,
+    hashes: std::vec::IntoIter<vcs_core::Hash>,
+    batch: BatchAccumulator,
+    pending: Option<PendingChunks>,
+    failed: bool,
+}
+
+impl ObjectStream {
+    fn new(api: Api, hashes: Vec<vcs_core::Hash>) -> Self {
+        Self {
+            api,
+            hashes: hashes.into_iter(),
+            batch: BatchAccumulator::new(),
+            pending: None,
+            failed: false,
+        }
+    }
+}
+
+impl Iterator for ObjectStream {
+    type Item = Result<pb::ObjectBatch, Status>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.failed {
+                return None;
+            }
+            // 大对象一旦开始发，就把它的分块发完，不跟小对象混批。
+            if let Some(pending) = self.pending.as_mut() {
+                let message = pending.take_message();
+                if pending.rest.is_empty() {
+                    self.pending = None;
+                }
+                return Some(Ok(message));
+            }
+            let Some(hash) = self.hashes.next() else {
+                return self.batch.take().map(Ok);
+            };
+            let data = {
+                let store = self.api.store();
+                store.objects().get(&hash)
+            };
+            let data = match data {
+                Ok(data) => data,
+                Err(err) => {
+                    self.failed = true;
+                    return Some(Err(Status::internal(format!(
+                        "{:?}: {}",
+                        err.code, err.message
+                    ))));
+                }
+            };
+            if data.len() > CHUNK_BYTES {
+                // 先把手上的小对象发出去，再单独开一条大对象的分块消息。
+                if let Some(message) = self.batch.take() {
+                    self.pending = Some(PendingChunks::new(&hash, data));
+                    return Some(Ok(message));
+                }
+                self.pending = Some(PendingChunks::new(&hash, data));
+                continue;
+            }
+            if self.batch.would_overflow(data.len()) {
+                let message = self.batch.take();
+                self.batch.push(pb::Object {
+                    hash: vcs_core::to_hex(&hash),
+                    kind: pb::ObjectKind::Blob as i32,
+                    data,
+                    compressed: false,
+                });
+                return message.map(Ok);
+            }
+            self.batch.push(pb::Object {
+                hash: vcs_core::to_hex(&hash),
+                kind: pb::ObjectKind::Blob as i32,
+                data,
+                compressed: false,
+            });
+        }
+    }
+}
+
+/// 接收端：把同一个 hash 的分块攒回完整对象。
+#[derive(Default)]
+struct ChunkAssembler {
+    /// hash → (已收字节, 下一片期望序号)
+    partial: HashMap<String, (Vec<u8>, u32)>,
+}
+
+impl ChunkAssembler {
+    /// 收下一片。`Ok(None)` = 还没收完，`Ok(Some((hash, data)))` = 这个对象齐了。
+    fn push(&mut self, chunk: pb::ObjectChunk) -> Result<Option<(String, Vec<u8>)>, String> {
+        let entry = self
+            .partial
+            .entry(chunk.hash.clone())
+            .or_insert_with(|| (Vec::new(), 0));
+        if chunk.index != entry.1 {
+            return Err(format!(
+                "对象 {} 的分块序号不连续：期望第 {} 块，收到第 {} 块",
+                chunk.hash, entry.1, chunk.index
+            ));
+        }
+        entry.0.extend_from_slice(&chunk.data);
+        entry.1 += 1;
+        if chunk.last {
+            let (data, _) = self.partial.remove(&chunk.hash).expect("条目刚写入");
+            return Ok(Some((chunk.hash, data)));
+        }
+        Ok(None)
+    }
+
+    /// 流结束时检查有没有只收了一半的对象。
+    fn unfinished(&self) -> Option<&str> {
+        self.partial.keys().next().map(String::as_str)
+    }
 }
 
 // ---------------- AuthService ----------------
@@ -1218,36 +1405,20 @@ impl RepoService for RepoApi {
         let session = self.api.session(&request)?;
         let req = request.into_inner();
         let rev = if req.rev == 0 { None } else { Some(req.rev) };
-        // 先在锁内把对象读进内存再返回流：MutexGuard 不能跨 await，也不能跨 yield。
-        let objects = {
+        // 锁内只取「要发哪些对象」的哈希清单：MutexGuard 不能跨 await / yield，
+        // 而内容本身按需在流里逐个读取，避免把整库对象一次性读进内存。
+        let hashes = {
             let store = self.api.store();
             let (_, _, files) = store
                 .files_at(&session, &req.repo_id, rev)
                 .map_err(|e| Status::internal(format!("{:?}: {}", e.code, e.message)))?;
-            let mut objects = Vec::new();
-            for entry in files {
-                if !req.paths.is_empty() && !under_any(&entry.path, &req.paths) {
-                    continue;
-                }
-                let data = store
-                    .objects()
-                    .get(&entry.hash)
-                    .map_err(|e| Status::internal(format!("{:?}: {}", e.code, e.message)))?;
-                objects.push(pb::Object {
-                    hash: vcs_core::to_hex(&entry.hash),
-                    kind: pb::ObjectKind::Blob as i32,
-                    data,
-                    compressed: false,
-                });
-            }
-            objects
-        };
-        let stream = tokio_stream::iter(
-            batches(objects)
+            files
                 .into_iter()
-                .map(Ok)
-                .collect::<Vec<Result<pb::ObjectBatch, Status>>>(),
-        );
+                .filter(|entry| req.paths.is_empty() || under_any(&entry.path, &req.paths))
+                .map(|entry| entry.hash)
+                .collect::<Vec<_>>()
+        };
+        let stream = tokio_stream::iter(ObjectStream::new(self.api.clone(), hashes));
         Ok(Response::new(Box::pin(stream) as Self::CheckoutStream))
     }
 
@@ -1333,30 +1504,12 @@ impl RepoService for RepoApi {
         while let Some(item) = stream.next().await {
             wanted.extend(item?.hashes);
         }
-        let mut objects = Vec::new();
-        {
-            let store = self.api.store();
-            for hex in wanted {
-                let hash =
-                    vcs_core::from_hex(&hex).map_err(|e| Status::invalid_argument(e.message))?;
-                let data = store
-                    .objects()
-                    .get(&hash)
-                    .map_err(|e| Status::internal(format!("{:?}: {}", e.code, e.message)))?;
-                objects.push(pb::Object {
-                    hash: hex,
-                    kind: pb::ObjectKind::Blob as i32,
-                    data,
-                    compressed: false,
-                });
-            }
-        }
-        let out = tokio_stream::iter(
-            batches(objects)
-                .into_iter()
-                .map(Ok)
-                .collect::<Vec<Result<pb::ObjectBatch, Status>>>(),
-        );
+        // 只把哈希交给流，内容由 ObjectStream 逐个读取（大对象自动分块）。
+        let hashes = wanted
+            .into_iter()
+            .map(|hex| vcs_core::from_hex(&hex).map_err(|e| Status::invalid_argument(e.message)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let out = tokio_stream::iter(ObjectStream::new(self.api.clone(), hashes));
         Ok(Response::new(Box::pin(out) as Self::FetchObjectsStream))
     }
 
@@ -1437,17 +1590,40 @@ impl RepoService for RepoApi {
         let session = self.api.session(&request)?;
         let mut stream = request.into_inner();
         let mut session_id = String::new();
-        let mut objects = Vec::new();
+        let mut objects: Vec<(vcs_core::Hash, Vec<u8>)> = Vec::new();
+        // 分块的半成品：序号不连续就整笔拒绝，免得把错位的片段拼成一个
+        // 「内容对不上地址」的对象。
+        let mut assembler = ChunkAssembler::default();
         while let Some(item) = stream.next().await {
             let batch = item?;
             if session_id.is_empty() {
                 session_id = batch.session_id.clone();
             }
             for object in batch.objects {
+                if assembler.partial.contains_key(&object.hash) {
+                    return Err(Status::invalid_argument(format!(
+                        "对象 {} 同时按整体与分块发送",
+                        object.hash
+                    )));
+                }
                 let hash = vcs_core::from_hex(&object.hash)
                     .map_err(|e| Status::invalid_argument(e.message))?;
                 objects.push((hash, object.data));
             }
+            for chunk in batch.chunks {
+                if let Some((hash_hex, data)) =
+                    assembler.push(chunk).map_err(Status::invalid_argument)?
+                {
+                    let hash = vcs_core::from_hex(&hash_hex)
+                        .map_err(|e| Status::invalid_argument(e.message))?;
+                    objects.push((hash, data));
+                }
+            }
+        }
+        if let Some(hash) = assembler.unfinished() {
+            return Err(Status::invalid_argument(format!(
+                "对象 {hash} 的分块没有收全（缺少 last 块）"
+            )));
         }
         if session_id.is_empty() {
             return Err(Status::invalid_argument("缺少 session_id"));
@@ -2520,8 +2696,9 @@ fn now_secs() -> i64 {
 /// 单独暴露 `router` 是为了测试能在进程内起服务：`serve_with_incoming` 可以用
 /// 内核分配的端口（`:0`），不必在 CI 上抢固定端口。
 ///
-/// 每个 service 都要显式抬 `max_decoding_message_size`：tonic 的默认值是 4 MiB，
-/// 桌面端一次 PushObjects 的批量对象很容易超过它，服务端会直接拒收整条流。
+/// 每个 service 都要显式抬 `max_decoding_message_size`：tonic 默认 4 MiB，
+/// 多文件仓库的 `GetTree` / `Update` 响应就会撞上限（对象内容本身已按
+/// [`CHUNK_BYTES`] 分块，不受这个数值影响）。
 pub fn router(store: Store) -> tonic::transport::server::Router {
     tonic::transport::Server::builder()
         .add_service(
@@ -2729,63 +2906,134 @@ mod tests {
         assert_eq!(change_entry_kind(&[]), EntryKind::File);
     }
 
+    fn blob(hash: &str, len: usize) -> pb::Object {
+        pb::Object {
+            hash: hash.to_string(),
+            kind: pb::ObjectKind::Blob as i32,
+            data: vec![0u8; len],
+            compressed: false,
+        }
+    }
+
+    /// 按流里的攒批规则把小对象收集成消息，便于断言条数与体积。
+    fn collect_small(objects: Vec<pb::Object>) -> Vec<pb::ObjectBatch> {
+        let mut acc = BatchAccumulator::new();
+        let mut out = Vec::new();
+        for object in objects {
+            if acc.would_overflow(object.data.len()) {
+                out.extend(acc.take());
+            }
+            acc.push(object);
+        }
+        out.extend(acc.take());
+        out
+    }
+
     #[test]
-    fn batches_split_by_count_and_size() {
-        let objects: Vec<pb::Object> = (0..70)
-            .map(|i| pb::Object {
-                hash: format!("{i:064x}"),
-                kind: pb::ObjectKind::Blob as i32,
-                data: vec![0u8; 8],
-                compressed: false,
-            })
-            .collect();
-        let batches = batches(objects);
+    fn small_objects_batch_by_count_and_size() {
+        let objects: Vec<pb::Object> = (0..70).map(|i| blob(&format!("{i:064x}"), 8)).collect();
+        let batches = collect_small(objects);
         assert_eq!(batches.len(), 3);
         assert_eq!(batches[0].objects.len(), 32);
         assert_eq!(batches[2].objects.len(), 6);
+        // 小对象永远不走分块。
+        assert!(batches.iter().all(|b| b.chunks.is_empty()));
     }
 
-    /// 中等体积对象不能被凑进同一批：3 MiB + 3 MiB 曾经合成一条 6 MiB 的消息，
-    /// 直接越过默认 4 MiB 上限，客户端报 `Received message larger than max`。
+    /// 中等体积对象不能被凑进同一条消息：3 MiB + 3 MiB 曾经合成 6 MiB，
+    /// 越过默认 4 MiB 上限，客户端报 `Received message larger than max`。
     #[test]
-    fn batches_never_exceed_target_bytes() {
+    fn batch_never_exceeds_target_bytes() {
         let objects: Vec<pb::Object> = (0..3)
-            .map(|i| pb::Object {
-                hash: format!("{i:064x}"),
-                kind: pb::ObjectKind::Blob as i32,
-                data: vec![0u8; 3 * 1024 * 1024],
-                compressed: false,
-            })
+            .map(|i| blob(&format!("{i:064x}"), 3 * 1024 * 1024))
             .collect();
-        let batches = batches(objects);
-        assert_eq!(batches.len(), 3, "每个 3 MiB 对象都该独占一批");
+        let batches = collect_small(objects);
+        assert_eq!(batches.len(), 3, "每个 3 MiB 对象都该独占一条消息");
         for batch in &batches {
             let bytes: usize = batch.objects.iter().map(|o| o.data.len()).sum();
             assert_eq!(bytes, 3 * 1024 * 1024);
         }
     }
 
-    /// 单个对象大于目标批量时也不能拆，只能独占一批——上限由 MAX_MESSAGE_BYTES 兜住。
+    /// 大对象切成连续分片、最后一片带 last，拼回去必须与原文逐字节一致。
     #[test]
-    fn batches_keep_oversized_object_alone() {
-        let objects: Vec<pb::Object> = vec![
-            pb::Object {
-                hash: "a".repeat(64),
-                kind: pb::ObjectKind::Blob as i32,
-                data: vec![0u8; 6 * 1024 * 1024],
-                compressed: false,
-            },
-            pb::Object {
-                hash: "b".repeat(64),
-                kind: pb::ObjectKind::Blob as i32,
-                data: vec![0u8; 1024],
-                compressed: false,
-            },
-        ];
-        let batches = batches(objects);
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].objects.len(), 1);
-        assert_eq!(batches[1].objects.len(), 1);
+    fn big_object_splits_into_contiguous_chunks() {
+        let data: Vec<u8> = (0..(CHUNK_BYTES * 2 + 7))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let hash = vcs_core::hash_bytes(&data);
+        let hex = vcs_core::to_hex(&hash);
+        let mut pending = PendingChunks::new(&hash, data.clone());
+        let mut assembler = ChunkAssembler::default();
+        let mut index = 0u32;
+        let mut messages = 0;
+        while !pending.rest.is_empty() {
+            let message = pending.take_message();
+            messages += 1;
+            assert!(message.objects.is_empty(), "大对象不该混进 objects");
+            for chunk in message.chunks {
+                assert_eq!(chunk.hash, hex);
+                assert_eq!(chunk.index, index);
+                assert!(chunk.data.len() <= CHUNK_BYTES);
+                let done = assembler.push(chunk).expect("序号连续");
+                if let Some((got_hash, got)) = done {
+                    assert_eq!(got_hash, hex);
+                    assert_eq!(got, data, "拼回去的内容必须与原文一致");
+                }
+                index += 1;
+            }
+        }
+        assert_eq!(index, 3);
+        assert_eq!(messages, 1, "3 MiB 摘要应落在一条 4 MiB 的消息里");
+        assert!(assembler.unfinished().is_none());
+    }
+
+    /// 超大对象（远超任何消息上限）也能发完：分块数随体积线性增长。
+    #[test]
+    fn huge_object_needs_no_message_limit() {
+        let size = 40 * 1024 * 1024;
+        let data = vec![9u8; size];
+        let hash = vcs_core::hash_bytes(&data);
+        let mut pending = PendingChunks::new(&hash, data);
+        let mut total = 0usize;
+        let mut messages = 0usize;
+        while !pending.rest.is_empty() {
+            let message = pending.take_message();
+            messages += 1;
+            let bytes: usize = message.chunks.iter().map(|c| c.data.len()).sum();
+            assert!(bytes <= PAYLOAD_BYTES, "单条消息负载不得超过目标");
+            total += bytes;
+        }
+        assert_eq!(total, size, "分块后一个字节都不能少");
+        assert!(
+            messages >= size / BATCH_BYTES,
+            "40 MiB 至少要切成 {} 条，实际 {messages}",
+            size / BATCH_BYTES
+        );
+    }
+
+    /// 分块序号错乱必须整笔拒绝，不能把错位的片段拼成「内容对不上地址」的对象。
+    #[test]
+    fn chunk_assembler_rejects_gaps() {
+        let mut assembler = ChunkAssembler::default();
+        let first = pb::ObjectChunk {
+            hash: "a".repeat(64),
+            kind: pb::ObjectKind::Blob as i32,
+            index: 0,
+            data: vec![1, 2, 3],
+            last: false,
+        };
+        assert!(assembler.push(first).expect("第 0 块合法").is_none());
+        let jumped = pb::ObjectChunk {
+            hash: "a".repeat(64),
+            kind: pb::ObjectKind::Blob as i32,
+            index: 2,
+            data: vec![4],
+            last: true,
+        };
+        let err = assembler.push(jumped).expect_err("跳块必须报错");
+        assert!(err.contains("不连续"), "{err}");
+        assert_eq!(assembler.unfinished(), Some("a".repeat(64).as_str()));
     }
 
     #[test]

@@ -299,6 +299,7 @@ async fn full_commit_round_trip_over_the_wire() {
             data: content.to_vec(),
             compressed: false,
         }],
+        chunks: Vec::new(),
     };
     let ack = h
         .repos()
@@ -1145,4 +1146,147 @@ async fn first_registration_over_grpc_auto_approves_the_admin() {
     assert_eq!(second.status.unwrap().code, pb::ErrorCode::Ok as i32);
     assert!(!second.auto_approved);
     assert_eq!(second.state, pb::RegistrationStatus::Pending as i32);
+}
+
+/// 大对象走分块：一条消息装不下的文件也必须能推上去、检下来。
+///
+/// 这条测试守的是「单文件没有大小上限」这个承诺：客户端把对象切成连续的
+/// `ObjectChunk`，服务端重组后入库；检出时再切回来。全程任何一条消息都远小于
+/// 文件本身。
+#[tokio::test]
+async fn big_object_round_trips_in_chunks() {
+    use vcs_grpc::CHUNK_BYTES;
+
+    let h = Harness::start("chunks").await;
+    let token = login(&h, "alice", PASSWORD).await;
+
+    let repo = h
+        .admin()
+        .await
+        .create_repo_direct(bearer(
+            Request::new(pb::CreateRepoDirectRequest {
+                repo_name: "media".into(),
+                repo_id_hint: String::new(),
+                quota_bytes: 64 * 1024 * 1024,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(repo.status.unwrap().code, pb::ErrorCode::Ok as i32);
+    let repo_id = repo.repo.unwrap().repo_id;
+
+    // 比 CHUNK_BYTES 大一点：必然切成多块，且最后一块不满。
+    let content: Vec<u8> = (0..(CHUNK_BYTES + 12345))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let hash = hash_bytes(&content);
+    let hex = vcs_core::to_hex(&hash);
+
+    let begin = h
+        .repos()
+        .await
+        .begin_commit(bearer(
+            Request::new(pb::BeginCommitRequest {
+                repo_id: repo_id.clone(),
+                base_rev: 0,
+                changes: vec![pb::Change {
+                    kind: pb::ChangeKind::Add as i32,
+                    path: "big.bin".into(),
+                    old_hash: String::new(),
+                    new_hash: hex.clone(),
+                    from_path: String::new(),
+                    props: Vec::new(),
+                }],
+                message: "一个大文件".into(),
+                estimated_new_bytes: content.len() as u64,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(begin.status.unwrap().code, pb::ErrorCode::Ok as i32);
+    assert_eq!(begin.missing_hashes, vec![hex.clone()]);
+
+    // 客户端侧分块：序号连续、最后一块带 last。
+    let push: Vec<pb::ObjectBatch> = content
+        .chunks(CHUNK_BYTES)
+        .enumerate()
+        .map(|(index, piece)| pb::ObjectBatch {
+            session_id: begin.session_id.clone(),
+            objects: Vec::new(),
+            chunks: vec![pb::ObjectChunk {
+                hash: hex.clone(),
+                kind: pb::ObjectKind::Blob as i32,
+                index: index as u32,
+                data: piece.to_vec(),
+                last: (index + 1) * CHUNK_BYTES >= content.len(),
+            }],
+        })
+        .collect();
+    assert_eq!(push.len(), 2, "1 MiB + 12345 字节应切成两块");
+
+    let ack = h
+        .repos()
+        .await
+        .push_objects(bearer(Request::new(tokio_stream::iter(push)), &token))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ack.status.unwrap().code, pb::ErrorCode::Ok as i32);
+    assert_eq!(ack.received_objects, 1, "分块应按对象计数，不是按块");
+    assert_eq!(ack.received_bytes, content.len() as u64);
+
+    let finalize = h
+        .repos()
+        .await
+        .finalize_commit(bearer(
+            Request::new(pb::FinalizeCommitRequest {
+                session_id: begin.session_id,
+                message: String::new(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(finalize.status.unwrap().code, pb::ErrorCode::Ok as i32);
+
+    // 检出流：把分块拼回来，必须与原文逐字节一致。
+    let mut stream = h
+        .repos()
+        .await
+        .checkout(bearer(
+            Request::new(pb::CheckoutRequest {
+                repo_id: repo_id.clone(),
+                rev: 0,
+                paths: Vec::new(),
+                depth: pb::Depth::Infinity as i32,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut got: Vec<u8> = Vec::new();
+    let mut chunk_messages = 0;
+    while let Some(batch) = stream.message().await.unwrap() {
+        assert!(batch.objects.is_empty(), "大对象不该走 objects");
+        for chunk in &batch.chunks {
+            assert_eq!(chunk.hash, hex);
+            assert_eq!(
+                chunk.index as usize * CHUNK_BYTES,
+                got.len(),
+                "分块序号必须连续"
+            );
+            got.extend_from_slice(&chunk.data);
+        }
+        if !batch.chunks.is_empty() {
+            chunk_messages += 1;
+        }
+    }
+    assert!(chunk_messages > 0, "检出大对象必须走分块");
+    assert_eq!(got, content);
 }

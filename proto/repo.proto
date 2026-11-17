@@ -113,9 +113,24 @@ message Object {
   bool compressed = 4;
 }
 
+// 大对象的一块。对象整体大于分块阈值时，改用它把同一个 hash 拆成多条消息：
+// 序号从 0 连续递增，接收方攒到 last 为止再校验哈希。这样单文件大小不受
+// 「一条 gRPC 消息能装多少」限制，也顺带绕开各语言 4 MiB 的消息默认上限。
+//
+// 小对象仍然走 ObjectBatch.objects（老客户端 / 老服务端只认这个字段），
+// 未实现分块的实现会忽略 chunks 字段，从而在缺对象时报错而不是写坏数据。
+message ObjectChunk {
+  string hash = 1;
+  ObjectKind kind = 2;
+  uint32 index = 3; // 同一 hash 内从 0 开始，必须连续
+  bytes data = 4;
+  bool last = 5; // 该对象的最后一块
+}
+
 message ObjectBatch {
   string session_id = 1;
   repeated Object objects = 2;
+  repeated ObjectChunk chunks = 3;
 }
 
 message TreeEntry {
