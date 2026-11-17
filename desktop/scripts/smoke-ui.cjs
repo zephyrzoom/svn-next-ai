@@ -521,38 +521,65 @@ function verify({ app, BrowserWindow, ipcMain }) {
         problems.push(`成员搜索求值失败：${err && err.message}`);
       }
 
-      // 提交：按钮有忙碌态（禁用 + 文案），committing 标记挡住重复进入。
-      let commitGuard = {};
+      // 动盘防重：更新 / 提交 / 检出 / 还原共用一把锁。
+      // 拉一个大文件要几十秒，这期间「更新」按钮必须是灰的、写上「更新中…」，
+      // 再点一次（即使绕开 disabled 直接调函数）也不能发出第二个请求。
+      let jobGuard = {};
       try {
-        commitGuard = await win.webContents.executeJavaScript(`(async () => {
-          const button = document.getElementById('commit');
+        jobGuard = await win.webContents.executeJavaScript(`(async () => {
+          const commitBtn = document.getElementById('commit');
+          const updateBtn = document.getElementById('update');
           const message = document.getElementById('message');
-          setCommitBusy(true);
-          const busy = {
-            disabled: button.disabled,
-            label: button.textContent.trim(),
-            inputDisabled: message.disabled,
-          };
-          setCommitBusy(false);
-          const after = { disabled: button.disabled, label: button.textContent.trim() };
-          const beforeBanner = document.getElementById('banner').textContent;
-          state.committing = true;
+          const banner = document.getElementById('banner');
           state.wcDir = '/tmp/不存在的目录';
           state.changes = [{ path: 'a.txt', kind: 'MODIFY' }];
           state.conflicts = [];
           message.value = '';
+          renderWcBar();
+          const began = beginJob('update');
+          const busy = {
+            updateDisabled: updateBtn.disabled,
+            updateLabel: updateBtn.textContent.trim(),
+            commitDisabled: commitBtn.disabled,
+            statusText: document.getElementById('wc-status').textContent.trim(),
+          };
+          // 锁只允许一个：拿着锁再要一次必须失败。
+          const second = beginJob('commit');
+          endJob();
+          const after = {
+            updateDisabled: updateBtn.disabled,
+            updateLabel: updateBtn.textContent.trim(),
+            commitDisabled: commitBtn.disabled,
+            commitLabel: commitBtn.textContent.trim(),
+            inputDisabled: message.disabled,
+          };
+          // 连点：锁被占着时 commit / update 都得原地返回——零请求、零提示。
+          const beforeBanner = banner.textContent;
+          const calls = [];
+          const realCommit = window.vcs.commit;
+          const realUpdate = window.vcs.update;
+          window.vcs.commit = (...args) => {
+            calls.push(args);
+            return new Promise(() => {});
+          };
+          window.vcs.update = (...args) => {
+            calls.push(args);
+            return new Promise(() => {});
+          };
+          state.job = 'update';
+          await update();
           await commit();
-          const blocked =
-            !button.disabled &&
-            button.textContent.trim() === '提交' &&
-            document.getElementById('banner').textContent === beforeBanner;
-          state.committing = false;
+          state.job = '';
+          window.vcs.commit = realCommit;
+          window.vcs.update = realUpdate;
+          const blocked = calls.length === 0 && banner.textContent === beforeBanner;
           state.wcDir = '';
           state.changes = [];
-          return { busy, after, blocked };
+          renderWcBar();
+          return { began, busy, second, after, blocked };
         })()`);
       } catch (err) {
-        problems.push(`提交防重求值失败：${err && err.message}`);
+        problems.push(`动盘防重求值失败：${err && err.message}`);
       }
 
       // 一个仓库检出多份：已检出后仍要有「再检出一份」的入口，能切换、能移出列表。
@@ -993,13 +1020,21 @@ function verify({ app, BrowserWindow, ipcMain }) {
           picker.queryShown === '王五',
         搜索行不含权限分类:
           picker.searchRowHasRole === false && picker.roleInsidePicker === true,
-        提交按钮有忙碌态:
-          commitGuard.busy.disabled === true &&
-          commitGuard.busy.label === '提交中…' &&
-          commitGuard.busy.inputDisabled === true &&
-          commitGuard.after.disabled === false &&
-          commitGuard.after.label === '提交',
-        提交进行中不会重复进入: commitGuard.blocked === true,
+        更新中按钮有忙碌态且其它动盘入口一起禁用:
+          jobGuard.began === true &&
+          jobGuard.busy?.updateDisabled === true &&
+          jobGuard.busy?.updateLabel === '更新中…' &&
+          jobGuard.busy?.commitDisabled === true &&
+          jobGuard.busy?.statusText === '更新中…' &&
+          jobGuard.second === false,
+        更新进行中不会重复进入: jobGuard.blocked === true,
+        // 一次操作结束必须把按钮还回去：不能点过一次更新就永久灰着。
+        操作结束后按钮恢复可用:
+          jobGuard.after?.updateDisabled === false &&
+          jobGuard.after?.updateLabel === '更新' &&
+          jobGuard.after?.commitDisabled === false &&
+          jobGuard.after?.commitLabel === '提交' &&
+          jobGuard.after?.inputDisabled === false,
         // 检出过一份之后，还得能再检出一份：卡片入口、切换下拉、目录清单都得在。
         已检出后仍可再检出一份:
           multiWc.before?.cardHidden === true &&
@@ -1099,7 +1134,7 @@ function verify({ app, BrowserWindow, ipcMain }) {
         layout,
         diffHead,
         picker,
-        commitGuard,
+        jobGuard,
         multiWc,
         adopt,
         sparse,

@@ -112,7 +112,7 @@ async function main() {
 
     step('检出 r0（napi 写 wc.db + pristine）');
     const result = await flow.checkoutRepo(client, repo.repoId, WC);
-    const info = wc.openInfo(WC);
+    const info = await wc.openInfo(WC);
     if (info.repoId !== repo.repoId || info.rev !== 0) {
       fail(`工作副本归属不对：${JSON.stringify(info)}`);
     }
@@ -121,18 +121,18 @@ async function main() {
     step('首次提交');
     fs.mkdirSync(path.join(WC, '202610'), { recursive: true });
     fs.writeFileSync(path.join(WC, '202610', 'summary.txt'), '十月汇总\n第二行\n');
-    const status = wc.status(WC);
+    const status = await wc.status(WC);
     if (status.length !== 1 || status[0].kind !== 'ADD') {
       fail(`变更识别不对：${JSON.stringify(status)}`);
     }
-    const diffs = wc.diff(WC);
+    const diffs = await wc.diff(WC);
     if (diffs.length !== 1 || !diffs[0].text.includes('+十月汇总')) {
       fail(`diff 不对：${JSON.stringify(diffs)}`);
     }
     console.log(diffs[0].text.trim().split('\n').map((line) => `  ${line}`).join('\n'));
     const first = await flow.commitWorkingCopy(client, WC, '首次提交');
     if (first.rev !== 1 || first.pushed !== 1) fail(`提交结果不对：${JSON.stringify(first)}`);
-    if (wc.status(WC).length !== 0) fail('提交后本地仍有变更');
+    if ((await wc.status(WC)).length !== 0) fail('提交后本地仍有变更');
     console.log(`  已提交 r${first.rev}，本地干净`);
 
     step('另一个人先提交（CLI import）→ 本地落后');
@@ -161,7 +161,7 @@ async function main() {
       fail(`更新没有产生任何变化：${JSON.stringify(updated)}`);
     }
     if (!fs.existsSync(path.join(WC, '202610', 'extra.txt'))) fail('更新后没拿到别人的新文件');
-    if (wc.openInfo(WC).rev !== remoteRev) fail('更新后本地版本没有推进');
+    if ((await wc.openInfo(WC)).rev !== remoteRev) fail('更新后本地版本没有推进');
     console.log(
       `  已更新到 r${updated.rev}：更新 ${updated.updated}，新增 ${updated.added}，删除 ${updated.removed}`,
     );
@@ -176,7 +176,7 @@ async function main() {
     }
     const localContent = fs.readFileSync(path.join(WC, '202610', 'summary.txt'), 'utf8');
     if (localContent !== '本地改的\n') fail('冲突时本地内容被覆盖了');
-    const conflictList = wc.conflicts(WC);
+    const conflictList = await wc.conflicts(WC);
     if (conflictList.length === 0) fail('冲突列表为空');
     console.log(
       `  发现 ${conflicted.conflicts} 处内容冲突；本地内容保留；冲突路径 ${conflictList
@@ -196,16 +196,16 @@ async function main() {
     if (!blocked) fail('带冲突的提交竟然成功');
 
     step('三栏合并：读 base/mine/theirs → 写入合并结果 → 提交');
-    const detail = wc.conflictDetail(WC, '202610/summary.txt');
+    const detail = await wc.conflictDetail(WC, '202610/summary.txt');
     if (detail.kind !== 'text') fail(`冲突类型不对：${detail.kind}`);
     if (detail.base !== '十月汇总\n第二行\n') fail(`base 不对：${JSON.stringify(detail.base)}`);
     if (detail.mine !== '本地改的\n') fail(`mine 不对：${JSON.stringify(detail.mine)}`);
     if (detail.theirs !== '远端改的\n') fail(`theirs 不对：${JSON.stringify(detail.theirs)}`);
     console.log('  三方内容都能离线读到（theirs 来自冲突时缓存进 pristine 的那份）');
 
-    wc.resolveConflict(WC, '202610/summary.txt', 'custom', '合并结果：本地+远端\n');
+    await wc.resolveConflict(WC, '202610/summary.txt', 'custom', '合并结果：本地+远端\n');
     if (wc.hasConflicts(WC)) fail('解决后仍有冲突');
-    const mergedStatus = wc.status(WC);
+    const mergedStatus = await wc.status(WC);
     if (mergedStatus.length !== 1 || mergedStatus[0].kind !== 'MODIFY') {
       fail(`解决后应显示为待提交的修改：${JSON.stringify(mergedStatus)}`);
     }
@@ -228,7 +228,7 @@ async function main() {
     }
     if (wc.hasConflicts(WC) !== true) fail('冲突状态与列表不一致');
 
-    const restored = flow.revertWorkingCopy(WC, []);
+    const restored = await flow.revertWorkingCopy(WC, []);
     if (restored === 0) fail('还原没有恢复任何条目');
     if (wc.hasConflicts(WC)) fail('还原后仍有冲突');
     const afterRevert = fs.readFileSync(path.join(WC, '202610', 'summary.txt'), 'utf8');
@@ -237,7 +237,7 @@ async function main() {
     step('还原后再更新：混合版本必须能补回差异');
     // 还原把 summary.txt 拉回了合并提交的基线，而服务端又改过它：
     // 只看 head 会得出「已经最新」，必须用 oldestRev 取差异才能补齐。
-    const beforeFix = wc.openInfo(WC);
+    const beforeFix = await wc.openInfo(WC);
     if (beforeFix.oldestRev >= secondConflictRev) {
       fail(`还原后 oldestRev 应落后于 head：${JSON.stringify(beforeFix)}`);
     }
@@ -246,7 +246,7 @@ async function main() {
     if (fixedContent !== '远端第二次\n') {
       fail(`还原后 update 没补回服务端内容，实际 ${JSON.stringify(fixedContent)}`);
     }
-    const afterFix = wc.openInfo(WC);
+    const afterFix = await wc.openInfo(WC);
     if (afterFix.oldestRev !== secondConflictRev) {
       fail(`补齐后 oldestRev 应等于 head r${secondConflictRev}：${JSON.stringify(afterFix)}`);
     }
@@ -255,7 +255,7 @@ async function main() {
     );
 
     step('恢复干净状态');
-    const after = wc.status(WC);
+    const after = await wc.status(WC);
     if (after.length !== 0) fail(`更新后仍有变更：${JSON.stringify(after)}`);
 
     step('删掉检出目录：只读接口报错，绝不凭空建回一份工作副本');
@@ -397,7 +397,7 @@ async function main() {
     if (!String(auto.message).includes('auto.txt')) {
       fail(`返回值里应带上实际写入的信息：${JSON.stringify(auto)}`);
     }
-    if (wc.status(WC).length !== 0) fail('留空提交后本地仍有变更');
+    if ((await wc.status(WC)).length !== 0) fail('留空提交后本地仍有变更');
     console.log(`  留空时写入的历史：${autoLog[0].message}（r${auto.rev}）`);
 
     step('空间治理：预估 → 清理 → GC');

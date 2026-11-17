@@ -229,7 +229,7 @@ async function main() {
       fs.writeSync(hugeFd, hugeChunk);
     }
     fs.closeSync(hugeFd);
-    const hugeHash = wc.hashFile(hugePath).hash;
+    const hugeHash = (await wc.hashFile(hugePath)).hash;
     const head = await client.getHead(repo.repoId);
     begin = await client.beginCommit(
       repo.repoId,
@@ -268,6 +268,39 @@ async function main() {
       );
     }
 
+    step('大文件哈希期间主线程不阻塞（「点一下卡一下」的回归）');
+    // 原生调用过去是同步的：算一份几 GB 文件的摘要，Electron 主进程就被钉住几秒到几分钟，
+    // 窗口拖不动、按钮点不动。现在走 libuv 线程池，主线程全程空闲——用「事件循环最长停顿」
+    // 直接量这件事：停顿 ≈ 哈希耗时就是又跑回主线程了。
+    const lagPath = path.join(WORK, 'lag.bin');
+    const lagFd = fs.openSync(lagPath, 'w');
+    const lagChunk = Buffer.alloc(1024 * 1024);
+    for (let index = 0; index < 256; index += 1) {
+      lagChunk.fill(index % 251);
+      fs.writeSync(lagFd, lagChunk);
+    }
+    fs.closeSync(lagFd);
+    let maxLag = 0;
+    let lastTick = Date.now();
+    const lagTimer = setInterval(() => {
+      const now = Date.now();
+      maxLag = Math.max(maxLag, now - lastTick - 5);
+      lastTick = now;
+    }, 5);
+    const hashStart = Date.now();
+    await wc.hashFile(lagPath);
+    const hashMs = Date.now() - hashStart;
+    clearInterval(lagTimer);
+    fs.rmSync(lagPath);
+    // 判据不写死毫秒数：慢机器上哈希本来就久，同步实现照样会「停顿 ≈ 耗时」。
+    const lagBudget = Math.max(60, hashMs / 3);
+    console.log(
+      `  哈希 256 MiB 用了 ${hashMs} ms；期间事件循环最长停顿 ${maxLag} ms（上限 ${lagBudget.toFixed(0)} ms）`,
+    );
+    if (maxLag > lagBudget) {
+      fail(`哈希期间事件循环被阻塞了 ${maxLag} ms，说明原生调用又跑回主线程了`);
+    }
+
     step('桌面端正式路径检出（下载落 spool → native 流式铺盘）');
     // 采样「检出期间」的常驻内存：整份内容进内存的话，这里会跳一个文件大小。
     const baseRss = process.memoryUsage().rss / 1024 / 1024;
@@ -277,12 +310,12 @@ async function main() {
     }, 20);
     const result = await flow.checkoutRepo(client, repo.repoId, WC);
     clearInterval(sampler);
-    const hugeInfo = wc.hashFile(path.join(WC, 'huge.bin'));
+    const hugeInfo = await wc.hashFile(path.join(WC, 'huge.bin'));
     if (hugeInfo.hash !== hugeHash || hugeInfo.size !== HUGE_BYTES) {
       fail(`大文件检出后摘要不一致：${JSON.stringify(hugeInfo)}`);
     }
     for (const file of files) {
-      const info = wc.hashFile(path.join(WC, file.path));
+      const info = await wc.hashFile(path.join(WC, file.path));
       if (info.hash !== file.hash) fail(`${file.path} 检出后摘要不一致`);
     }
     const growth = sampledPeak - baseRss;

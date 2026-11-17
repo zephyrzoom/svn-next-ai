@@ -265,7 +265,8 @@ ipcMain.handle('vcs:wcInfo', (_event, dir: string) =>
   wrap(async () => {
     if (!isWorkingCopyAt(dir)) return null;
     try {
-      return wc.openInfo(dir);
+      // 必须 await：原生调用是异步的，直接 return 会让这层 try 接不住它的拒绝。
+      return await wc.openInfo(dir);
     } catch {
       return null;
     }
@@ -361,13 +362,13 @@ ipcMain.handle('vcs:status', (_event, dir: string) =>
     if (!isWorkingCopyAt(dir)) {
       return { repoId: '', rev: 0, entries: [], conflicts: [], missing: true };
     }
-    const info = wc.openInfo(dir);
+    const info = await wc.openInfo(dir);
     return {
       repoId: info.repoId,
       rev: info.rev,
-      entries: wc.status(dir),
+      entries: await wc.status(dir),
       // 冲突单独给出来：界面要用红点标出来，且带冲突时提交会被拦。
-      conflicts: wc.conflicts(dir),
+      conflicts: await wc.conflicts(dir),
       missing: false,
     };
   }),
@@ -389,14 +390,14 @@ ipcMain.handle(
   'vcs:resolveConflict',
   (_event, dir: string, path: string, choice: ConflictChoice, content?: string) =>
     wrap(async () => {
-      wc.resolveConflict(dir, path, choice, content);
+      await wc.resolveConflict(dir, path, choice, content);
       return null;
     }),
 );
 
 /** 离线差异；目录已不是工作副本时没有差异可言，返回空表而不是让原生层建目录。 */
 ipcMain.handle('vcs:diff', (_event, dir: string) =>
-  wrap(async () => (isWorkingCopyAt(dir) ? wc.diff(dir) : [])),
+  wrap(async () => (isWorkingCopyAt(dir) ? await wc.diff(dir) : [])),
 );
 
 ipcMain.handle('vcs:commit', (_event, dir: string, message: string) =>

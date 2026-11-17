@@ -107,7 +107,7 @@ export async function setSparseRules(
   dir: string,
   rules: string[],
 ): Promise<SparseResult> {
-  const info = wc.openInfo(dir);
+  const info = await wc.openInfo(dir);
   const oldRules = info.sparseRules ?? [];
   const nextRules = normalizeSparsePaths(rules);
   const added = addedSparsePrefixes(oldRules, nextRules);
@@ -165,15 +165,14 @@ export async function commitWorkingCopy(
 ): Promise<CommitResult> {
   // 冲突未解决一律拒绝：宁可挡住，也不猜用户想留哪一边（与 CLI 的 `vcs commit` 一致）。
   if (wc.hasConflicts(dir)) {
-    const conflicts = wc
-      .conflicts(dir)
+    const conflicts = (await wc.conflicts(dir))
       .map((item) => `${item.path}（${item.kind}）`)
       .join('、');
     throw new Error(`存在未解决的冲突：${conflicts}；请先还原或手工合并`);
   }
 
-  const manifest = wc.openInfo(dir);
-  const changes = wc.localChanges(dir);
+  const manifest = await wc.openInfo(dir);
+  const changes = await wc.localChanges(dir);
   if (changes.length === 0) {
     throw new Error('工作副本没有变更');
   }
@@ -191,12 +190,15 @@ export async function commitWorkingCopy(
 
   // 内容在推送时才从磁盘读（按 1 MiB 分片），这里先用流式哈希校验
   // 「扫描之后用户有没有又改过」——全程不把文件读进内存。
+  //
+  // 逐个文件顺序算，不并发：libuv 线程池只有 4 个线程，同时开几个 GB 级的读盘
+  // 只会互相拖慢，还把线程池占满（下载落盘要用它）。
   const payload: Array<{ hash: string; path: string }> = [];
   let estimated = 0;
   for (const change of changes) {
     if (!change.hash) continue;
     const target = path.join(dir, change.path);
-    const { hash, size } = wc.hashFile(target);
+    const { hash, size } = await wc.hashFile(target);
     if (hash !== change.hash) {
       throw new Error(`${change.path} 在扫描后又被修改，请重试`);
     }
@@ -218,7 +220,9 @@ export async function commitWorkingCopy(
       await client.pushFiles(begin.sessionId, toPush);
     }
     const outcome = await client.finalizeCommit(begin.sessionId);
-    wc.markCommitted(dir, outcome.rev, changes);
+    // 写 pristine 会把刚提交的内容再落一份基线：几 GB 的文件也要几十秒，
+    // 同样在后台线程里跑，界面不会被这一段「提交后收尾」冻住。
+    await wc.markCommitted(dir, outcome.rev, changes);
     return {
       rev: outcome.rev,
       added: changes.filter((c) => c.kind === 'ADD').length,
@@ -245,7 +249,7 @@ export async function updateWorkingCopy(
   client: VcsClient,
   dir: string,
 ): Promise<wc.UpdateOutcome> {
-  const info = wc.openInfo(dir);
+  const info = await wc.openInfo(dir);
   const head = await client.getHead(info.repoId);
   // 用「最旧条目版本」而不是 head 版本的副本做比较：revert 过的条目仍停在旧基线，
   // 只看 rev 会得出「已经最新」，那部分差异就永远拉不回来。
@@ -266,11 +270,11 @@ export async function updateWorkingCopy(
   });
   // 这次变更集覆盖整份工作副本（全量副本覆盖整库，稀疏副本按规则覆盖规则内路径），
   // 所以没出现在差异里的条目一定与目标版本一致，可以安全地把基线推进到 head。
-  wc.advanceBase(dir, head.rev);
+  await wc.advanceBase(dir, head.rev);
   return outcome;
 }
 
 /** 撤销本地改动（空数组 = 全部），冲突标记一并清除。 */
-export function revertWorkingCopy(dir: string, paths: string[] = []): number {
+export async function revertWorkingCopy(dir: string, paths: string[] = []): Promise<number> {
   return wc.revert(dir, paths);
 }

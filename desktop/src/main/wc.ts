@@ -9,6 +9,10 @@
  * `vcs-core::wc` 有 22 个单测盯着「纳秒 mtime 快路径」「冲突三哈希」「COW 更新」，
  * 这些行为在 JS 里复制一遍必然走样。
  *
+ * **原生调用一律异步**：`vcs-napi` 里每个动盘的函数都返回 Promise（内部走 `AsyncTask`），
+ * 写入 / 哈希几 GB 的文件只占后台线程，Electron 主进程不会被几十秒的磁盘操作钉住。
+ * 代价是「同步调用天然串行」这层保护没了，所以下面按目录排一次队（`serial`）。
+ *
  * 原生模块由 `npm run build:native` 产出（cargo build + 改后缀），不引 @napi-rs/cli。
  */
 import * as path from 'node:path';
@@ -86,8 +90,8 @@ export interface UpdateOutcome {
 
 interface NativeBinding {
   hashBytesHex(data: Buffer): string;
-  wcInfo(dir: string): string;
-  hashFileHex(path: string): string;
+  wcInfo(dir: string): Promise<string>;
+  hashFileHex(path: string): Promise<string>;
   wcCheckout(
     dir: string,
     repoId: string,
@@ -95,29 +99,29 @@ interface NativeBinding {
     entriesJson: string,
     spoolDir: string,
     rulesJson: string,
-  ): number;
+  ): Promise<number>;
   wcApplySparseRules(
     dir: string,
     rulesJson: string,
     rev: number,
     entriesJson: string,
     spoolDir: string,
-  ): string;
-  wcStatus(dir: string): string;
-  wcDiff(dir: string): string;
-  wcLocalChanges(dir: string): string;
-  wcMarkCommitted(dir: string, rev: number, changesJson: string): void;
+  ): Promise<string>;
+  wcStatus(dir: string): Promise<string>;
+  wcDiff(dir: string): Promise<string>;
+  wcLocalChanges(dir: string): Promise<string>;
+  wcMarkCommitted(dir: string, rev: number, changesJson: string): Promise<void>;
   wcApplyUpdate(
     dir: string,
     repoId: string,
     targetRev: number,
     changesJson: string,
     spoolDir: string,
-  ): string;
-  wcAdvanceBase(dir: string, rev: number): number;
-  wcRevert(dir: string, pathsJson: string): number;
-  wcConflicts(dir: string): string;
-  wcConflictDetail(dir: string, path: string): {
+  ): Promise<string>;
+  wcAdvanceBase(dir: string, rev: number): Promise<number>;
+  wcRevert(dir: string, pathsJson: string): Promise<number>;
+  wcConflicts(dir: string): Promise<string>;
+  wcConflictDetail(dir: string, path: string): Promise<{
     path: string;
     kind: string;
     baseHash: string | null;
@@ -126,8 +130,9 @@ interface NativeBinding {
     base: Buffer | null;
     mine: Buffer | null;
     theirs: Buffer | null;
-  };
-  wcResolveConflict(dir: string, path: string, choice: string, content?: Buffer): void;
+  }>;
+  wcResolveConflict(dir: string, path: string, choice: string, content?: Buffer): Promise<void>;
+  /** 唯一保持同步的查询：一次 EXISTS，等线程池往返反而更贵。 */
   wcHasConflicts(dir: string): boolean;
 }
 
@@ -161,24 +166,53 @@ function loadNative(): NativeBinding {
 
 const native = loadNative();
 
+/**
+ * 同一份工作副本上的原生调用排队执行。
+ *
+ * 同步调用时代，主线程本身就是那把锁：一段代码没跑完，下一段没机会进来。改成异步之后，
+ * 两段代码可以同时动同一个目录——它们会各自 open 一份 `wc.db`（写事务互相 SQLITE_BUSY），
+ * 更糟的是「更新写到一半」时被另一段读到半成品。界面上虽然有「一次只允许一个动盘操作」
+ * 的锁挡住重复点击，但后台自动刷新、多窗口、以后新增的调用点都可能绕过去，
+ * 所以真正的互斥放在这里：**按目录排队**，不同目录之间互不等待。
+ */
+const queues = new Map<string, Promise<unknown>>();
+
+async function serial<T>(dir: string, run: () => Promise<T>): Promise<T> {
+  // 同一个目录的不同写法（多余的 `..`、结尾斜杠）其实是同一份副本，先归一化再排队。
+  const id = path.resolve(dir);
+  const prev = queues.get(id) ?? Promise.resolve();
+  // 前一个失败了不等于后一个也要失败：成功与失败两条分支都接着往下跑。
+  const task = prev.then(run, run);
+  const tail = task.then(
+    () => undefined,
+    () => undefined,
+  );
+  queues.set(id, tail);
+  void tail.then(() => {
+    // 队列空了就把这条目录摘掉，长年开着的窗口不该在这里越攒越多。
+    if (queues.get(id) === tail) queues.delete(id);
+  });
+  return task;
+}
+
 /** BLAKE3-256 十六进制摘要，与服务端同一实现。 */
 export function hashBytes(data: Buffer): string {
   return native.hashBytesHex(data);
 }
 
 /**
- * 流式算文件摘要与字节数（原生侧边读边算）。
+ * 流式算文件摘要与字节数（原生侧边读边算，Promise）。
  *
  * 提交前的「扫描之后有没有再改过」校验用它：不需要把文件读进 JS 内存，
- * 几个 GB 的文件也一样。
+ * 几个 GB 的文件也一样——读盘那几分钟在后台线程里，界面照常能用。
  */
-export function hashFile(path: string): { hash: string; size: number } {
-  return JSON.parse(native.hashFileHex(path)) as { hash: string; size: number };
+export async function hashFile(file: string): Promise<{ hash: string; size: number }> {
+  return JSON.parse(await native.hashFileHex(file)) as { hash: string; size: number };
 }
 
 /** 工作副本归属与基线版本。 */
-export function openInfo(dir: string): WorkingCopyInfo {
-  return JSON.parse(native.wcInfo(dir)) as WorkingCopyInfo;
+export async function openInfo(dir: string): Promise<WorkingCopyInfo> {
+  return JSON.parse(await serial(dir, () => native.wcInfo(dir))) as WorkingCopyInfo;
 }
 
 /**
@@ -187,21 +221,23 @@ export function openInfo(dir: string): WorkingCopyInfo {
  * 内容来自 `spoolDir`（CAS 布局的下载暂存目录），native 侧流式读——内存与仓库大小无关。
  * 同一份内容被多路径引用时只落一份基线。
  */
-export function checkout(
+export async function checkout(
   dir: string,
   repoId: string,
   rev: number,
   entries: CheckoutEntry[],
   spoolDir: string,
   rules: string[] = [],
-): number {
-  return native.wcCheckout(
-    dir,
-    repoId,
-    rev,
-    JSON.stringify(entries),
-    spoolDir,
-    JSON.stringify(rules),
+): Promise<number> {
+  return serial(dir, () =>
+    native.wcCheckout(
+      dir,
+      repoId,
+      rev,
+      JSON.stringify(entries),
+      spoolDir,
+      JSON.stringify(rules),
+    ),
   );
 }
 
@@ -209,53 +245,55 @@ export function checkout(
  * 调整稀疏规则：把新增前缀下的文件与内容交给 core 增量铺盘 / 移除。
  * 规则之外的干净条目会被删掉；有本地改动时 core 直接报错，一个文件都不会动。
  */
-export function applySparseRules(
+export async function applySparseRules(
   dir: string,
   rules: string[],
   rev: number,
   entries: CheckoutEntry[],
   spoolDir: string,
-): SparseOutcome {
-  const raw = native.wcApplySparseRules(
-    dir,
-    JSON.stringify(rules),
-    rev,
-    JSON.stringify(entries),
-    spoolDir,
+): Promise<SparseOutcome> {
+  const raw = await serial(dir, () =>
+    native.wcApplySparseRules(dir, JSON.stringify(rules), rev, JSON.stringify(entries), spoolDir),
   );
   return JSON.parse(raw) as SparseOutcome;
 }
 
 /** 扫描工作副本（mtime 快路径 + 改动条目重算哈希）。 */
-export function status(dir: string): StatusEntry[] {
-  return JSON.parse(native.wcStatus(dir)) as StatusEntry[];
+export async function status(dir: string): Promise<StatusEntry[]> {
+  return JSON.parse(await serial(dir, () => native.wcStatus(dir))) as StatusEntry[];
 }
 
 /** 离线 diff：基线 vs 磁盘。 */
-export function diff(dir: string): DiffEntry[] {
-  return JSON.parse(native.wcDiff(dir)) as DiffEntry[];
+export async function diff(dir: string): Promise<DiffEntry[]> {
+  return JSON.parse(await serial(dir, () => native.wcDiff(dir))) as DiffEntry[];
 }
 
 /** 待提交变更（含内容地址）。 */
-export function localChanges(dir: string): LocalChange[] {
-  return JSON.parse(native.wcLocalChanges(dir)) as LocalChange[];
+export async function localChanges(dir: string): Promise<LocalChange[]> {
+  return JSON.parse(await serial(dir, () => native.wcLocalChanges(dir))) as LocalChange[];
 }
 
 /** 提交成功后刷新基线并推进版本。 */
-export function markCommitted(dir: string, rev: number, changes: LocalChange[]): void {
-  native.wcMarkCommitted(dir, rev, JSON.stringify(changes));
+export async function markCommitted(
+  dir: string,
+  rev: number,
+  changes: LocalChange[],
+): Promise<void> {
+  await serial(dir, () => native.wcMarkCommitted(dir, rev, JSON.stringify(changes)));
 }
 
 /** 应用服务端差异（update）。冲突不覆盖本地内容，只记元数据。 */
-export function applyUpdate(
+export async function applyUpdate(
   dir: string,
   repoId: string,
   targetRev: number,
   changes: LocalChange[],
   spoolDir: string,
-): UpdateOutcome {
+): Promise<UpdateOutcome> {
   // 内容已由调用方下载到 spool 目录，这里只给路径：native 流式读。
-  const raw = native.wcApplyUpdate(dir, repoId, targetRev, JSON.stringify(changes), spoolDir);
+  const raw = await serial(dir, () =>
+    native.wcApplyUpdate(dir, repoId, targetRev, JSON.stringify(changes), spoolDir),
+  );
   const parsed = JSON.parse(raw) as {
     rev: number;
     updated: number;
@@ -281,17 +319,20 @@ export function applyUpdate(
  * 不推进的话，那些「在仓库里从未被改过」的条目会永远钉在旧 base_rev 上，
  * 每次 update 都要把同一段差异重算一遍。
  */
-export function advanceBase(dir: string, rev: number): number {
-  return native.wcAdvanceBase(dir, rev);
+export async function advanceBase(dir: string, rev: number): Promise<number> {
+  return serial(dir, () => native.wcAdvanceBase(dir, rev));
 }
 
 /** 撤销本地改动（空数组表示全部）。未纳入版本控制的文件不会被删除。 */
-export function revert(dir: string, paths: string[] = []): number {
-  return native.wcRevert(dir, JSON.stringify(paths));
+export async function revert(dir: string, paths: string[] = []): Promise<number> {
+  return serial(dir, () => native.wcRevert(dir, JSON.stringify(paths)));
 }
 
-export function conflicts(dir: string): Array<{ path: string; kind: string }> {
-  return JSON.parse(native.wcConflicts(dir)) as Array<{ path: string; kind: string }>;
+export async function conflicts(dir: string): Promise<Array<{ path: string; kind: string }>> {
+  return JSON.parse(await serial(dir, () => native.wcConflicts(dir))) as Array<{
+    path: string;
+    kind: string;
+  }>;
 }
 
 /** 二进制判定：与 core 的 diff 一致，出现 NUL 就当二进制，界面不做文本合并。 */
@@ -309,8 +350,8 @@ function decode(data: Buffer | null): string | null {
  * base / theirs 来自 pristine（冲突发生时已缓存），mine 来自工作目录——
  * 全程不需要联网，这是「冲突不落标记文件」设计的直接收益。
  */
-export function conflictDetail(dir: string, path: string): ConflictDetail {
-  const detail = native.wcConflictDetail(dir, path);
+export async function conflictDetail(dir: string, file: string): Promise<ConflictDetail> {
+  const detail = await serial(dir, () => native.wcConflictDetail(dir, file));
   return {
     path: detail.path,
     kind: detail.kind,
@@ -331,13 +372,20 @@ export function conflictDetail(dir: string, path: string): ConflictDetail {
  *   - `custom` 写入手工合并结果
  *   - `delete` 删除文件与条目
  */
-export function resolveConflict(
+export async function resolveConflict(
   dir: string,
-  path: string,
+  file: string,
   choice: ConflictChoice,
   content?: string,
-): void {
-  native.wcResolveConflict(dir, path, choice, content === undefined ? undefined : Buffer.from(content, 'utf8'));
+): Promise<void> {
+  await serial(dir, () =>
+    native.wcResolveConflict(
+      dir,
+      file,
+      choice,
+      content === undefined ? undefined : Buffer.from(content, 'utf8'),
+    ),
+  );
 }
 
 export function hasConflicts(dir: string): boolean {

@@ -96,10 +96,15 @@ const state = {
   /** 搜索序号：只接受最后一次请求的结果，慢响应不许盖掉新输入。 */
   searchSeq: 0,
   searchTimer: 0,
-  /** 提交进行中：按钮禁用的同时用它挡住重复调用。 */
-  committing: false,
-  /** 更新进行中：自动刷新避开它，别在盘被改到一半的时候去扫。 */
-  updating: false,
+  /**
+   * 正在进行的那一次动盘操作：''（空闲）/ 'update' / 'commit' / 'checkout' /
+   * 'revert' / 'sparse'。
+   *
+   * 同一时刻只允许一个。大文件的一次更新要跑几十秒，期间再点一次「更新」，或在同一份
+   * 副本上点「提交」，只会让两次写盘交错在同一个 wc.db 与同一批文件上；按钮跟着它一起
+   * 禁用并换成「更新中…」，后台自动刷新也绕开它。
+   */
+  job: '',
   /**
    * 稀疏检出面板。`checked` 是界面里勾中的目录，`rules` 是当前工作副本里
    * 真正生效的规则（从 wc.db 读回）；两者不一致时提示「待应用」。
@@ -112,7 +117,6 @@ const state = {
     rules: [],
     repoId: null,
     loading: false,
-    busy: false,
   },
 };
 
@@ -506,6 +510,12 @@ function renderRepoNav() {
     li.querySelector('.repo-dot').classList.toggle('on', dirs.length > 0);
     li.querySelector('.repo-rev').textContent = `r${repo.headRev}`;
     li.addEventListener('click', () => {
+      // 操作跑着时不换仓库：进度属于当前这份副本，换了上下文界面就自相矛盾
+      // （屏幕上是 B 的列表，后台还在写 A 的目录）。
+      if (state.job) {
+        banner(`正在${JOB_LABEL[state.job]}，完成后再切换仓库`, 'error');
+        return;
+      }
       // 已经选中的仓库再点一次 = 「回到这个仓库的工作区」（比如刚从建库申请页回来）。
       // 这也算一次使用，但不必把整个工作区重来一遍（那会收起差异面板）。
       if (repo.repoId === state.selectedRepoId) {
@@ -659,6 +669,8 @@ function renderWcDirOptions() {
   }
   select.value = state.wcDir || '';
   select.classList.toggle('hidden', dirs.length < 2);
+  // 操作跑着的时候别让人切到另一份副本：屏幕上会变成「B 的列表 + A 的进度」。
+  select.disabled = Boolean(state.job);
 }
 
 /** 检出卡片里的目录清单：切换 / 移出列表，两者都不动本地文件。 */
@@ -703,24 +715,75 @@ function renderWcDirList() {
   box.classList.toggle('hidden', dirs.length === 0);
 }
 
+/** 动盘操作的名字：按钮上写「更新中…」，提示里写「正在更新」。 */
+const JOB_LABEL = {
+  update: '更新',
+  commit: '提交',
+  checkout: '检出',
+  revert: '还原',
+  sparse: '应用稀疏规则',
+};
+
+/** 忙碌时按钮上的文案：让人一眼看出「还在跑」而不是「没点动」。 */
+const JOB_TEXT = {
+  update: '更新中…',
+  commit: '提交中…',
+  checkout: '检出中…',
+  revert: '还原中…',
+  sparse: '应用中…',
+};
+
+/**
+ * 进入一次动盘操作，返回 false 表示已经有别的操作在跑、这一次点击直接作废。
+ *
+ * 为什么要有这道锁：拉一个大文件、提交一个大文件都是几十秒甚至几分钟的事。按钮虽然
+ * 会禁用，但「点下去到界面真的变了」之间有个空档，手快的人在空档里再点一次、
+ * 或者先点更新又点提交，都会把两次写盘排到同一个目录上。作废时**不弹提示**——
+ * 按钮本来就是灰的，再弹一句「正在更新」只是噪音。
+ */
+function beginJob(kind) {
+  if (state.job) return false;
+  state.job = kind;
+  // renderWcBar 顺带把上下文条、提交区、稀疏卡片一起刷新（含按钮禁用与文案）。
+  renderWcBar();
+  return true;
+}
+
+/** 结束动盘操作：只由发起它的那个 finally 调用，避免提前解锁。 */
+function endJob() {
+  state.job = '';
+  renderWcBar();
+}
+
 function renderWcBar() {
   const dir = state.wcDir;
   const dirs = dirsFor(state.selectedRepoId);
   const hasRepo = Boolean(currentRepo());
+  // 有操作在跑时，所有会动同一份副本的按钮一起禁用：它们互相打架。
+  const busy = state.job;
   el('wc-path').textContent = dir || '未检出到本地';
   el('wc-path').title = dir;
   el('wc-dot').className = `wc-dot${dir ? ' on' : ''}`;
   const conflicts = state.conflicts.length;
-  el('wc-status').textContent = !dir
-    ? '检出后即可提交与更新'
-    : conflicts > 0
-      ? `${conflicts} 个冲突待解决`
-      : `${state.changes.length} 个待提交变更 @ r${state.wcRev}`;
-  el('wc-status').classList.toggle('warn', conflicts > 0);
+  el('wc-status').textContent = busy
+    ? JOB_TEXT[busy]
+    : !dir
+      ? '检出后即可提交与更新'
+      : conflicts > 0
+        ? `${conflicts} 个冲突待解决`
+        : `${state.changes.length} 个待提交变更 @ r${state.wcRev}`;
+  el('wc-status').classList.toggle('warn', conflicts > 0 && !busy);
   // 已有工作副本照样能再检出一份；切换已登记的目录统一走上下文条的下拉。
-  el('open-checkout').disabled = !hasRepo;
-  el('update').disabled = !dir;
-  el('commit').disabled = !dir || state.committing;
+  el('open-checkout').disabled = !hasRepo || Boolean(busy);
+  el('update').disabled = !dir || Boolean(busy);
+  el('update').textContent = busy === 'update' ? JOB_TEXT.update : '更新';
+  el('commit').disabled = !dir || Boolean(busy);
+  el('commit').textContent = busy === 'commit' ? JOB_TEXT.commit : '提交';
+  el('message').disabled = busy === 'commit';
+  el('revert').disabled = Boolean(busy);
+  el('revert').textContent = busy === 'revert' ? JOB_TEXT.revert : '全部还原';
+  el('checkout').disabled = Boolean(busy);
+  el('checkout').textContent = busy === 'checkout' ? JOB_TEXT.checkout : '检出';
   el('checkout-card').classList.toggle('hidden', Boolean(dir) && !state.checkoutOpen);
   el('workbench').classList.toggle('hidden', !dir);
   el('wc-change-count').textContent = dir ? `${state.changes.length} 项` : '';
@@ -918,7 +981,8 @@ function renderSparseSummary() {
     ? `当前选择：${rules.join('、')}`
     : '当前选择：整个仓库（不勾任何目录）';
   el('sparse-apply').classList.toggle('hidden', !state.wcDir);
-  el('sparse-apply').disabled = state.sparse.busy || !state.wcDir;
+  el('sparse-apply').disabled = Boolean(state.job) || !state.wcDir;
+  el('sparse-apply').textContent = state.job === 'sparse' ? JOB_TEXT.sparse : '应用规则';
   el('sparse-toggle').textContent = state.sparse.open ? '收起' : '选择目录';
   el('sparse-toggle').setAttribute('aria-expanded', String(state.sparse.open));
   el('sparse-body').classList.toggle('hidden', !state.sparse.open);
@@ -930,9 +994,8 @@ function renderSparseSummary() {
 
 /** 已检出的副本调整规则：只补拉新增前缀、移除干净条目，绝不重新铺盘。 */
 async function applySparseRules() {
-  if (!state.wcDir || state.sparse.busy) return;
-  state.sparse.busy = true;
-  renderSparseSummary();
+  if (!state.wcDir) return;
+  if (!beginJob('sparse')) return;
   try {
     const rules = currentSparseRules();
     const result = unwrap(await api.setSparseRules(state.wcDir, rules), '调整稀疏规则');
@@ -951,8 +1014,7 @@ async function applySparseRules() {
     banner(`稀疏规则已更新：${parts.join('，')}${tail}`);
     await guard('扫描工作副本', refreshStatus);
   } finally {
-    state.sparse.busy = false;
-    renderSparseSummary();
+    endJob();
     renderSparseTree();
   }
 }
@@ -1028,6 +1090,11 @@ async function bindWorkingCopy(repoId, dir) {
 /** 切换到同一仓库的另一份工作副本；记住选择，重启后仍停在这份上。 */
 async function switchWorkingCopy(dir) {
   if (!dir || dir === state.wcDir || !dirsFor(state.selectedRepoId).includes(dir)) return;
+  // 换副本同样要避开进行中的操作：它正握着当前那份目录在读写。
+  if (state.job) {
+    banner(`正在${JOB_LABEL[state.job]}，完成后再切换工作副本`, 'error');
+    return;
+  }
   const rest = dirsFor(state.selectedRepoId).filter((item) => item !== dir);
   state.wcDirs[state.selectedRepoId] = [dir, ...rest];
   state.wcDir = dir;
@@ -1043,6 +1110,11 @@ async function switchWorkingCopy(dir) {
 
 /** 把一份工作副本移出列表（只是不再记住它，本地文件一个字节都不删）。 */
 async function removeWorkingCopy(dir) {
+  // 正在这份目录上动盘时先别摘登记：操作还在用这个路径。
+  if (state.job) {
+    banner(`正在${JOB_LABEL[state.job]}，完成后再移出列表`, 'error');
+    return;
+  }
   await forgetWorkingCopy(dir, `已把「${dir}」移出列表（本地文件未删除）。`);
 }
 
@@ -1153,33 +1225,39 @@ async function checkout() {
     banner('请填写检出目录', 'error');
     return;
   }
-  // 目录里已经有一份工作副本（含别家仓库的、从别处拷来的）：只读探测到就接进来，
-  // 绝不重新铺盘——那会把已有文件与本地改动整盘覆盖掉。手敲路径也别想绕过这条保护。
-  const existing = unwrap(await api.wcInfo(dir), '读取工作副本信息');
-  if (existing) {
-    await adoptWorkingCopy(dir, existing);
-    return;
-  }
-  // 之前登记过、但 wc.db 已经不在了：宁可让用户先移出列表，也不闷头重铺一份。
-  if (dirsFor(repo.repoId).includes(dir)) {
+  // 检出整库也要占用一份副本：和更新 / 提交共用同一把锁，连点只会铺一次盘。
+  if (!beginJob('checkout')) return;
+  try {
+    // 目录里已经有一份工作副本（含别家仓库的、从别处拷来的）：只读探测到就接进来，
+    // 绝不重新铺盘——那会把已有文件与本地改动整盘覆盖掉。手敲路径也别想绕过这条保护。
+    const existing = unwrap(await api.wcInfo(dir), '读取工作副本信息');
+    if (existing) {
+      await adoptWorkingCopy(dir, existing);
+      return;
+    }
+    // 之前登记过、但 wc.db 已经不在了：宁可让用户先移出列表，也不闷头重铺一份。
+    if (dirsFor(repo.repoId).includes(dir)) {
+      banner(
+        `「${dir}」曾登记为「${repo.name}」的工作副本，但目录里已找不到 .vcs/wc.db。` +
+          '请先在目录清单里把它「移出列表」，或换一个新目录再检出。',
+        'error',
+      );
+      return;
+    }
+    const rules = currentSparseRules();
+    const result = unwrap(await api.checkout(repo.repoId, dir, 0, rules), '检出');
+    await bindWorkingCopy(repo.repoId, result.dir);
     banner(
-      `「${dir}」曾登记为「${repo.name}」的工作副本，但目录里已找不到 .vcs/wc.db。` +
-        '请先在目录清单里把它「移出列表」，或换一个新目录再检出。',
-      'error',
+      `已把「${repo.name}」检出到 ${result.dir}（r${result.rev}，共 ${result.files} 个文件${rules.length ? `，稀疏目录：${rules.join('、')}` : ''}），` +
+        `这个仓库现在有 ${dirsFor(repo.repoId).length} 份本地工作副本。`,
     );
-    return;
+    await refreshStatus();
+    await loadLog();
+    // 主进程把这次检出也记成了一次使用：把新顺序拉回来，常用的仓库浮到最上面。
+    await refreshRepoUsage();
+  } finally {
+    endJob();
   }
-  const rules = currentSparseRules();
-  const result = unwrap(await api.checkout(repo.repoId, dir, 0, rules), '检出');
-  await bindWorkingCopy(repo.repoId, result.dir);
-  banner(
-    `已把「${repo.name}」检出到 ${result.dir}（r${result.rev}，共 ${result.files} 个文件${rules.length ? `，稀疏目录：${rules.join('、')}` : ''}），` +
-      `这个仓库现在有 ${dirsFor(repo.repoId).length} 份本地工作副本。`,
-  );
-  await refreshStatus();
-  await loadLog();
-  // 主进程把这次检出也记成了一次使用：把新顺序拉回来，常用的仓库浮到最上面。
-  await refreshRepoUsage();
 }
 
 /** 变更集合的指纹：版本 + 每条路径的状态 + 冲突集合。指纹没变，界面就不用动。 */
@@ -1835,21 +1913,14 @@ async function showDiff(path, node) {
 
 // ---------------- 提交 / 更新 / 还原 ----------------
 
-/** 提交按钮的忙碌态：既告诉人事情在做，也让第二次点击落空。 */
-function setCommitBusy(busy) {
-  const button = el('commit');
-  button.disabled = busy;
-  button.textContent = busy ? '提交中…' : '提交';
-  el('message').disabled = busy;
-}
-
 /**
  * 提交。提交信息可以留空——主进程会按本次变更自动生成一条，
  * 界面上不必为了「写一句话」把整次提交挡住。
- * 提交是几秒级的网络往返：按钮禁用 + committing 标记双保险，连点只会提交一次。
+ *
+ * 大文件让这件事从「几秒的网络往返」变成了「几分钟的读盘 + 上传 + 写基线」：
+ * 按钮禁用、文案换成「提交中…」、上下文条显示进度，`beginJob` 同时挡住连点。
  */
 async function commit() {
-  if (state.committing) return;
   const dir = state.wcDir;
   if (!dir) {
     banner('请先检出工作副本', 'error');
@@ -1863,9 +1934,8 @@ async function commit() {
     banner('工作副本没有变更，不需要提交', 'error');
     return;
   }
+  if (!beginJob('commit')) return;
   const message = el('message').value.trim();
-  state.committing = true;
-  setCommitBusy(true);
   try {
     const result = unwrap(await api.commit(dir, message), '提交');
     el('message').value = '';
@@ -1876,19 +1946,23 @@ async function commit() {
     // 提交会推进仓库 HEAD：列表里的版本号与历史都要跟着刷新。
     await loadRepos();
   } finally {
-    state.committing = false;
-    setCommitBusy(false);
+    endJob();
   }
 }
 
+/**
+ * 拉取服务端更新。
+ *
+ * 几个 GB 的文件在这里要下载、铺盘、再扫一遍重算哈希，全程几十秒到几分钟；
+ * 期间按钮禁用并显示「更新中…」，再点一次不会发出第二个请求（`beginJob` 直接返回）。
+ */
 async function update() {
   const dir = state.wcDir;
   if (!dir) {
     banner('请先检出工作副本', 'error');
     return;
   }
-  if (state.updating) return;
-  state.updating = true;
+  if (!beginJob('update')) return;
   try {
     const result = unwrap(await api.update(dir), '更新');
     const parts = [
@@ -1904,7 +1978,7 @@ async function update() {
     await refreshStatus();
     await loadRepos();
   } finally {
-    state.updating = false;
+    endJob();
   }
 }
 
@@ -1914,9 +1988,14 @@ async function revertAll() {
     banner('请先检出工作副本', 'error');
     return;
   }
-  const restored = unwrap(await api.revert(dir, []), '还原');
-  banner(`已把 ${restored} 个条目还原到基线内容（未纳入版本控制的文件不会被删除）`);
-  await refreshStatus();
+  if (!beginJob('revert')) return;
+  try {
+    const restored = unwrap(await api.revert(dir, []), '还原');
+    banner(`已把 ${restored} 个条目还原到基线内容（未纳入版本控制的文件不会被删除）`);
+    await refreshStatus();
+  } finally {
+    endJob();
+  }
 }
 
 async function disconnect() {
@@ -1937,8 +2016,8 @@ async function disconnect() {
   el('members').innerHTML = '';
   resetMemberPicker();
   state.members = [];
-  state.committing = false;
-  setCommitBusy(false);
+  // 退出登录时作废进行中的操作标记：新的账号进来不该继承一把「有操作在跑」的锁。
+  state.job = '';
   setTab('wc');
   setDiffOpen(false);
   el('diff-path').textContent = '';
@@ -1974,7 +2053,8 @@ const AUTO_SCAN_INTERVAL_MS = 8000;
 function canAutoScan() {
   if (!state.user || document.hidden) return false;
   if (!state.wcDir || !currentRepo()) return false;
-  if (state.scanning || state.committing || state.updating || state.sparse.busy) return false;
+  // `job` 覆盖更新 / 提交 / 检出 / 还原 / 稀疏规则：盘正在被改到一半时不去扫。
+  if (state.scanning || state.job) return false;
   // 正在手动解决冲突时不打断：三栏里可能是打了一半的合并结果。
   if (state.conflict) return false;
   return true;
