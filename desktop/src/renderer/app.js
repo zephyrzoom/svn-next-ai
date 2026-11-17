@@ -22,6 +22,10 @@
  * `.vcs/wc.db`：选到的目录若本来就是一份工作副本（例如从别处拷来的），直接把它
  * 接进来 / 切过去，绝不重新铺盘——原「更换目录」的绑定能力就收在这个入口里。
  *
+ * 列表的顺序是**常用优先**：切到这个仓库、把它检出到本地，都算一次使用；权重按
+ * 半衰期衰减（记在当前账号名下），常用的浮到最上面。从没用过的仓库保持服务端顺序
+ * 排在后面，彼此不会因为一次重排而换位——列表要稳定，只有真的用过才往上走。
+ *
  * 工作副本是磁盘上的事实，不是界面上的一段记忆：`settings.json` 里记下的目录一旦
  * 不存在（用户删掉了整个检出目录、或清掉了 `.vcs/`），刷新仓库页时就把它从列表里摘掉；
  * 扫描遇到这种目录只回报 missing，绝不会把删掉的目录重新检出建回来。
@@ -54,6 +58,11 @@ const state = {
   selectedRepoId: null,
   /** 仓库 → 该仓库在**当前账号**名下的所有工作副本目录（首个为最近使用的一份），持久化在 settings.json。 */
   wcDirs: {},
+  /**
+   * 仓库 → 本机使用权重（`weight` 已按半衰期折算，越大越常用）。
+   * 左侧列表按它排序，常用的浮到最上面；没有记录的仓库保持服务端顺序排在后面。
+   */
+  repoUsage: {},
   /** 当前仓库正在操作的那一份工作副本目录；空串表示还没有本地工作副本。 */
   wcDir: '',
   /** 「检出到本地」卡片是否展开：已有工作副本时由「检出」按钮临时打开。 */
@@ -414,6 +423,8 @@ function currentRepo() {
 async function loadRepos() {
   const repos = unwrap(await api.listRepos(), '加载仓库');
   state.repos = repos;
+  // 常用权重与本机的仓库列表一起刷新：排序是列表的一部分，不能拿上一轮的顺序去渲染。
+  await refreshRepoUsage();
   // 本地目录可能已经被删掉：每次刷新仓库页都先核对一遍绑定关系，
   // 失效的登记就地摘掉——列表里不该留着一份不存在的工作副本。
   await syncWorkingCopies();
@@ -428,11 +439,51 @@ async function loadRepos() {
     return;
   }
   // 选中的仓库被删或不再可见时才回落到第一个，否则保持原位——刷新不该把人踢走。
+  // 回落也按「常用」序取第一个：一个都还没用过时就是服务端返回的原顺序。
   const kept = repos.some((repo) => repo.repoId === state.selectedRepoId);
-  await selectRepo(kept ? state.selectedRepoId : repos[0].repoId);
+  await selectRepo(kept ? state.selectedRepoId : orderedRepos()[0].repoId);
 }
 
-/** 左侧仓库列表：名字 + HEAD + 「本地有工作副本」的圆点。 */
+/**
+ * 拉一次本机记下的「常用」权重。
+ *
+ * 读不到（旧版主进程、磁盘只读）就当没有记录：列表退回服务端顺序即可，
+ * 排序偏好不该挡住仓库页——它只是好看，不是能不能用的前提。
+ */
+async function refreshRepoUsage() {
+  try {
+    const res = await api.repoUsage();
+    state.repoUsage = res && res.ok && res.data ? res.data : {};
+  } catch {
+    state.repoUsage = {};
+  }
+  renderRepoNav();
+}
+
+/**
+ * 左侧列表的顺序：**常用的浮到最上面**。
+ *
+ * 权重由主进程记（每切到一个仓库 +1，检出也算一次，按半衰期衰减），界面只负责排：
+ * 权重相同看最近一次使用，再相同就保持服务端返回的原始顺序。这样从没用过的仓库
+ * 之间不会因为一次重排互相换位，列表看起来是稳定的，只有「用过的」往上浮。
+ */
+function orderedRepos() {
+  const usage = state.repoUsage || {};
+  const weightOf = (hit) => (hit && Number.isFinite(hit.weight) ? hit.weight : 0);
+  const lastOf = (hit) => (hit && Number.isFinite(hit.last) ? hit.last : 0);
+  return state.repos
+    .map((repo, index) => ({ repo, index, hit: usage[repo.repoId] }))
+    .sort((a, b) => {
+      const diff = weightOf(b.hit) - weightOf(a.hit);
+      if (diff !== 0) return diff;
+      const recency = lastOf(b.hit) - lastOf(a.hit);
+      if (recency !== 0) return recency;
+      return a.index - b.index;
+    })
+    .map((item) => item.repo);
+}
+
+/** 左侧仓库列表：名字 + HEAD + 「本地有工作副本」的圆点，顺序按「常用」排。 */
 function renderRepoNav() {
   const list = el('repo-nav');
   list.innerHTML = '';
@@ -440,7 +491,7 @@ function renderRepoNav() {
     list.innerHTML = '<li class="repo-empty">暂无仓库</li>';
     return;
   }
-  for (const repo of state.repos) {
+  for (const repo of orderedRepos()) {
     const li = document.createElement('li');
     const dirs = dirsFor(repo.repoId);
     li.className = `repo-item${repo.repoId === state.selectedRepoId ? ' active' : ''}`;
@@ -456,11 +507,13 @@ function renderRepoNav() {
     li.querySelector('.repo-rev').textContent = `r${repo.headRev}`;
     li.addEventListener('click', () => {
       // 已经选中的仓库再点一次 = 「回到这个仓库的工作区」（比如刚从建库申请页回来）。
+      // 这也算一次使用，但不必把整个工作区重来一遍（那会收起差异面板）。
       if (repo.repoId === state.selectedRepoId) {
+        void touchRepo(repo.repoId);
         setView('repo');
         return;
       }
-      void guard('切换仓库', () => selectRepo(repo.repoId));
+      void guard('切换仓库', () => openRepo(repo.repoId));
     });
     list.appendChild(li);
   }
@@ -517,6 +570,27 @@ async function selectRepo(repoId) {
   // 停在新仓库的成员页时，成员列表也得跟着换仓库（非 owner 已在 renderMemberAccess 里退回）。
   if (state.tab === 'members') await guard('加载成员', loadMembers);
   if (state.wcDir) await guard('扫描工作副本', refreshStatus);
+}
+
+/**
+ * 打开一个仓库：先记一次「用过」，再切上下文。
+ *
+ * 记录失败（旧版主进程、磁盘只读）不挡切换——最坏情况只是列表维持原顺序。
+ */
+async function openRepo(repoId) {
+  await touchRepo(repoId);
+  await selectRepo(repoId);
+}
+
+/** 记一次使用并就地重排：常用的那个立刻浮到列表最上面。 */
+async function touchRepo(repoId) {
+  try {
+    const res = await api.touchRepo(repoId);
+    if (res && res.ok && res.data) state.repoUsage = res.data;
+  } catch {
+    /* 记不上就按原顺序显示 */
+  }
+  renderRepoNav();
 }
 
 /** 顶部固定上下文条：仓库名 + HEAD + 本地目录 + 待提交/冲突计数。 */
@@ -1061,7 +1135,7 @@ async function adoptWorkingCopy(dir, info) {
   await bindWorkingCopy(owner.repoId, dir);
   if (owner.repoId !== state.selectedRepoId) {
     banner(`这个目录是「${owner.name}」的工作副本，已绑定到该仓库并切换过去。`);
-    await selectRepo(owner.repoId);
+    await openRepo(owner.repoId);
     return;
   }
   await guard('扫描工作副本', refreshStatus);
@@ -1104,6 +1178,8 @@ async function checkout() {
   );
   await refreshStatus();
   await loadLog();
+  // 主进程把这次检出也记成了一次使用：把新顺序拉回来，常用的仓库浮到最上面。
+  await refreshRepoUsage();
 }
 
 /** 变更集合的指纹：版本 + 每条路径的状态 + 冲突集合。指纹没变，界面就不用动。 */
@@ -1871,6 +1947,8 @@ async function disconnect() {
   // 目录记忆留在 settings.json 的**这个账号名下**，清的只是内存状态；
   // 下次同一个人登录会重新读回来，换成别人的账号则读不到这一份。
   state.wcDirs = {};
+  // 「常用」权重同理：属于账号的本机偏好，退出登录时从内存里清掉。
+  state.repoUsage = {};
   state.checkoutOpen = false;
   el('dir').value = '';
   renderWcBar();

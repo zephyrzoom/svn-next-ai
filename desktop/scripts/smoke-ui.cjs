@@ -444,6 +444,37 @@ function verify({ app, BrowserWindow, ipcMain }) {
         problems.push(`差异卡片头求值失败：${err && err.message}`);
       }
 
+      // 左侧列表「常用优先」：权重高的排前面，权重相同看最近一次使用；
+      // 从没用过的仓库保持服务端顺序排在后面，彼此不会因为一次重排而换位。
+      let navOrder = {};
+      try {
+        navOrder = await win.webContents.executeJavaScript(`(() => {
+          const saved = { repos: state.repos, usage: state.repoUsage };
+          state.repos = [
+            { repoId: 'r1', name: '一', headRev: 1 },
+            { repoId: 'r2', name: '二', headRev: 2 },
+            { repoId: 'r3', name: '三', headRev: 3 },
+            { repoId: 'r4', name: '四', headRev: 4 },
+          ];
+          state.repoUsage = {
+            r4: { weight: 1.5, last: 100 },
+            r2: { weight: 1.5, last: 300 },
+            r3: { weight: 6, last: 50 },
+          };
+          const ordered = orderedRepos().map((repo) => repo.repoId);
+          renderRepoNav();
+          const listed = Array.from(
+            document.querySelectorAll('#repo-nav .repo-item .repo-name'),
+          ).map((node) => node.textContent);
+          state.repos = saved.repos || [];
+          state.repoUsage = saved.usage || {};
+          renderRepoNav();
+          return { ordered, listed };
+        })()`);
+      } catch (err) {
+        problems.push(`仓库排序求值失败：${err && err.message}`);
+      }
+
       // 添加成员：搜索行只有输入框（不含权限分类），点结果选中后才露出「权限 + 添加」。
       let picker = {};
       try {
@@ -896,6 +927,10 @@ function verify({ app, BrowserWindow, ipcMain }) {
         // 免登录改为默认行为：登录页不再有勾选框，表单只留用户名与密码。
         登录页无免登录勾选框: info.hasRememberCheckbox === false,
         上下文条没有重复的更换目录按钮: info.hasPickDir === false,
+        // 常用的仓库浮到最上面：权重 > 最近使用 > 服务端原始顺序。
+        仓库列表按常用排序:
+          navOrder.ordered?.join(',') === 'r3,r2,r4,r1' &&
+          navOrder.listed?.join(',') === '三,二,四,一',
         登录表单只有用户名与密码:
           Array.isArray(info.loginInputs) &&
           info.loginInputs.join(',') === 'username,password',

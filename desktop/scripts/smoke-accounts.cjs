@@ -161,6 +161,68 @@ function verify({ app }) {
     });
     const single = require(settingsEntry);
     expect('单字符串升级', single.loadRepoDirs(ALICE), { r2: ['/tmp/single-wc'] });
+
+    // 8) 常用权重：越用越大、按账号隔离、久不使用会衰减掉，清空目录时不跟着被删。
+    const usageDir = useStore('usage');
+    const usage = require(settingsEntry);
+    expect('匿名读取权重', usage.loadRepoUsage(null), {});
+    usage.bumpRepoUsage(ALICE, 'r1');
+    const afterSecond = usage.bumpRepoUsage(ALICE, 'r1');
+    const afterOther = usage.bumpRepoUsage(ALICE, 'r2');
+    // r1 用了两次、r2 一次：列表要靠这个顺序把 r1 排在前面。
+    if (!(afterOther.r1.weight > afterOther.r2.weight)) {
+      problems.push(`重复使用没有累加权重：${JSON.stringify(afterOther)}`);
+    }
+    if (!(afterSecond.r1.weight > 1.9 && afterSecond.r1.weight <= 2)) {
+      problems.push(`两次使用应约等于 2 分：${JSON.stringify(afterSecond.r1)}`);
+    }
+    expect('权重按账号隔离', usage.loadRepoUsage(BOB), {});
+    expect('匿名写入权重不落盘', usage.bumpRepoUsage(null, 'r1'), {});
+    // 落盘结构：只存「分数 + 时刻」，折算后的权重由读的时候算，避免越读越旧。
+    const usageFile = readJson(settingsPathIn(usageDir));
+    const stored = usageFile.accounts[ALICE.target].alice.repoUsage;
+    for (const id of ['r1', 'r2']) {
+      const keys = Object.keys(stored[id] || {}).sort().join(',');
+      if (keys !== 'last,score') problems.push(`使用记录的字段应该是 score/last，实际 ${keys}`);
+    }
+    // 清空工作副本目录：账号条目可以没有 repoDirs，但使用记录不能被顺手删掉。
+    usage.saveRepoDirs(ALICE, {});
+    if (!readJson(settingsPathIn(usageDir)).accounts[ALICE.target].alice.repoUsage) {
+      problems.push('清空工作副本登记时把使用记录一起删了');
+    }
+    if (usage.loadRepoUsage(ALICE).r1 === undefined) {
+      problems.push('清空工作副本登记后读不到原来的使用记录');
+    }
+
+    // 9) 三个月没碰过的记录直接失效：它已经不代表「常用」，留着只会占位。
+    const oldDir = useStore('stale-usage');
+    const day = 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    writeJson(settingsPathIn(oldDir), {
+      accounts: {
+        [ALICE.target]: {
+          alice: {
+            repoUsage: {
+              old: { score: 9, last: now - 120 * day },
+              fresh: { score: 1, last: now - day },
+              future: { score: 1, last: now + 30 * day },
+              broken: { score: -1, last: now },
+            },
+          },
+        },
+      },
+    });
+    const stale = require(settingsEntry);
+    const weights = stale.loadRepoUsage(ALICE);
+    if (weights.old !== undefined) problems.push('120 天没用过的记录没有被丢掉');
+    if (weights.broken !== undefined) problems.push('坏数据（负分）没有被丢掉');
+    if (!(weights.fresh && weights.fresh.weight > 0.9)) {
+      problems.push(`一天前的记录应仍有接近 1 分：${JSON.stringify(weights.fresh)}`);
+    }
+    // 未来时间（改过系统时钟）按「就是现在」算，不能因此永远排第一。
+    if (!(weights.future && weights.future.weight <= 1.0001)) {
+      problems.push(`未来的时间戳没有被夹回现在：${JSON.stringify(weights.future)}`);
+    }
   } catch (err) {
     problems.push(`执行出错：${err && err.message}`);
   } finally {

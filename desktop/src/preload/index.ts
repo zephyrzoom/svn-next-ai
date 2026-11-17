@@ -163,6 +163,13 @@ export interface QuotaDto {
   source: number;
 }
 
+/** 一个仓库在本机的使用权重：主进程已经按半衰期折算到「此刻」，界面直接比大小。 */
+export interface RepoUsageDto {
+  weight: number;
+  /** 最后一次使用的时刻（Unix 毫秒）。 */
+  last: number;
+}
+
 export interface VcsApi {
   // —— 连接与仓库使用 ——
   /** 桌面端固定 30 天免登录，主进程统一按长期会话签发，无需传 rememberMe。 */
@@ -194,6 +201,10 @@ export interface VcsApi {
   >;
   /** 保存当前账号的工作副本登记（账号由主进程按登录身份决定，界面不传）。 */
   saveRepoDirs(dirs: Record<string, string[]>): Promise<Envelope<null>>;
+  /** 当前账号的仓库使用权重：`weight` 越大越常用，左侧列表按它排。 */
+  repoUsage(): Promise<Envelope<Record<string, RepoUsageDto>>>;
+  /** 记一次使用（切到该仓库），回传折算后的新权重表。 */
+  touchRepo(repoId: string): Promise<Envelope<Record<string, RepoUsageDto>>>;
   checkout(
     repoId: string,
     dir: string,
@@ -278,6 +289,8 @@ const api: VcsApi = {
   loadRepoDirs: () => ipcRenderer.invoke('vcs:repoDirs'),
   verifyRepoDirs: () => ipcRenderer.invoke('vcs:verifyRepoDirs'),
   saveRepoDirs: (dirs) => ipcRenderer.invoke('vcs:saveRepoDirs', dirs),
+  repoUsage: () => ipcRenderer.invoke('vcs:repoUsage'),
+  touchRepo: (repoId) => ipcRenderer.invoke('vcs:touchRepo', repoId),
   checkout: (repoId, dir, rev, paths) =>
     ipcRenderer.invoke('vcs:checkout', repoId, dir, rev, paths),
   tree: (repoId) => ipcRenderer.invoke('vcs:tree', repoId),

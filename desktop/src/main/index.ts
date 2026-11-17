@@ -11,9 +11,11 @@ import {
   updateWorkingCopy,
 } from './flow';
 import {
+  bumpRepoUsage,
   clearToken,
   loadPrefs,
   loadRepoDirs,
+  loadRepoUsage,
   loadToken,
   saveLogin,
   saveRepoDirs,
@@ -312,7 +314,30 @@ ipcMain.handle('vcs:saveRepoDirs', (_event, dirs: Record<string, string[]>) =>
 ipcMain.handle(
   'vcs:checkout',
   (_event, repoId: string, dir: string, rev = 0, paths: string[] = []) =>
-    wrap(async () => checkoutRepo(requireClient(), repoId, dir, rev, paths)),
+    wrap(async () => {
+      const result = await checkoutRepo(requireClient(), repoId, dir, rev, paths);
+      // 检出是很强的「常用」信号：连工作副本都铺了，说明这个仓库真在用。
+      bumpRepoUsage(session, repoId);
+      return result;
+    }),
+);
+
+/**
+ * 当前账号的仓库使用权重：渲染层按它把常用的仓库排在列表最上面。
+ *
+ * 记录的是「这个人在这台机器上实际用了什么」，所以按 session 隔离（同工作副本
+ * 登记一样），并且只由下面的 `vcs:touchRepo` / `vcs:checkout` 写入。
+ */
+ipcMain.handle('vcs:repoUsage', () => wrap(async () => loadRepoUsage(session)));
+
+/**
+ * 记一次使用，回传折算后的新权重表。
+ *
+ * 「用了一次」由界面显式上报，而不是由主进程猜：自动选中的第一个仓库不算使用，
+ * 否则排在最上面的那个每次启动都会再得一分，越用越钉死在顶部。
+ */
+ipcMain.handle('vcs:touchRepo', (_event, repoId: string) =>
+  wrap(async () => bumpRepoUsage(session, repoId)),
 );
 
 /** 仓库 HEAD 的完整相对路径清单：渲染层据此推导目录树，供稀疏检出勾选。 */
