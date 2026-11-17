@@ -6,9 +6,37 @@
 
 use crate::{Error, ErrorCode, Hash, HASH_LEN};
 
+/// 流式读取的缓冲区大小。哈希、写入、校验都用它，保证内存与对象大小无关。
+pub const STREAM_BUF: usize = 64 * 1024;
+
 /// 计算对象地址。CAS 的唯一写入入口都走这里，保证「地址 = 内容摘要」。
 pub fn hash_bytes(data: &[u8]) -> Hash {
     *blake3::hash(data).as_bytes()
+}
+
+/// 流式计算对象地址（攒够一块喂一次 hasher），用于文件上传前的校验。
+///
+/// 与 [`hash_bytes`] 结果完全一致，区别只是**内存只占一个缓冲区**：
+/// 几个 GB 的文件也不会被整体读进内存。
+pub fn hash_reader(reader: &mut dyn std::io::Read) -> std::io::Result<(Hash, u64)> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; STREAM_BUF];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((*hasher.finalize().as_bytes(), total))
+}
+
+/// 流式计算文件摘要，返回（地址，字节数）。
+pub fn hash_file(path: &std::path::Path) -> std::io::Result<(Hash, u64)> {
+    let mut file = std::fs::File::open(path)?;
+    hash_reader(&mut file)
 }
 
 /// 空目录树的地址，用于初始化空仓库的 root_tree。

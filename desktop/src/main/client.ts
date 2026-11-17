@@ -12,6 +12,7 @@
  * 本文件只做协议适配，不做任何版本语义判断；工作副本相关的编排在 flow.ts。
  */
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 
 import * as grpc from '@grpc/grpc-js';
@@ -382,78 +383,201 @@ function toVcsError(err: grpc.ServiceError): VcsError {
   return new VcsError(err.code, detail);
 }
 
-/**
- * 分块对象的重组：同一个哈希收齐到 `last` 才算完整。
- *
- * 大对象在线上被拆成多条 `ObjectChunk`，这里攒回整份内容；序号必须连续，
- * 否则宁可报错也不把错位的片段拼成一份「内容对不上哈希」的文件。
- */
-class ChunkAssembler {
-  private readonly partial = new Map<string, Buffer[]>();
+/** 对象文件的存储标记：0 = 原始字节（不压缩），与服务端 CAS 的布局一致。 */
+const RAW_OBJECT_FLAG = Buffer.from([0]);
 
-  /** 吃掉一条 `ObjectBatch`，完整的对象写进 `out`。 */
-  absorb(batch: any, out: Map<string, Buffer>): void {
-    for (const object of batch.objects ?? []) {
-      out.set(object.hash as string, Buffer.from(object.data));
-    }
-    for (const chunk of batch.chunks ?? []) {
-      const hash = chunk.hash as string;
-      const pieces = this.partial.get(hash) ?? [];
-      if (Number(chunk.index ?? 0) !== pieces.length) {
-        throw new VcsError(
-          ErrorCode.INVALID_ARGUMENT,
-          `对象 ${hash} 的分块序号不连续：期望第 ${pieces.length} 块，收到第 ${chunk.index} 块`,
-        );
-      }
-      pieces.push(Buffer.from(chunk.data));
-      if (chunk.last) {
-        this.partial.delete(hash);
-        out.set(hash, Buffer.concat(pieces));
-      } else {
-        this.partial.set(hash, pieces);
-      }
-    }
-  }
-
-  /** 流结束时检查有没有只收了一半的对象。 */
-  finish(): void {
-    const [hash] = this.partial.keys();
-    if (hash) {
-      throw new VcsError(ErrorCode.INVALID_ARGUMENT, `对象 ${hash} 的分块没有收全`);
-    }
-  }
+/** spool 里一个对象的落盘路径：`objects/<前两位>/<其余>`，正是 CAS 的目录布局。 */
+export function spoolObjectPath(spoolDir: string, hash: string): string {
+  return path.join(spoolDir, 'objects', hash.slice(0, 2), hash.slice(2));
 }
 
-/** 把一条对象流收成「哈希 → 内容」，分块与整包两种形态都能吃。 */
-function drainObjects(call: any): Promise<Map<string, Buffer>> {
+/**
+ * 把对象流收进 spool 目录，返回对象个数。
+ *
+ * 关键是**全程只驻留一个分片**：小对象整体到达、大对象按 1 MiB 分片追写到文件，
+ * 既不再 `Buffer.concat` 整个文件，也不会把整库攒在内存里。落盘格式就是 CAS 的
+ * 布局（首字节标记 0 + 原始内容），native 侧用 `FileObjectStore` 直接流式读。
+ */
+function receiveToSpool(call: any, spoolDir: string): Promise<number> {
   return new Promise((resolve, reject) => {
-    const contents = new Map<string, Buffer>();
-    const assembler = new ChunkAssembler();
-    let failure: VcsError | null = null;
+    let current: { hash: string; fd: number; nextIndex: number } | null = null;
+    let count = 0;
+    let failure: Error | null = null;
+
+    const closeCurrent = () => {
+      if (!current) return;
+      fs.closeSync(current.fd);
+      current = null;
+    };
+    const begin = (hash: string) => {
+      const target = spoolObjectPath(spoolDir, hash);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      const fd = fs.openSync(target, 'w');
+      fs.writeSync(fd, RAW_OBJECT_FLAG);
+      current = { hash, fd, nextIndex: 0 };
+    };
+
     call.on('data', (batch: any) => {
       if (failure) return;
       try {
-        assembler.absorb(batch, contents);
+        for (const object of batch.objects ?? []) {
+          // 小对象整份到达：一条消息一个文件。
+          closeCurrent();
+          begin(object.hash as string);
+          fs.writeSync(current!.fd, Buffer.from(object.data));
+          closeCurrent();
+          count += 1;
+        }
+        for (const chunk of batch.chunks ?? []) {
+          const hash = chunk.hash as string;
+          if (!current || current.hash !== hash) {
+            closeCurrent();
+            begin(hash);
+          }
+          if (Number(chunk.index ?? 0) !== current!.nextIndex) {
+            throw new VcsError(
+              ErrorCode.INVALID_ARGUMENT,
+              `对象 ${hash} 的分块序号不连续：期望第 ${current!.nextIndex} 块，收到第 ${chunk.index} 块`,
+            );
+          }
+          fs.writeSync(current!.fd, Buffer.from(chunk.data));
+          current!.nextIndex += 1;
+          if (chunk.last) {
+            closeCurrent();
+            count += 1;
+          }
+        }
       } catch (err) {
         // 事件回调里抛错不会 reject 这个 Promise，只能记下来并主动取消流。
-        failure = err as VcsError;
+        failure = err as Error;
+        closeCurrent();
         call.cancel();
       }
     });
-    call.on('error', (err: grpc.ServiceError) => reject(failure ?? toVcsError(err)));
+    call.on('error', (err: grpc.ServiceError) => {
+      closeCurrent();
+      reject(failure ?? toVcsError(err));
+    });
     call.on('end', () => {
-      if (failure) {
-        reject(failure);
-        return;
-      }
-      try {
-        assembler.finish();
-        resolve(contents);
-      } catch (err) {
-        reject(err as Error);
-      }
+      closeCurrent();
+      if (failure) reject(failure);
+      else resolve(count);
     });
   });
+}
+
+/**
+ * 推送器：小对象攒批、大对象从磁盘按 1 MiB 分片流式读。
+ *
+ * 关键有两点：
+ *   1. 同一时刻内存里只有一个分片，与文件 / 仓库大小无关；
+ *   2. `call.write` 返回 false 时必须等 `drain` 再继续——不等的话 grpc-js 会把
+ *      几十 MB 的分片全排进发送队列，等于又把文件攒回内存（实测 64 MiB 文件会涨 80 MiB）。
+ */
+class ObjectUploader {
+  private batch: any[] = [];
+  private bytes = 0;
+  private chunks: any[] = [];
+  private chunkBytes = 0;
+
+  constructor(
+    private readonly call: any,
+    private readonly sessionId: string,
+  ) {}
+
+  /**
+   * 写一条消息并等它真正被消费。
+   *
+   * grpc-js 的 `write` 是异步序列化 + 排队：只等 `drain` 不够（队列里能堆几十 MB），
+   * 也不能在回调之前复用源缓冲（会写坏内容）。等回调既解决背压，也让
+   * 「复用一块 1 MiB 读缓冲」变得安全——大文件推送不再制造每片一份的垃圾。
+   */
+  private write(message: any): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.call.write(message, (err?: Error | null) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+  }
+
+  private async flushChunks(): Promise<void> {
+    if (this.chunks.length === 0) return;
+    const chunks = this.chunks;
+    this.chunks = [];
+    this.chunkBytes = 0;
+    await this.write({ sessionId: this.sessionId, objects: [], chunks });
+  }
+
+  private async flushObjects(): Promise<void> {
+    if (this.batch.length === 0) return;
+    const objects = this.batch;
+    this.batch = [];
+    this.bytes = 0;
+    await this.write({ sessionId: this.sessionId, objects, chunks: [] });
+  }
+
+  /** 小对象（已在内存里）：按「32 个 / 4 MiB」攒批。 */
+  async addBuffer(hash: string, data: Buffer): Promise<void> {
+    if (data.length > CHUNK_BYTES) {
+      await this.flushObjects();
+      let index = 0;
+      for (let offset = 0; offset < data.length; offset += CHUNK_BYTES) {
+        const end = Math.min(offset + CHUNK_BYTES, data.length);
+        await this.addChunk(hash, index, data.subarray(offset, end), end === data.length);
+        index += 1;
+      }
+      await this.flushChunks();
+      return;
+    }
+    if (this.batch.length >= PUSH_BATCH_OBJECTS || this.bytes + data.length > PUSH_PAYLOAD_BYTES) {
+      await this.flushObjects();
+    }
+    this.batch.push({ hash, kind: 1, data, compressed: false });
+    this.bytes += data.length;
+  }
+
+  /** 从磁盘文件推送：读一块发一块，文件多大都不会整份进内存。 */
+  async addFile(hash: string, filePath: string): Promise<void> {
+    const size = fs.statSync(filePath).size;
+    if (size <= CHUNK_BYTES) {
+      await this.addBuffer(hash, fs.readFileSync(filePath));
+      return;
+    }
+    await this.flushObjects();
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const buffer = Buffer.allocUnsafe(CHUNK_BYTES);
+      let offset = 0;
+      let index = 0;
+      while (offset < size) {
+        const read = fs.readSync(fd, buffer, 0, CHUNK_BYTES, offset);
+        if (read <= 0) break;
+        offset += read;
+        // grpc-js 会延后序列化，复用的读缓冲不能直接交出去（会被下一片覆盖）：
+        // 每片拷一份，配合上面的「写一条等一条」把在途分片数量钉在一两个。
+        await this.addChunk(hash, index, Buffer.from(buffer.subarray(0, read)), offset >= size);
+        index += 1;
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+    await this.flushChunks();
+  }
+
+  private async addChunk(hash: string, index: number, data: Buffer, last: boolean): Promise<void> {
+    if (this.chunks.length > 0 && this.chunkBytes + data.length > PUSH_PAYLOAD_BYTES) {
+      await this.flushChunks();
+    }
+    this.chunks.push({ hash, kind: 1, index, data, last });
+    this.chunkBytes += data.length;
+  }
+
+  async finish(): Promise<void> {
+    await this.flushObjects();
+    await this.flushChunks();
+    this.call.end();
+  }
 }
 
 export class VcsClient {
@@ -1069,14 +1193,52 @@ export class VcsClient {
     }));
   }
 
-  /** 拉取某个版本、某组稀疏路径下的全部 blob（对象流）。返回 哈希 → 内容。 */
+  /**
+   * 把某个版本、某组稀疏路径下的全部 blob 拉到 spool 目录，返回对象个数。
+   *
+   * 内容直接落盘（CAS 布局），内存里只有一个分片；随后的 `wc.checkout` 用
+   * `FileObjectStore` 流式读，所以整库多大都不会进内存。
+   */
+  async downloadObjectsToSpool(
+    repoId: string,
+    rev: number,
+    paths: string[],
+    spoolDir: string,
+  ): Promise<number> {
+    const call = (this.repo as any).checkout({ repoId, rev, paths, depth: 1 }, this.metadata());
+    return receiveToSpool(call, spoolDir);
+  }
+
+  /**
+   * 调试 / 测试用：把整份内容读成「哈希 → 内容」。
+   *
+   * **生产路径不要用**——它会把所有对象同时放进内存，正是这次要摆脱的做法。
+   */
   async downloadObjects(
     repoId: string,
     rev: number,
     paths: string[] = [],
   ): Promise<Map<string, Buffer>> {
-    const call = (this.repo as any).checkout({ repoId, rev, paths, depth: 1 }, this.metadata());
-    return drainObjects(call);
+    const spool = fs.mkdtempSync(path.join(os.tmpdir(), 'vcs-readall-'));
+    try {
+      await this.downloadObjectsToSpool(repoId, rev, paths, spool);
+      const out = new Map<string, Buffer>();
+      const walk = (dir: string) => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) walk(full);
+          else if (entry.name.length === 62) {
+            const shard = path.basename(path.dirname(full));
+            // 首字节是存储标记，内容从第二字节开始。
+            out.set(`${shard}${entry.name}`, fs.readFileSync(full).subarray(1));
+          }
+        }
+      };
+      walk(path.join(spool, 'objects'));
+      return out;
+    } finally {
+      fs.rmSync(spool, { recursive: true, force: true });
+    }
   }
 
   async getLog(repoId: string, limit = 20): Promise<RevisionInfo[]> {
@@ -1091,11 +1253,11 @@ export class VcsClient {
     return (resp.revisions ?? []) as RevisionInfo[];
   }
 
-  /** 按哈希批量拉对象内容（FetchObjects 双向流）。update 前补对象用。 */
-  async fetchObjects(hashes: string[]): Promise<Map<string, Buffer>> {
-    if (hashes.length === 0) return new Map<string, Buffer>();
+  /** 按哈希补对象到 spool 目录（FetchObjects 双向流）。update 前用，内存不随对象变大。 */
+  async fetchObjectsToSpool(hashes: string[], spoolDir: string): Promise<number> {
+    if (hashes.length === 0) return 0;
     const call = (this.repo as any).fetchObjects(this.metadata());
-    const done = drainObjects(call);
+    const done = receiveToSpool(call, spoolDir);
     call.write({ sessionId: '', hashes });
     call.end();
     return done;
@@ -1165,84 +1327,73 @@ export class VcsClient {
   }
 
   /**
-   * 客户端流：把对象推上去。
+   * 客户端流的统一入口：建流、喂对象、收尾，再按 `PushAck` 判定成败。
    *
-   * 小对象按「32 个 + 4 MiB」攒批；超过 {@link CHUNK_BYTES} 的对象切成连续的
-   * `ObjectChunk` 发送，因此**单文件多大都能推**，不受单条消息上限约束。
+   * `feed` 负责往上传器里塞对象；等它把每个分片真正写出去（含背压等待）之后才收尾，
+   * 所以内存占用由「一个分片」封顶。
+   */
+  private async pushSession(
+    sessionId: string,
+    feed: (uploader: ObjectUploader) => Promise<void>,
+  ): Promise<number> {
+    let resolveAck!: (value: any) => void;
+    let rejectAck!: (err: Error) => void;
+    const ack = new Promise<any>((resolve, reject) => {
+      resolveAck = resolve;
+      rejectAck = reject;
+    });
+    // 失败时由下面的 `await feed` 决定成败，先挂一个 catch 避免「未处理的拒绝」。
+    ack.catch(() => undefined);
+
+    const call = (this.repo as any).pushObjects(
+      this.metadata(),
+      (err: grpc.ServiceError | null, response: any) => {
+        if (err) rejectAck(toVcsError(err));
+        else resolveAck(response);
+      },
+    );
+    const uploader = new ObjectUploader(call, sessionId);
+    try {
+      await feed(uploader);
+      await uploader.finish();
+    } catch (err) {
+      call.cancel();
+      throw err;
+    }
+    const response = await ack;
+    // PushAck 也带业务 Status：内容与地址不符等错误在这里暴露，而不是等到 Finalize。
+    assertOk(response.status);
+    return response.receivedObjects as number;
+  }
+
+  /**
+   * 把内存里的对象推上去。
+   *
+   * 小对象按「32 个 + 4 MiB」攒批；超过 {@link CHUNK_BYTES} 的切成连续 `ObjectChunk`。
+   * 生产路径一般用 {@link pushFiles}：直接从磁盘读，连「整份进内存」都省掉。
    */
   async pushObjects(
     sessionId: string,
     objects: Array<{ hash: string; data: Buffer }>,
   ): Promise<number> {
-    const ack = await new Promise<any>((resolve, reject) => {
-      const call = (this.repo as any).pushObjects(
-        this.metadata(),
-        (err: grpc.ServiceError | null, response: any) => {
-          if (err) {
-            reject(toVcsError(err));
-            return;
-          }
-          resolve(response);
-        },
-      );
-      // 只按个数切会在「32 个各 1 MiB」时拼出 32 MiB 的单条消息，所以还要看体积。
-      let batch: any[] = [];
-      let bytes = 0;
-      let chunks: any[] = [];
-      let chunkBytes = 0;
-      const flushChunks = () => {
-        if (chunks.length === 0) return;
-        call.write({ sessionId, objects: [], chunks });
-        chunks = [];
-        chunkBytes = 0;
-      };
-      const flush = () => {
-        if (batch.length === 0) return;
-        call.write({ sessionId, objects: batch, chunks: [] });
-        batch = [];
-        bytes = 0;
-      };
-      for (const object of objects) {
-        if (object.data.length > CHUNK_BYTES) {
-          // 大对象独占若干条分块消息，先把手上的小对象发掉。
-          flush();
-          let index = 0;
-          for (let offset = 0; offset < object.data.length; offset += CHUNK_BYTES) {
-            const end = Math.min(offset + CHUNK_BYTES, object.data.length);
-            const data = object.data.subarray(offset, end);
-            if (chunks.length > 0 && chunkBytes + data.length > PUSH_PAYLOAD_BYTES) {
-              flushChunks();
-            }
-            chunks.push({
-              hash: object.hash,
-              kind: 1, // OBJECT_KIND_BLOB
-              index,
-              data,
-              last: end === object.data.length,
-            });
-            chunkBytes += data.length;
-            index += 1;
-          }
-          flushChunks();
-          continue;
-        }
-        if (batch.length >= PUSH_BATCH_OBJECTS || bytes + object.data.length > PUSH_PAYLOAD_BYTES) {
-          flush();
-        }
-        batch.push({
-          hash: object.hash,
-          kind: 1, // OBJECT_KIND_BLOB
-          data: object.data,
-          compressed: false,
-        });
-        bytes += object.data.length;
-      }
-      flush();
-      call.end();
+    return this.pushSession(sessionId, async (uploader) => {
+      for (const object of objects) await uploader.addBuffer(object.hash, object.data);
     });
-    // PushAck 也带业务 Status：内容与地址不符等错误在这里暴露，而不是等到 Finalize。
-    assertOk(ack.status);
-    return ack.receivedObjects as number;
+  }
+
+  /**
+   * 从磁盘文件推对象：读一块发一块。
+   *
+   * `files` 给的是「哈希 → 本地路径」，内容由文件流提供，内存里只有当前分片。
+   * 服务端会按地址复验摘要，客户端这边不再整份读出来算一遍。
+   */
+  async pushFiles(
+    sessionId: string,
+    files: Array<{ hash: string; path: string }>,
+  ): Promise<number> {
+    return this.pushSession(sessionId, async (uploader) => {
+      for (const file of files) await uploader.addFile(file.hash, file.path);
+    });
   }
 
   async finalizeCommit(sessionId: string): Promise<CommitOutcome> {

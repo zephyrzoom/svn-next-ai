@@ -12,17 +12,25 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::hash::{hash_bytes, object_rel_path, to_hex};
+use crate::hash::{hash_bytes, hash_file, object_rel_path, to_hex};
 use crate::sparse::{SparseRules, SPARSE_META_KEY};
-use crate::{ChangeKind, EntryKind, Error, ErrorCode, FlatEntry, Hash, ObjectStore, Result};
+use crate::{
+    ChangeKind, EntryKind, Error, ErrorCode, FlatEntry, Hash, ObjectStore, Result, STREAM_BUF,
+};
 
 const WC_SCHEMA: &str = include_str!("../../../schema/wc.sql");
 const VCS_DIR: &str = ".vcs";
 pub const WC_FORMAT_VERSION: &str = "1";
+
+/// 超过这个体积的条目不做行级 diff：行级差异必须把两边内容整份放进内存，
+/// 而给一个 1 GB 的文件算 diff 既没意义，也会把进程撑爆。
+const DIFF_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const TOO_BIG_FOR_DIFF: &str = "（文件超过 4 MiB，未生成行级差异；二进制或大文件请直接比对文件）";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WcState {
@@ -186,6 +194,16 @@ impl WorkingCopy {
         })
     }
 
+    /// 基线缓存的字节数（只查元数据，不读内容）。
+    ///
+    /// 给「要不要做行级 diff / 要不要把三方内容交给界面」这类判断用：
+    /// 先看体积，避免为了一个几 GB 的二进制文件把整份内容读进内存。
+    pub fn pristine_size(&self, hash: &Hash) -> Option<u64> {
+        fs::metadata(pristine_path(&self.root, hash))
+            .ok()
+            .map(|m| m.len())
+    }
+
     /// 检出：把给定版本的完整树铺到磁盘，并写入 wc.db 与 pristine 缓存。
     ///
     /// 调用方负责先把 store 里缺的对象补齐（M1 中 store 即本地服务端存储）。
@@ -229,13 +247,13 @@ impl WorkingCopy {
             if !rules.includes(&entry.path) {
                 continue;
             }
-            let data = store.get(&entry.hash)?;
             let target = wc_root.join(&entry.path);
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).map_err(|e| io("创建目录失败", parent, e))?;
             }
-            write_entry(&target, entry.kind, &data)?;
-            write_pristine(&wc_root, &entry.hash, &data)?;
+            // 内容按块读、按块写：内存占用与文件大小无关。
+            let mut reader = store.open(&entry.hash)?;
+            let size = stream_object_into(&wc_root, &target, entry.kind, &entry.hash, &mut reader)?;
 
             let meta = fs::symlink_metadata(&target).map_err(|e| io("读取条目失败", &target, e))?;
             tx.execute(
@@ -251,7 +269,7 @@ impl WorkingCopy {
                     rev as i64,
                     to_hex(&entry.hash),
                     mtime_nanos(&meta),
-                    data.len() as i64,
+                    size as i64,
                     to_hex(&entry.hash),
                 ],
             )
@@ -261,7 +279,7 @@ impl WorkingCopy {
                 "INSERT INTO pristine (hash, size_bytes, stored_size, ref_count, path_hint)
                  VALUES (?1, ?2, ?2, 1, ?3)
                  ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + 1",
-                params![to_hex(&entry.hash), data.len() as i64, entry.path],
+                params![to_hex(&entry.hash), size as i64, entry.path],
             )
             .map_err(|e| Error::new(ErrorCode::IoError, format!("写 pristine 失败：{e}")))?;
 
@@ -378,12 +396,11 @@ impl WorkingCopy {
                     format!("「{}」已有本地未受控文件挡路，不能补拉这个路径", entry.path),
                 ));
             }
-            let data = store.get(&entry.hash)?;
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).map_err(|e| io("创建目录失败", parent, e))?;
             }
-            write_entry(&target, entry.kind, &data)?;
-            write_pristine(&wc_root, &entry.hash, &data)?;
+            let mut reader = store.open(&entry.hash)?;
+            let size = stream_object_into(&wc_root, &target, entry.kind, &entry.hash, &mut reader)?;
             let meta = fs::symlink_metadata(&target).map_err(|e| io("读取条目失败", &target, e))?;
             tx.execute(
                 "INSERT INTO entries (path, kind, base_rev, base_hash, state, mtime, size, checksum)
@@ -394,7 +411,7 @@ impl WorkingCopy {
                     rev as i64,
                     to_hex(&entry.hash),
                     mtime_nanos(&meta),
-                    data.len() as i64,
+                    size as i64,
                     to_hex(&entry.hash),
                 ],
             )
@@ -403,7 +420,7 @@ impl WorkingCopy {
                 "INSERT INTO pristine (hash, size_bytes, stored_size, ref_count, path_hint)
                  VALUES (?1, ?2, ?2, 1, ?3)
                  ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + 1",
-                params![to_hex(&entry.hash), data.len() as i64, entry.path],
+                params![to_hex(&entry.hash), size as i64, entry.path],
             )
             .map_err(|e| Error::new(ErrorCode::IoError, format!("写 pristine 失败：{e}")))?;
             outcome.added += 1;
@@ -532,8 +549,8 @@ impl WorkingCopy {
                 continue;
             }
 
-            let current = fs::read(&target).unwrap_or_default();
-            let current_hash = hash_bytes(&current);
+            // 全量校验只看摘要，不清内容进内存：几 GB 的文件也只占一个缓冲区。
+            let (current_hash, _) = local_content_hash(&target);
             let unchanged = base_hash
                 .as_deref()
                 .map(|h| h == to_hex(&current_hash))
@@ -601,9 +618,34 @@ impl WorkingCopy {
                 row.map_err(|e| Error::new(ErrorCode::IoError, format!("读取条目失败：{e}")))?;
             known.insert(path.clone());
 
-            let old = match base_hash.as_deref().map(crate::hash::from_hex) {
-                Some(Ok(h)) => self.read_pristine(&h).unwrap_or_default(),
-                _ => Vec::new(),
+            let base = match base_hash.as_deref().map(crate::hash::from_hex) {
+                Some(Ok(h)) => Some(h),
+                _ => None,
+            };
+            // 行级 diff 天生要把两边内容整份放进内存，所以先按体积挡一道：
+            // 给一个 1 GB 的二进制文件生成「差异文本」既没意义，也会把进程撑爆。
+            let too_big = base
+                .map(|h| {
+                    self.pristine_size(&h)
+                        .map(|len| len > DIFF_MAX_BYTES)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+                || fs::metadata(self.root.join(&path))
+                    .map(|m| m.len() > DIFF_MAX_BYTES)
+                    .unwrap_or(false);
+            if too_big {
+                let (mine, _) = local_content_hash(&self.root.join(&path));
+                let same = base.map(|h| h == mine).unwrap_or(false);
+                if !same {
+                    out.push((path, TOO_BIG_FOR_DIFF.to_string()));
+                }
+                continue;
+            }
+
+            let old = match base {
+                Some(h) => self.read_pristine(&h).unwrap_or_default(),
+                None => Vec::new(),
             };
             let new = fs::read(self.root.join(&path)).unwrap_or_default();
             if old == new {
@@ -616,7 +658,15 @@ impl WorkingCopy {
             if known.contains(&path) {
                 continue;
             }
-            let new = fs::read(self.root.join(&path)).unwrap_or_default();
+            let target = self.root.join(&path);
+            if fs::metadata(&target)
+                .map(|m| m.len() > DIFF_MAX_BYTES)
+                .unwrap_or(false)
+            {
+                out.push((path, TOO_BIG_FOR_DIFF.to_string()));
+                continue;
+            }
+            let new = fs::read(&target).unwrap_or_default();
             out.push((path, unified_diff(&[], &new)));
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -759,8 +809,8 @@ impl WorkingCopy {
                     })?;
                     // 本地已有同名条目或未受控文件挡路：不覆盖，记树冲突。
                     if existing.is_some() || target.exists() {
-                        if let Ok(data) = store.get(&hash) {
-                            write_pristine(&wc_root, &hash, &data)?;
+                        if let Ok(mut reader) = store.open(&hash) {
+                            write_pristine_stream(&wc_root, &hash, &mut reader)?;
                         }
                         self.record_conflict(
                             &path,
@@ -773,8 +823,8 @@ impl WorkingCopy {
                         outcome.tree_conflicts += 1;
                         continue;
                     }
-                    let data = store.get(&hash)?;
-                    self.materialize(&path, change.entry_kind, &data, target_rev, &hash)?;
+                    let mut reader = store.open(&hash)?;
+                    self.materialize(&path, change.entry_kind, &mut reader, target_rev, &hash)?;
                     outcome.added += 1;
                 }
 
@@ -794,14 +844,14 @@ impl WorkingCopy {
                     };
 
                     if local_clean {
-                        let data = store.get(&hash)?;
-                        self.materialize(&path, change.entry_kind, &data, target_rev, &hash)?;
+                        let mut reader = store.open(&hash)?;
+                        self.materialize(&path, change.entry_kind, &mut reader, target_rev, &hash)?;
                         outcome.updated += 1;
                     } else {
                         // 冲突时也要把服务端内容存进 pristine：三栏合并必须在**离线**状态下
                         // 能读到 theirs，否则用户每次合并都要联网重新取一遍。
-                        if let Ok(data) = store.get(&hash) {
-                            write_pristine(&wc_root, &hash, &data)?;
+                        if let Ok(mut reader) = store.open(&hash) {
+                            write_pristine_stream(&wc_root, &hash, &mut reader)?;
                         }
                         self.record_conflict(
                             &path,
@@ -1078,23 +1128,23 @@ impl WorkingCopy {
             let target = self.root.join(&entry.path);
             match entry.state {
                 WcState::Modified => {
-                    let data = fs::read(&target).unwrap_or_default();
+                    let (hash, size) = local_content_hash(&target);
                     out.push(LocalChange {
                         path: entry.path,
                         kind: ChangeKind::Modify,
                         entry_kind: EntryKind::File,
-                        hash: Some(hash_bytes(&data)),
-                        size: data.len() as u64,
+                        hash: Some(hash),
+                        size,
                     });
                 }
                 WcState::Added | WcState::Unversioned => {
-                    let data = fs::read(&target).unwrap_or_default();
+                    let (hash, size) = local_content_hash(&target);
                     out.push(LocalChange {
                         path: entry.path,
                         kind: ChangeKind::Add,
                         entry_kind: EntryKind::File,
-                        hash: Some(hash_bytes(&data)),
-                        size: data.len() as u64,
+                        hash: Some(hash),
+                        size,
                     });
                 }
                 WcState::Deleted => out.push(LocalChange {
@@ -1128,8 +1178,8 @@ impl WorkingCopy {
                     let meta = fs::symlink_metadata(&target)
                         .map_err(|e| io("读取条目失败", &target, e))?;
                     // 新内容进入 pristine，下一次离线 diff 才有正确基线。
-                    if let Ok(data) = store.get(&hash) {
-                        write_pristine(&wc_root, &hash, &data)?;
+                    if let Ok(mut reader) = store.open(&hash) {
+                        write_pristine_stream(&wc_root, &hash, &mut reader)?;
                     }
                     self.conn
                         .execute(
@@ -1226,11 +1276,13 @@ impl WorkingCopy {
     }
 
     /// 把服务端内容落到磁盘并登记条目（新增 / 覆盖）。
+    ///
+    /// 内容以流的形式给进来：更新一个大文件时也不会把整份内容读进内存。
     fn materialize(
         &self,
         path: &str,
         kind: EntryKind,
-        data: &[u8],
+        reader: &mut dyn Read,
         rev: u64,
         hash: &Hash,
     ) -> Result<()> {
@@ -1238,8 +1290,7 @@ impl WorkingCopy {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|e| io("创建目录失败", parent, e))?;
         }
-        write_entry(&target, kind, data)?;
-        write_pristine(&self.root, hash, data)?;
+        let size = stream_object_into(&self.root, &target, kind, hash, reader)?;
         let meta = fs::symlink_metadata(&target).map_err(|e| io("读取条目失败", &target, e))?;
         self.conn
             .execute(
@@ -1256,7 +1307,7 @@ impl WorkingCopy {
                     rev as i64,
                     to_hex(hash),
                     mtime_nanos(&meta),
-                    data.len() as i64
+                    size as i64
                 ],
             )
             .map_err(|e| Error::new(ErrorCode::IoError, format!("更新条目失败：{e}")))?;
@@ -1265,7 +1316,7 @@ impl WorkingCopy {
                 "INSERT INTO pristine (hash, size_bytes, stored_size, ref_count, path_hint)
                  VALUES (?1, ?2, ?2, 1, ?3)
                  ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + 1",
-                params![to_hex(hash), data.len() as i64, path],
+                params![to_hex(hash), size as i64, path],
             )
             .map_err(|e| Error::new(ErrorCode::IoError, format!("写 pristine 失败：{e}")))?;
         Ok(())
@@ -1300,7 +1351,12 @@ impl WorkingCopy {
 
 /// 读取磁盘上某条目的内容哈希；不存在返回 None。
 fn read_local_hash(path: &Path) -> Option<Hash> {
-    fs::read(path).ok().map(|data| hash_bytes(&data))
+    hash_file(path).ok().map(|(hash, _)| hash)
+}
+
+/// 本地文件的（摘要，字节数）。读不到时按空内容处理——与原来的 `unwrap_or_default` 一致。
+fn local_content_hash(path: &Path) -> (Hash, u64) {
+    hash_file(path).unwrap_or_else(|_| (hash_bytes(&[]), 0))
 }
 
 fn remove_path(path: &Path) -> Result<()> {
@@ -1385,6 +1441,142 @@ fn write_pristine(root: &Path, hash: &Hash, data: &[u8]) -> Result<()> {
     fs::write(&tmp, data).map_err(|e| io("写 pristine 失败", &tmp, e))?;
     fs::rename(&tmp, &path).map_err(|e| io("提交 pristine 失败", &path, e))?;
     Ok(())
+}
+
+/// 流式写 pristine：内容边读边落，**内存只用一个 64 KiB 缓冲**。
+///
+/// 与 [`write_pristine`] 的区别只是不进内存；摘要仍然边写边校验，
+/// 传坏了或者磁盘上那份坏了都会当场报错，而不会被当成基线缓存起来。
+fn write_pristine_stream(root: &Path, hash: &Hash, reader: &mut dyn Read) -> Result<()> {
+    let path = pristine_path(root, hash);
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| io("创建 pristine 目录失败", parent, e))?;
+    }
+    let tmp = path.with_extension("part");
+    let written = copy_to_file(&tmp, reader).map_err(|e| io("写 pristine 失败", &tmp, e))?;
+    if written.0 != *hash {
+        let _ = fs::remove_file(&tmp);
+        return Err(Error::new(
+            ErrorCode::ObjectMissing,
+            format!(
+                "对象内容与地址不符：期望 {} 实际 {}",
+                to_hex(hash),
+                to_hex(&written.0)
+            ),
+        ));
+    }
+    fs::rename(&tmp, &path).map_err(|e| io("提交 pristine 失败", &path, e))?;
+    Ok(())
+}
+
+/// 把流写进文件，同时算摘要。返回（摘要，字节数）。
+fn copy_to_file(path: &Path, reader: &mut dyn Read) -> std::io::Result<(Hash, u64)> {
+    let mut out = BufWriter::new(fs::File::create(path)?);
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; STREAM_BUF];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        out.write_all(&buf[..n])?;
+        total += n as u64;
+    }
+    out.flush()?;
+    out.get_ref().sync_all()?;
+    Ok((*hasher.finalize().as_bytes(), total))
+}
+
+/// 把对象流式落成「工作文件 + pristine」，并校验摘要。
+///
+/// 这是检出与更新的唯一写盘点：文件内容从头到尾只在 64 KiB 缓冲里过一遍，
+/// 不管对象是 1 KB 还是 10 GB，进程内存都一样。目录没有内容；符号链接的目标
+/// 本身就是全文，天然很小，仍然整份读。
+fn stream_object_into(
+    root: &Path,
+    target: &Path,
+    kind: EntryKind,
+    hash: &Hash,
+    reader: &mut dyn Read,
+) -> Result<u64> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|e| io("创建目录失败", parent, e))?;
+    }
+    if kind != EntryKind::File {
+        let mut data = Vec::new();
+        reader
+            .read_to_end(&mut data)
+            .map_err(|e| Error::new(ErrorCode::IoError, format!("读取对象失败：{e}")))?;
+        write_entry(target, kind, &data)?;
+        write_pristine(root, hash, &data)?;
+        return Ok(data.len() as u64);
+    }
+
+    let pristine = pristine_path(root, hash);
+    let need_pristine = !pristine.exists();
+    let pristine_tmp = pristine.with_extension("part");
+    let mut pristine_writer = if need_pristine {
+        if let Some(parent) = pristine.parent() {
+            fs::create_dir_all(parent).map_err(|e| io("创建 pristine 目录失败", parent, e))?;
+        }
+        Some(BufWriter::new(
+            fs::File::create(&pristine_tmp)
+                .map_err(|e| io("写 pristine 失败", &pristine_tmp, e))?,
+        ))
+    } else {
+        None
+    };
+
+    let mut out =
+        BufWriter::new(fs::File::create(target).map_err(|e| io("写入文件失败", target, e))?);
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; STREAM_BUF];
+    let mut written = 0u64;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| Error::new(ErrorCode::IoError, format!("读取对象失败：{e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        out.write_all(&buf[..n])
+            .map_err(|e| io("写入文件失败", target, e))?;
+        if let Some(writer) = pristine_writer.as_mut() {
+            writer
+                .write_all(&buf[..n])
+                .map_err(|e| io("写 pristine 失败", &pristine_tmp, e))?;
+        }
+        written += n as u64;
+    }
+    out.flush().map_err(|e| io("写入文件失败", target, e))?;
+    out.get_ref()
+        .sync_all()
+        .map_err(|e| io("刷新工作文件失败", target, e))?;
+    if let Some(mut writer) = pristine_writer {
+        writer
+            .flush()
+            .map_err(|e| io("写 pristine 失败", &pristine_tmp, e))?;
+        drop(writer);
+        fs::rename(&pristine_tmp, &pristine).map_err(|e| io("提交 pristine 失败", &pristine, e))?;
+    }
+    let actual = *hasher.finalize().as_bytes();
+    if actual != *hash {
+        return Err(Error::new(
+            ErrorCode::ObjectMissing,
+            format!(
+                "对象内容与地址不符：期望 {} 实际 {}",
+                to_hex(hash),
+                to_hex(&actual)
+            ),
+        ));
+    }
+    Ok(written)
 }
 
 fn kind_str(kind: EntryKind) -> &'static str {

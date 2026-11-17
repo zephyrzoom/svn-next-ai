@@ -9,10 +9,26 @@
  *   - Finalize 失败一律 Abort，避免留一个 2 小时 TTL 的半截会话。
  */
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { ErrorCode, VcsError, type ChangePayload, type VcsClient } from './client';
 import * as wc from './wc';
+
+/**
+ * 建一个下载暂存目录，用完就删。
+ *
+ * 网络上的对象先落成 CAS 布局的文件（`objects/ab/cdef…`），native 侧再流式读进工作副本。
+ * 这样「下载」与「铺盘」两段都不需要把内容攒在内存里——只有磁盘临时占用。
+ */
+async function withSpool<T>(fn: (spool: string) => Promise<T>): Promise<T> {
+  const spool = fs.mkdtempSync(path.join(os.tmpdir(), 'vcs-spool-'));
+  try {
+    return await fn(spool);
+  } finally {
+    fs.rmSync(spool, { recursive: true, force: true });
+  }
+}
 
 export interface CheckoutResult {
   dir: string;
@@ -66,15 +82,17 @@ export async function checkoutRepo(
   const head = await client.getHead(repoId);
   const target = rev === 0 ? head.rev : rev;
   const entries = await client.getTree(repoId, target, rules);
-  const contents = await client.downloadObjects(repoId, target, rules);
-  const files = wc.checkout(
-    dir,
-    repoId,
-    target,
-    entries.map((entry) => ({ path: entry.path, hash: entry.hash, size: entry.size })),
-    contents,
-    rules,
-  );
+  const files = await withSpool(async (spool) => {
+    await client.downloadObjectsToSpool(repoId, target, rules, spool);
+    return wc.checkout(
+      dir,
+      repoId,
+      target,
+      entries.map((entry) => ({ path: entry.path, hash: entry.hash, size: entry.size })),
+      spool,
+      rules,
+    );
+  });
   return { dir, rev: target, files, paths: rules };
 }
 
@@ -96,19 +114,23 @@ export async function setSparseRules(
   const needDownload = nextRules.length === 0 ? oldRules.length > 0 : added.length > 0;
   const head = await client.getHead(info.repoId);
 
-  let entries: wc.CheckoutEntry[] = [];
-  let contents = new Map<string, Buffer>();
-  if (needDownload) {
-    const fetchPaths = nextRules.length === 0 ? [] : added;
-    const tree = await client.getTree(info.repoId, head.rev, fetchPaths);
-    entries = tree.map((entry) => ({
-      path: entry.path,
-      hash: entry.hash,
-      size: entry.size,
-    }));
-    contents = await client.downloadObjects(info.repoId, head.rev, fetchPaths);
-  }
-  const outcome = wc.applySparseRules(dir, nextRules, head.rev, entries, contents);
+  const outcome = await withSpool(async (spool) => {
+    let entries: wc.CheckoutEntry[] = [];
+    if (needDownload) {
+      const fetchPaths = nextRules.length === 0 ? [] : added;
+      const tree = await client.getTree(info.repoId, head.rev, fetchPaths);
+      entries = tree.map((entry) => ({
+        path: entry.path,
+        hash: entry.hash,
+        size: entry.size,
+      }));
+      await client.fetchObjectsToSpool(
+        [...new Set(entries.map((entry) => entry.hash))],
+        spool,
+      );
+    }
+    return wc.applySparseRules(dir, nextRules, head.rev, entries, spool);
+  });
   return { ...outcome, rules: nextRules };
 }
 
@@ -167,17 +189,19 @@ export async function commitWorkingCopy(
     );
   }
 
-  // 内容在这里再读一次并校验哈希：扫描之后用户可能又改了文件。
-  const payload: Array<{ hash: string; data: Buffer }> = [];
+  // 内容在推送时才从磁盘读（按 1 MiB 分片），这里先用流式哈希校验
+  // 「扫描之后用户有没有又改过」——全程不把文件读进内存。
+  const payload: Array<{ hash: string; path: string }> = [];
   let estimated = 0;
   for (const change of changes) {
     if (!change.hash) continue;
-    const data = fs.readFileSync(path.join(dir, change.path));
-    if (wc.hashBytes(data) !== change.hash) {
+    const target = path.join(dir, change.path);
+    const { hash, size } = wc.hashFile(target);
+    if (hash !== change.hash) {
       throw new Error(`${change.path} 在扫描后又被修改，请重试`);
     }
-    payload.push({ hash: change.hash, data });
-    estimated += data.length;
+    payload.push({ hash: change.hash, path: target });
+    estimated += size;
   }
 
   const begin = await client.beginCommit(
@@ -191,7 +215,7 @@ export async function commitWorkingCopy(
     const missing = new Set(begin.missingHashes);
     const toPush = payload.filter((object) => missing.has(object.hash));
     if (toPush.length > 0) {
-      await client.pushObjects(begin.sessionId, toPush);
+      await client.pushFiles(begin.sessionId, toPush);
     }
     const outcome = await client.finalizeCommit(begin.sessionId);
     wc.markCommitted(dir, outcome.rev, changes);
@@ -236,8 +260,10 @@ export async function updateWorkingCopy(
   const rules = info.sparseRules ?? [];
   const delta = await client.update(info.repoId, info.oldestRev, head.rev, rules);
   const needed = delta.changes.map((change) => change.hash).filter((h): h is string => !!h);
-  const objects = await client.fetchObjects([...new Set(needed)]);
-  const outcome = wc.applyUpdate(dir, info.repoId, head.rev, delta.changes, objects);
+  const outcome = await withSpool(async (spool) => {
+    await client.fetchObjectsToSpool([...new Set(needed)], spool);
+    return wc.applyUpdate(dir, info.repoId, head.rev, delta.changes, spool);
+  });
   // 这次变更集覆盖整份工作副本（全量副本覆盖整库，稀疏副本按规则覆盖规则内路径），
   // 所以没出现在差异里的条目一定与目标版本一致，可以安全地把基线推进到 head。
   wc.advanceBase(dir, head.rev);

@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use vcs_core::auth::{self, Claims, TokenSigner};
 use vcs_core::hash::hash_bytes;
+use vcs_core::hash_file;
 use vcs_core::tree::{self, FlatEntry};
 use vcs_core::{
     self as core_types, to_hex, ChangeKind, EffectiveQuota, EntryKind, Error, ErrorCode,
@@ -1434,26 +1435,31 @@ impl ServerStore {
             estimated,
         )?;
 
-        // 4) 分批推送对象，避免把整个目录读进内存。
-        let mut batch: Vec<(Hash, Vec<u8>)> = Vec::new();
+        // 4) 分批入库：文件直接给路径，由 CAS 流式读——目录里放个几 GB 的文件也不会
+        //    把它整体读进内存。符号链接的内容是链接目标字符串（很小），仍然按字节推。
+        let mut batch: Vec<(Hash, std::path::PathBuf)> = Vec::new();
         let mut batch_bytes = 0u64;
         let mut seen: std::collections::BTreeSet<Hash> = std::collections::BTreeSet::new();
         for (rel, (hash, size, kind)) in &scanned {
             if seen.contains(hash) || self.objects.exists(hash) {
                 continue;
             }
-            let data = read_entry_bytes(dir, rel, *kind)?;
-            batch.push((*hash, data));
-            batch_bytes += *size;
             seen.insert(*hash);
+            if *kind == EntryKind::Symlink {
+                let data = read_entry_bytes(dir, rel, *kind)?;
+                self.push_objects(session, &commit.session_id, &[(*hash, data)])?;
+                continue;
+            }
+            batch.push((*hash, dir.join(rel)));
+            batch_bytes += *size;
             if batch.len() >= 32 || batch_bytes >= 32 * 1024 * 1024 {
-                self.push_objects(session, &commit.session_id, &batch)?;
+                self.push_objects_from_paths(session, &commit.session_id, &batch)?;
                 batch.clear();
                 batch_bytes = 0;
             }
         }
         if !batch.is_empty() {
-            self.push_objects(session, &commit.session_id, &batch)?;
+            self.push_objects_from_paths(session, &commit.session_id, &batch)?;
         }
 
         // 5) 分配版本号。会话本身不知道「未变」的数量，由本次扫描补上。
@@ -1628,6 +1634,51 @@ impl ServerStore {
                 ));
             }
             self.objects.put(expected, data)?;
+            accepted += 1;
+        }
+
+        self.conn
+            .execute(
+                "UPDATE upload_sessions SET state = 'pushing' WHERE session_id = ?1",
+                params![session_id],
+            )
+            .map_err(db("更新会话状态失败"))?;
+        Ok(accepted)
+    }
+
+    /// 从磁盘文件入库：内容不进内存。
+    ///
+    /// gRPC 的 `PushObjects` 会把分块先落到临时文件，再走这里——推多大的文件，
+    /// 服务端内存都只占分片缓冲。摘要照样逐个校验，与 [`Self::push_objects`] 等价。
+    pub fn push_objects_from_paths(
+        &self,
+        session: &Session,
+        session_id: &str,
+        objects: &[(Hash, std::path::PathBuf)],
+    ) -> Result<usize> {
+        let row = self.load_session(session, session_id)?;
+        if matches!(row.state.as_str(), "committed" | "aborted" | "expired") {
+            return Err(Error::new(
+                ErrorCode::InvalidSession,
+                format!("会话已结束（{}），不能继续推送", row.state),
+            ));
+        }
+
+        let mut accepted = 0usize;
+        for (expected, path) in objects {
+            let (actual, _) = hash_file(path)
+                .map_err(|e| Error::new(ErrorCode::IoError, format!("读取待入库文件失败：{e}")))?;
+            if actual != *expected {
+                return Err(Error::new(
+                    ErrorCode::ObjectMissing,
+                    format!(
+                        "对象内容与地址不符：期望 {}，实际 {}",
+                        to_hex(expected),
+                        to_hex(&actual)
+                    ),
+                ));
+            }
+            self.objects.put_from_path(expected, path)?;
             accepted += 1;
         }
 
@@ -5748,9 +5799,9 @@ fn scan_dir(
             continue;
         }
 
-        let data = fs::read(&path).map_err(|e| io("读取文件失败", &path, e))?;
-        let hash = hash_bytes(&data);
-        out.insert(rel, (hash, data.len() as u64, EntryKind::File));
+        // 流式算摘要：扫描阶段也不把文件整体读进内存。
+        let (hash, size) = hash_file(&path).map_err(|e| io("读取文件失败", &path, e))?;
+        out.insert(rel, (hash, size, EntryKind::File));
     }
     Ok(())
 }

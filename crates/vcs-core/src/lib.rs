@@ -35,7 +35,7 @@ pub mod store;
 pub mod tree;
 pub mod wc;
 
-pub use hash::{from_hex, hash_bytes, object_rel_path, to_hex};
+pub use hash::{from_hex, hash_bytes, hash_file, hash_reader, object_rel_path, to_hex, STREAM_BUF};
 pub use sparse::{SparseRules, SPARSE_META_KEY};
 pub use store::FileObjectStore;
 pub use tree::{
@@ -485,15 +485,34 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 // ---------------- 对象存储契约 ----------------
 
+/// 流式读句柄：内容按块读出，**内存占用与对象大小无关**。
+pub type ObjectReader = Box<dyn std::io::Read + Send>;
+
 /// 生产实现为本地文件系统 CAS；内存实现仅用于测试。
 /// 保留 trait 抽象是为了让 GC 与业务层不依赖具体目录布局，
 /// 而不是为了切换到远端对象存储。
+///
+/// `get` / `put` 是「整份进内存」的便捷入口，只适合小对象（树、配置、文本 diff）；
+/// 大对象一律走 `open` / `put_from_path`，否则一个几 GB 的文件就会把进程撑爆。
 pub trait ObjectStore: Send + Sync {
     fn get(&self, hash: &Hash) -> Result<Vec<u8>>;
     fn put(&self, hash: &Hash, data: &[u8]) -> Result<()>;
     fn exists(&self, hash: &Hash) -> bool;
     fn remove(&self, hash: &Hash) -> Result<()>;
     fn stored_size(&self, hash: &Hash) -> Result<u64>;
+
+    /// 流式读取。默认实现退回 `get`（内存存储本来就整份在内存里）。
+    fn open(&self, hash: &Hash) -> Result<ObjectReader> {
+        Ok(Box::new(std::io::Cursor::new(self.get(hash)?)) as ObjectReader)
+    }
+
+    /// 从磁盘上的文件流式入库：读一遍算摘要 + 压缩，按「压缩后更小才压」落盘。
+    /// 默认实现退回读整个文件再 `put`，供内存存储 / 测试使用。
+    fn put_from_path(&self, hash: &Hash, path: &std::path::Path) -> Result<()> {
+        let data = std::fs::read(path)
+            .map_err(|e| Error::new(ErrorCode::IoError, format!("读取待入库文件失败：{e}")))?;
+        self.put(hash, &data)
+    }
 }
 
 #[derive(Debug, Default)]

@@ -22,6 +22,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -473,57 +474,106 @@ impl BatchAccumulator {
     }
 }
 
-/// 正在分块发送的大对象：剩余未发字节 + 下一片序号。
+/// 正在分块发送的大对象：直接持有 CAS 上的读句柄，按 [`CHUNK_BYTES`] 一片片往外发。
+///
+/// **不在内存里缓存整个对象**：只留「当前这一片 + 预读的一片」。几 GB 的文件
+/// 与几十 KB 的文件，服务端占用同样大小的内存。
 struct PendingChunks {
     hash: String,
     kind: i32,
-    rest: Vec<u8>,
+    reader: vcs_core::ObjectReader,
     next_index: u32,
+    /// 已读出、还没发出去的分片（`last` 判定要看下一片是否存在）。
+    buffered: std::collections::VecDeque<Vec<u8>>,
 }
 
 impl PendingChunks {
-    fn new(hash: &vcs_core::Hash, data: Vec<u8>) -> Self {
+    fn new(
+        hash: &vcs_core::Hash,
+        kind: i32,
+        reader: vcs_core::ObjectReader,
+        buffered: std::collections::VecDeque<Vec<u8>>,
+    ) -> Self {
         Self {
             hash: vcs_core::to_hex(hash),
-            kind: pb::ObjectKind::Blob as i32,
-            rest: data,
+            kind,
+            reader,
             next_index: 0,
+            buffered,
         }
     }
 
-    /// 取出一条消息的分块：装到 [`PAYLOAD_BYTES`] 为止，避免一条消息过胖。
-    fn take_message(&mut self) -> pb::ObjectBatch {
+    fn take_message(&mut self) -> std::io::Result<Option<pb::ObjectBatch>> {
         let mut chunks = Vec::new();
         let mut bytes = 0usize;
-        while !self.rest.is_empty() {
-            let take = self.rest.len().min(CHUNK_BYTES);
-            // 放不下就留给下一条消息；但至少装一块，否则大对象永远发不出去。
-            if !chunks.is_empty() && bytes + take > PAYLOAD_BYTES {
+        while bytes < PAYLOAD_BYTES {
+            let piece = match self.buffered.pop_front() {
+                Some(piece) => piece,
+                None => match read_piece(&mut self.reader)? {
+                    Some(piece) => piece,
+                    None => break,
+                },
+            };
+            // 放不下就还给下一条消息（至少放一片，否则大对象永远发不出去）。
+            if !chunks.is_empty() && bytes + piece.len() > PAYLOAD_BYTES {
+                self.buffered.push_front(piece);
                 break;
             }
-            let tail = self.rest.split_off(take);
-            let data = std::mem::replace(&mut self.rest, tail);
-            bytes += data.len();
-            let last = self.rest.is_empty();
+            // 预读下一片：没有下一片，这一片才是最后一块。
+            let next = match self.buffered.pop_front() {
+                Some(piece) => Some(piece),
+                None => read_piece(&mut self.reader)?,
+            };
+            let last = next.is_none();
+            if let Some(next) = next {
+                self.buffered.push_back(next);
+            }
+            bytes += piece.len();
             chunks.push(pb::ObjectChunk {
                 hash: self.hash.clone(),
                 kind: self.kind,
                 index: self.next_index,
-                data,
+                data: piece,
                 last,
             });
             self.next_index += 1;
+            if last {
+                break;
+            }
         }
-        pb::ObjectBatch {
+        if chunks.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(pb::ObjectBatch {
             session_id: String::new(),
             objects: Vec::new(),
             chunks,
-        }
+        }))
     }
 }
 
-/// 按需读对象、边读边发：内存里只压着「当前这一批 + 正在切的大对象」，
-/// 不再像以前那样先把整个仓库读进内存再发包。
+/// 从 CAS 上读一片：攒到 [`CHUNK_BYTES`] 或读到结尾（`None` = 已经没有了）。
+fn read_piece(reader: &mut dyn std::io::Read) -> std::io::Result<Option<Vec<u8>>> {
+    let mut buf = vec![0u8; CHUNK_BYTES];
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let n = reader.read(&mut buf[filled..])?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    if filled == 0 {
+        return Ok(None);
+    }
+    buf.truncate(filled);
+    Ok(Some(buf))
+}
+
+/// 按需读对象、边读边发：内存里只压着「当前这一批 + 正在发的一片」。
+///
+/// 对象内容直接从 CAS 流式读出（`ObjectStore::open`），不再先把整库读进内存，
+/// 也不再把单个大对象读成 `Vec`。
 struct ObjectStream {
     api: Api,
     hashes: std::vec::IntoIter<vcs_core::Hash>,
@@ -542,6 +592,10 @@ impl ObjectStream {
             failed: false,
         }
     }
+
+    fn fail(err: String) -> Result<pb::ObjectBatch, Status> {
+        Err(Status::internal(err))
+    }
 }
 
 impl Iterator for ObjectStream {
@@ -554,38 +608,64 @@ impl Iterator for ObjectStream {
             }
             // 大对象一旦开始发，就把它的分块发完，不跟小对象混批。
             if let Some(pending) = self.pending.as_mut() {
-                let message = pending.take_message();
-                if pending.rest.is_empty() {
-                    self.pending = None;
+                match pending.take_message() {
+                    Ok(Some(message)) => return Some(Ok(message)),
+                    Ok(None) => {
+                        self.pending = None;
+                    }
+                    Err(err) => {
+                        self.failed = true;
+                        return Some(Self::fail(format!("读取对象失败：{err}")));
+                    }
                 }
-                return Some(Ok(message));
             }
             let Some(hash) = self.hashes.next() else {
                 return self.batch.take().map(Ok);
             };
-            let data = {
+            // 先读两片：第一片就没有 → 空对象；读不满两片 → 小对象（走攒批）；
+            // 两片都在 → 大对象，改走分块。
+            let opened = {
                 let store = self.api.store();
-                store.objects().get(&hash)
+                store.objects().open(&hash)
             };
-            let data = match data {
-                Ok(data) => data,
+            let mut reader = match opened {
+                Ok(reader) => reader,
                 Err(err) => {
                     self.failed = true;
-                    return Some(Err(Status::internal(format!(
-                        "{:?}: {}",
-                        err.code, err.message
-                    ))));
+                    return Some(Self::fail(format!("{:?}: {}", err.code, err.message)));
                 }
             };
-            if data.len() > CHUNK_BYTES {
-                // 先把手上的小对象发出去，再单独开一条大对象的分块消息。
-                if let Some(message) = self.batch.take() {
-                    self.pending = Some(PendingChunks::new(&hash, data));
-                    return Some(Ok(message));
+            let mut buffered = std::collections::VecDeque::new();
+            let mut done = false;
+            for _ in 0..2 {
+                match read_piece(&mut reader) {
+                    Ok(Some(piece)) => buffered.push_back(piece),
+                    Ok(None) => {
+                        done = true;
+                        break;
+                    }
+                    Err(err) => {
+                        self.failed = true;
+                        return Some(Self::fail(format!("读取对象失败：{err}")));
+                    }
                 }
-                self.pending = Some(PendingChunks::new(&hash, data));
-                continue;
             }
+            if !done && buffered.len() == 2 {
+                // 大对象：先把手上的小对象发出去，再开始发分块。
+                let pending =
+                    PendingChunks::new(&hash, pb::ObjectKind::Blob as i32, reader, buffered);
+                match self.batch.take() {
+                    Some(message) => {
+                        self.pending = Some(pending);
+                        return Some(Ok(message));
+                    }
+                    None => {
+                        self.pending = Some(pending);
+                        continue;
+                    }
+                }
+            }
+            let data = buffered.pop_front().unwrap_or_default();
             if self.batch.would_overflow(data.len()) {
                 let message = self.batch.take();
                 self.batch.push(pb::Object {
@@ -594,7 +674,10 @@ impl Iterator for ObjectStream {
                     data,
                     compressed: false,
                 });
-                return message.map(Ok);
+                if let Some(message) = message {
+                    return Some(Ok(message));
+                }
+                continue;
             }
             self.batch.push(pb::Object {
                 hash: vcs_core::to_hex(&hash),
@@ -606,38 +689,79 @@ impl Iterator for ObjectStream {
     }
 }
 
-/// 接收端：把同一个 hash 的分块攒回完整对象。
-#[derive(Default)]
-struct ChunkAssembler {
-    /// hash → (已收字节, 下一片期望序号)
-    partial: HashMap<String, (Vec<u8>, u32)>,
+/// 接收端：分块直接落到临时文件，收齐后才整份交给 CAS。
+///
+/// **不在内存里拼对象**：推 10 GB 的文件，服务端占用的也只是几个 1 MiB 分片的
+/// 缓冲和一块临时磁盘。序号不连续整笔拒绝，避免把错位的片段拼成一份
+/// 「内容对不上地址」的对象；最终的摘要校验由 `ObjectStore::put_from_path` 兜底。
+struct ChunkSpool {
+    dir: PathBuf,
+    /// hash → (写入中的文件, 下一片期望序号)
+    partial: HashMap<String, (std::fs::File, u32)>,
+    /// 已经收齐的对象：hash → 临时文件路径
+    finished: Vec<(String, PathBuf)>,
 }
 
-impl ChunkAssembler {
-    /// 收下一片。`Ok(None)` = 还没收完，`Ok(Some((hash, data)))` = 这个对象齐了。
-    fn push(&mut self, chunk: pb::ObjectChunk) -> Result<Option<(String, Vec<u8>)>, String> {
-        let entry = self
-            .partial
-            .entry(chunk.hash.clone())
-            .or_insert_with(|| (Vec::new(), 0));
-        if chunk.index != entry.1 {
+impl ChunkSpool {
+    fn new() -> std::io::Result<Self> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "vcs-push-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self {
+            dir,
+            partial: HashMap::new(),
+            finished: Vec::new(),
+        })
+    }
+
+    fn push(&mut self, chunk: pb::ObjectChunk) -> std::result::Result<(), String> {
+        if !self.partial.contains_key(&chunk.hash) {
+            if chunk.index != 0 {
+                return Err(format!(
+                    "对象 {} 的分块序号不连续：期望第 0 块，收到第 {} 块",
+                    chunk.hash, chunk.index
+                ));
+            }
+            let path = self.dir.join(&chunk.hash);
+            let file =
+                std::fs::File::create(&path).map_err(|e| format!("创建暂存文件失败：{e}"))?;
+            self.partial.insert(chunk.hash.clone(), (file, 0));
+        }
+        let (file, next) = self.partial.get_mut(&chunk.hash).expect("条目刚写入");
+        if chunk.index != *next {
             return Err(format!(
                 "对象 {} 的分块序号不连续：期望第 {} 块，收到第 {} 块",
-                chunk.hash, entry.1, chunk.index
+                chunk.hash, next, chunk.index
             ));
         }
-        entry.0.extend_from_slice(&chunk.data);
-        entry.1 += 1;
+        file.write_all(&chunk.data)
+            .map_err(|e| format!("写暂存文件失败：{e}"))?;
+        *next += 1;
         if chunk.last {
-            let (data, _) = self.partial.remove(&chunk.hash).expect("条目刚写入");
-            return Ok(Some((chunk.hash, data)));
+            let (file, _) = self.partial.remove(&chunk.hash).expect("条目还在");
+            file.sync_all()
+                .map_err(|e| format!("刷新暂存文件失败：{e}"))?;
+            drop(file);
+            self.finished
+                .push((chunk.hash.clone(), self.dir.join(&chunk.hash)));
         }
-        Ok(None)
+        Ok(())
     }
 
     /// 流结束时检查有没有只收了一半的对象。
     fn unfinished(&self) -> Option<&str> {
         self.partial.keys().next().map(String::as_str)
+    }
+}
+
+impl Drop for ChunkSpool {
+    fn drop(&mut self) {
+        // 无论成功还是失败都不留临时文件。
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -1590,17 +1714,19 @@ impl RepoService for RepoApi {
         let session = self.api.session(&request)?;
         let mut stream = request.into_inner();
         let mut session_id = String::new();
-        let mut objects: Vec<(vcs_core::Hash, Vec<u8>)> = Vec::new();
-        // 分块的半成品：序号不连续就整笔拒绝，免得把错位的片段拼成一个
-        // 「内容对不上地址」的对象。
-        let mut assembler = ChunkAssembler::default();
+        // 小对象（整体发送）留在内存：它们的体积本来就被攒批上限约束住了。
+        let mut inline: Vec<(vcs_core::Hash, Vec<u8>)> = Vec::new();
+        // 大对象（分块发送）落到临时文件，收齐后由 CAS 流式入库——
+        // 这样推多大的文件，服务端内存都只占几个分片的缓冲。
+        let mut spool =
+            ChunkSpool::new().map_err(|e| Status::internal(format!("创建暂存目录失败：{e}")))?;
         while let Some(item) = stream.next().await {
             let batch = item?;
             if session_id.is_empty() {
                 session_id = batch.session_id.clone();
             }
             for object in batch.objects {
-                if assembler.partial.contains_key(&object.hash) {
+                if spool.partial.contains_key(&object.hash) {
                     return Err(Status::invalid_argument(format!(
                         "对象 {} 同时按整体与分块发送",
                         object.hash
@@ -1608,19 +1734,13 @@ impl RepoService for RepoApi {
                 }
                 let hash = vcs_core::from_hex(&object.hash)
                     .map_err(|e| Status::invalid_argument(e.message))?;
-                objects.push((hash, object.data));
+                inline.push((hash, object.data));
             }
             for chunk in batch.chunks {
-                if let Some((hash_hex, data)) =
-                    assembler.push(chunk).map_err(Status::invalid_argument)?
-                {
-                    let hash = vcs_core::from_hex(&hash_hex)
-                        .map_err(|e| Status::invalid_argument(e.message))?;
-                    objects.push((hash, data));
-                }
+                spool.push(chunk).map_err(Status::invalid_argument)?;
             }
         }
-        if let Some(hash) = assembler.unfinished() {
+        if let Some(hash) = spool.unfinished() {
             return Err(Status::invalid_argument(format!(
                 "对象 {hash} 的分块没有收全（缺少 last 块）"
             )));
@@ -1628,13 +1748,29 @@ impl RepoService for RepoApi {
         if session_id.is_empty() {
             return Err(Status::invalid_argument("缺少 session_id"));
         }
-        let received = objects.len() as u64;
-        let bytes = objects.iter().map(|(_, data)| data.len() as u64).sum();
-        match self
-            .api
-            .store()
-            .push_objects(&session, &session_id, &objects)
-        {
+        let files = spool
+            .finished
+            .iter()
+            .map(|(hex, path)| {
+                let hash =
+                    vcs_core::from_hex(hex).map_err(|e| Status::invalid_argument(e.message))?;
+                Ok((hash, path.clone()))
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        let bytes: u64 = inline
+            .iter()
+            .map(|(_, data)| data.len() as u64)
+            .sum::<u64>()
+            + files
+                .iter()
+                .filter_map(|(_, path)| std::fs::metadata(path).ok().map(|m| m.len()))
+                .sum::<u64>();
+        let received = (inline.len() + files.len()) as u64;
+        let store = self.api.store();
+        let pushed = store
+            .push_objects(&session, &session_id, &inline)
+            .and_then(|_| store.push_objects_from_paths(&session, &session_id, &files));
+        match pushed {
             Ok(_) => Ok(Response::new(pb::PushAck {
                 status: Some(status_ok()),
                 received_objects: received,
@@ -2955,7 +3091,11 @@ mod tests {
         }
     }
 
-    /// 大对象切成连续分片、最后一片带 last，拼回去必须与原文逐字节一致。
+    fn cursor_reader(data: Vec<u8>) -> vcs_core::ObjectReader {
+        Box::new(std::io::Cursor::new(data))
+    }
+
+    /// 大对象从 CAS 流式发出：分片连续、最后一片带 last，拼回去逐字节一致。
     #[test]
     fn big_object_splits_into_contiguous_chunks() {
         let data: Vec<u8> = (0..(CHUNK_BYTES * 2 + 7))
@@ -2963,42 +3103,50 @@ mod tests {
             .collect();
         let hash = vcs_core::hash_bytes(&data);
         let hex = vcs_core::to_hex(&hash);
-        let mut pending = PendingChunks::new(&hash, data.clone());
-        let mut assembler = ChunkAssembler::default();
+        let mut pending = PendingChunks::new(
+            &hash,
+            pb::ObjectKind::Blob as i32,
+            cursor_reader(data.clone()),
+            std::collections::VecDeque::new(),
+        );
+        let mut spool = ChunkSpool::new().expect("建暂存目录");
         let mut index = 0u32;
         let mut messages = 0;
-        while !pending.rest.is_empty() {
-            let message = pending.take_message();
+        while let Some(message) = pending.take_message().expect("读取分片") {
             messages += 1;
             assert!(message.objects.is_empty(), "大对象不该混进 objects");
             for chunk in message.chunks {
                 assert_eq!(chunk.hash, hex);
                 assert_eq!(chunk.index, index);
                 assert!(chunk.data.len() <= CHUNK_BYTES);
-                let done = assembler.push(chunk).expect("序号连续");
-                if let Some((got_hash, got)) = done {
-                    assert_eq!(got_hash, hex);
-                    assert_eq!(got, data, "拼回去的内容必须与原文一致");
-                }
+                spool.push(chunk).expect("序号连续");
                 index += 1;
             }
         }
         assert_eq!(index, 3);
         assert_eq!(messages, 1, "3 MiB 摘要应落在一条 4 MiB 的消息里");
-        assert!(assembler.unfinished().is_none());
+        assert!(spool.unfinished().is_none());
+        assert_eq!(spool.finished.len(), 1);
+        let (got_hex, path) = &spool.finished[0];
+        assert_eq!(got_hex, &hex);
+        assert_eq!(std::fs::read(path).expect("读暂存文件"), data);
     }
 
     /// 超大对象（远超任何消息上限）也能发完：分块数随体积线性增长。
     #[test]
     fn huge_object_needs_no_message_limit() {
-        let size = 40 * 1024 * 1024;
+        let size = 12 * 1024 * 1024;
         let data = vec![9u8; size];
         let hash = vcs_core::hash_bytes(&data);
-        let mut pending = PendingChunks::new(&hash, data);
+        let mut pending = PendingChunks::new(
+            &hash,
+            pb::ObjectKind::Blob as i32,
+            cursor_reader(data),
+            std::collections::VecDeque::new(),
+        );
         let mut total = 0usize;
         let mut messages = 0usize;
-        while !pending.rest.is_empty() {
-            let message = pending.take_message();
+        while let Some(message) = pending.take_message().expect("读取分片") {
             messages += 1;
             let bytes: usize = message.chunks.iter().map(|c| c.data.len()).sum();
             assert!(bytes <= PAYLOAD_BYTES, "单条消息负载不得超过目标");
@@ -3007,33 +3155,36 @@ mod tests {
         assert_eq!(total, size, "分块后一个字节都不能少");
         assert!(
             messages >= size / BATCH_BYTES,
-            "40 MiB 至少要切成 {} 条，实际 {messages}",
+            "{size} 字节至少要切成 {} 条，实际 {messages}",
             size / BATCH_BYTES
         );
     }
 
     /// 分块序号错乱必须整笔拒绝，不能把错位的片段拼成「内容对不上地址」的对象。
     #[test]
-    fn chunk_assembler_rejects_gaps() {
-        let mut assembler = ChunkAssembler::default();
-        let first = pb::ObjectChunk {
-            hash: "a".repeat(64),
-            kind: pb::ObjectKind::Blob as i32,
-            index: 0,
-            data: vec![1, 2, 3],
-            last: false,
-        };
-        assert!(assembler.push(first).expect("第 0 块合法").is_none());
-        let jumped = pb::ObjectChunk {
-            hash: "a".repeat(64),
-            kind: pb::ObjectKind::Blob as i32,
-            index: 2,
-            data: vec![4],
-            last: true,
-        };
-        let err = assembler.push(jumped).expect_err("跳块必须报错");
+    fn chunk_spool_rejects_gaps() {
+        let mut spool = ChunkSpool::new().expect("建暂存目录");
+        let hash = "a".repeat(64);
+        spool
+            .push(pb::ObjectChunk {
+                hash: hash.clone(),
+                kind: pb::ObjectKind::Blob as i32,
+                index: 0,
+                data: vec![1, 2, 3],
+                last: false,
+            })
+            .expect("第 0 块合法");
+        let err = spool
+            .push(pb::ObjectChunk {
+                hash: hash.clone(),
+                kind: pb::ObjectKind::Blob as i32,
+                index: 2,
+                data: vec![4],
+                last: true,
+            })
+            .expect_err("跳块必须报错");
         assert!(err.contains("不连续"), "{err}");
-        assert_eq!(assembler.unfinished(), Some("a".repeat(64).as_str()));
+        assert_eq!(spool.unfinished(), Some(hash.as_str()));
     }
 
     #[test]

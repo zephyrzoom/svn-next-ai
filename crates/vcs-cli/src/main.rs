@@ -21,7 +21,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use vcs_core::{hash_bytes, ChangeKind, ObjectStore, SparseRules, WorkingCopy};
+use vcs_core::{ChangeKind, ObjectStore, SparseRules, WorkingCopy};
 use vcs_server::{
     authenticate_ldap, test_ldap_connection, PendingChange, ServerStore, Session, TlsMode,
 };
@@ -745,20 +745,23 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
 
-            // 采集内容：边读边校验，防止「扫描后又被改」导致提交的内容与本地不一致。
-            let mut payload: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+            // 采集内容：流式算摘要校验「扫描后有没有又被改」，只记下路径。
+            // 内容在入库时按文件流式读（`push_objects_from_paths`），
+            // 所以提交一个几 GB 的文件也不会把它整体读进内存。
+            let mut payload: Vec<(vcs_core::Hash, std::path::PathBuf)> = Vec::new();
             let mut estimated = 0u64;
             for change in &changes {
                 let Some(hash) = change.hash else { continue };
-                let data = std::fs::read(wc.root().join(&change.path))?;
-                if hash_bytes(&data) != hash {
+                let path = wc.root().join(&change.path);
+                let (actual, size) = vcs_core::hash_file(&path)?;
+                if actual != hash {
                     return Err(format!("{} 在扫描后又被修改，请重新提交", change.path).into());
                 }
                 if !store.objects().exists(&hash) {
                     // 只统计对象池里还没有的内容，去重后不重复计费。
-                    estimated += data.len() as u64;
+                    estimated += size;
                 }
-                payload.push((hash, data));
+                payload.push((hash, path));
             }
 
             let pending: Vec<PendingChange> = changes
@@ -776,9 +779,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let commit =
                 store.begin_commit(&session, &repo_id, base_rev, &pending, &message, estimated)?;
 
-            for batch in batch_payload(&payload) {
-                store.push_objects(&session, &commit.session_id, batch)?;
-            }
+            store.push_objects_from_paths(&session, &commit.session_id, &payload)?;
 
             let outcome = match store.finalize_commit(&session, &commit.session_id) {
                 Ok(outcome) => outcome,
@@ -1717,34 +1718,6 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
-}
-
-// ---------------- 提交辅助 ----------------
-
-/// 单批推送的条目上限与字节上限。
-///
-/// 分批的意义不只是省内存：`push_objects` 是幂等的，中断后重跑同一批不会产生副作用，
-/// 所以「大提交失败」可以从头重来而不必担心半截状态。
-const PUSH_BATCH_ITEMS: usize = 32;
-const PUSH_BATCH_BYTES: usize = 32 * 1024 * 1024;
-
-fn batch_payload(payload: &[(vcs_core::Hash, Vec<u8>)]) -> Vec<&[(vcs_core::Hash, Vec<u8>)]> {
-    let mut batches = Vec::new();
-    let mut start = 0usize;
-    let mut bytes = 0usize;
-    for (idx, (_, data)) in payload.iter().enumerate() {
-        bytes += data.len();
-        let full = idx + 1 - start >= PUSH_BATCH_ITEMS || bytes >= PUSH_BATCH_BYTES;
-        if full {
-            batches.push(&payload[start..=idx]);
-            start = idx + 1;
-            bytes = 0;
-        }
-    }
-    if start < payload.len() {
-        batches.push(&payload[start..]);
-    }
-    batches
 }
 
 // ---------------- 登录态缓存 ----------------

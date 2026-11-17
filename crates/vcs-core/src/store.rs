@@ -16,12 +16,12 @@
 //! 小对象压缩反而变大，所以按「压缩后更小才压」决策，代价是读路径多一次分支。
 
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hash::{hash_bytes, object_rel_path};
-use crate::{Error, ErrorCode, Hash, ObjectStore, Result};
+use crate::{Error, ErrorCode, Hash, ObjectReader, ObjectStore, Result, STREAM_BUF};
 
 const FLAG_RAW: u8 = 0;
 const FLAG_ZSTD: u8 = 1;
@@ -72,20 +72,21 @@ impl FileObjectStore {
         }
     }
 
-    fn decompress(&self, raw: &[u8]) -> Result<Vec<u8>> {
-        let (flag, body) = raw
-            .split_first()
-            .ok_or_else(|| Error::new(ErrorCode::ObjectMissing, "对象文件为空"))?;
-        match *flag {
-            FLAG_RAW => Ok(body.to_vec()),
-            // 流式解码：`bulk::decompress` 必须给一个固定上限（原来是 512 MiB），
-            // 等于给单个对象强加一个大小上限。流式解码按需增长，没有这个天花板。
-            FLAG_ZSTD => zstd::stream::decode_all(std::io::Cursor::new(body))
-                .map_err(|e| Error::new(ErrorCode::ObjectMissing, format!("zstd 解压失败：{e}"))),
-            other => Err(Error::new(
-                ErrorCode::ObjectMissing,
-                format!("未知的对象压缩标记：{other}"),
-            )),
+    /// 把暂存文件原子地挪到最终路径。
+    ///
+    /// rename 在同一文件系统内是原子的：要么看不到对象，要么看到完整对象。并发写同一个
+    /// 对象时后到者丢弃自己的副本——地址即内容，两份字节必然相同。
+    fn commit_tmp(&self, tmp: PathBuf, target: PathBuf) -> Result<()> {
+        match fs::rename(&tmp, &target) {
+            Ok(()) => Ok(()),
+            Err(_) if target.exists() => {
+                let _ = fs::remove_file(&tmp);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                Err(io_err("对象落盘失败", &target, e))
+            }
         }
     }
 
@@ -156,6 +157,17 @@ impl FileObjectStore {
 
 impl ObjectStore for FileObjectStore {
     fn get(&self, hash: &Hash) -> Result<Vec<u8>> {
+        let mut reader = self.open(hash)?;
+        let mut out = Vec::new();
+        reader
+            .read_to_end(&mut out)
+            .map_err(|e| Error::new(ErrorCode::ObjectMissing, format!("读取对象失败：{e}")))?;
+        Ok(out)
+    }
+
+    /// 流式读取：只读一个标记字节，剩下的交给文件 / zstd 解码器，
+    /// 内存占用与对象大小无关（这也是「检出几 GB 文件不炸」的前提）。
+    fn open(&self, hash: &Hash) -> Result<ObjectReader> {
         let path = self.path_of(hash);
         let mut file = File::open(&path).map_err(|_| {
             Error::new(
@@ -163,10 +175,23 @@ impl ObjectStore for FileObjectStore {
                 format!("对象不存在：{}", crate::hash::to_hex(hash)),
             )
         })?;
-        let mut raw = Vec::new();
-        file.read_to_end(&mut raw)
-            .map_err(|e| io_err("读取对象失败", &path, e))?;
-        self.decompress(&raw)
+        let mut flag = [0u8; 1];
+        file.read_exact(&mut flag)
+            .map_err(|e| io_err("读取对象标记失败", &path, e))?;
+        let reader = BufReader::new(file);
+        match flag[0] {
+            FLAG_RAW => Ok(Box::new(reader) as ObjectReader),
+            FLAG_ZSTD => {
+                let decoder = zstd::stream::read::Decoder::new(reader).map_err(|e| {
+                    Error::new(ErrorCode::ObjectMissing, format!("zstd 解码失败：{e}"))
+                })?;
+                Ok(Box::new(BufReader::new(decoder)) as ObjectReader)
+            }
+            other => Err(Error::new(
+                ErrorCode::ObjectMissing,
+                format!("未知的对象压缩标记：{other}"),
+            )),
+        }
     }
 
     fn put(&self, hash: &Hash, data: &[u8]) -> Result<()> {
@@ -199,18 +224,93 @@ impl ObjectStore for FileObjectStore {
             file.sync_all()
                 .map_err(|e| io_err("刷新暂存文件失败", &tmp, e))?;
         }
-        // rename 在同一文件系统内是原子的：要么看不到对象，要么看到完整对象。
-        match fs::rename(&tmp, &target) {
-            Ok(()) => Ok(()),
-            Err(_) if target.exists() => {
-                let _ = fs::remove_file(&tmp);
-                Ok(())
-            }
-            Err(e) => {
-                let _ = fs::remove_file(&tmp);
-                Err(io_err("对象落盘失败", &target, e))
-            }
+        self.commit_tmp(tmp, target)
+    }
+
+    /// 从磁盘文件流式入库：一遍读出算摘要 + 压缩，再按「压缩后更小才压」定稿。
+    ///
+    /// 内存只用一个 64 KiB 缓冲：推上来的对象先落在临时文件里，这里按文件读，
+    /// 不会把整个对象塞进内存。压缩不划算时再读一遍源文件写成 raw——多一次 IO，
+    /// 换来的是「对象多大都不影响内存」。
+    fn put_from_path(&self, hash: &Hash, src: &Path) -> Result<()> {
+        let target = self.path_of(hash);
+        if target.exists() {
+            return Ok(());
         }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| io_err("创建分片目录失败", parent, e))?;
+        }
+        let raw_size = fs::metadata(src)
+            .map_err(|e| io_err("读取待入库文件大小失败", src, e))?
+            .len();
+
+        // 第 1 遍：边读边算摘要、边压缩到临时文件。
+        let compressed_tmp = self.unique_tmp_name();
+        let mut hasher = blake3::Hasher::new();
+        let mut input =
+            BufReader::new(File::open(src).map_err(|e| io_err("打开待入库文件失败", src, e))?);
+        let compressed_size = {
+            let out = File::create(&compressed_tmp)
+                .map_err(|e| io_err("创建压缩暂存失败", &compressed_tmp, e))?;
+            let mut encoder = zstd::stream::write::Encoder::new(BufWriter::new(out), ZSTD_LEVEL)
+                .map_err(|e| Error::new(ErrorCode::IoError, format!("zstd 压缩失败：{e}")))?;
+            let mut buf = vec![0u8; STREAM_BUF];
+            loop {
+                let n = input
+                    .read(&mut buf)
+                    .map_err(|e| io_err("读取待入库文件失败", src, e))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                encoder
+                    .write_all(&buf[..n])
+                    .map_err(|e| Error::new(ErrorCode::IoError, format!("zstd 压缩失败：{e}")))?;
+            }
+            let mut out = encoder
+                .finish()
+                .map_err(|e| Error::new(ErrorCode::IoError, format!("zstd 收尾失败：{e}")))?;
+            out.flush()
+                .map_err(|e| io_err("刷新压缩暂存失败", &compressed_tmp, e))?;
+            out.get_ref()
+                .metadata()
+                .map_err(|e| io_err("读取压缩结果大小失败", &compressed_tmp, e))?
+                .len()
+        };
+        let actual = *hasher.finalize().as_bytes();
+        if actual != *hash {
+            let _ = fs::remove_file(&compressed_tmp);
+            return Err(Error::new(
+                ErrorCode::ObjectMissing,
+                format!(
+                    "内容摘要与地址不一致，拒绝写入：期望 {} 实际 {}",
+                    crate::hash::to_hex(hash),
+                    crate::hash::to_hex(&actual)
+                ),
+            ));
+        }
+
+        // 第 2 遍：写最终对象（标记字节 + 正文），只保留更小的一种表示。
+        let use_zstd = compressed_size + 1 < raw_size + 1;
+        let staged = self.unique_tmp_name();
+        {
+            let out = File::create(&staged).map_err(|e| io_err("创建暂存文件失败", &staged, e))?;
+            let mut out = BufWriter::new(out);
+            out.write_all(&[if use_zstd { FLAG_ZSTD } else { FLAG_RAW }])
+                .map_err(|e| io_err("写对象标记失败", &staged, e))?;
+            let body_path = if use_zstd { &compressed_tmp } else { src };
+            let mut body = BufReader::new(
+                File::open(body_path).map_err(|e| io_err("打开对象正文失败", body_path, e))?,
+            );
+            std::io::copy(&mut body, &mut out).map_err(|e| io_err("写暂存文件失败", &staged, e))?;
+            out.flush()
+                .map_err(|e| io_err("刷新暂存文件失败", &staged, e))?;
+            out.get_ref()
+                .sync_all()
+                .map_err(|e| io_err("刷新暂存文件失败", &staged, e))?;
+        }
+        let _ = fs::remove_file(&compressed_tmp);
+        self.commit_tmp(staged, target)
     }
 
     fn exists(&self, hash: &Hash) -> bool {
@@ -319,6 +419,48 @@ mod tests {
         let hash = hash_bytes(data);
         store.put(&hash, data).unwrap();
         assert_eq!(store.stored_size(&hash).unwrap(), 2); // 1 字节标记 + 1 字节内容
+    }
+
+    /// 流式读写：内容不进内存，且压缩与否都能读回来。
+    #[test]
+    fn stream_put_and_open_round_trip() {
+        let dir = TempDir::new("stream");
+        let store = FileObjectStore::open(dir.0.join("cas")).unwrap();
+        // 4 MiB 高度重复内容：会走 zstd 分支；再写一份随机内容走 raw 分支。
+        let mut repetitive = vec![0u8; 4 * 1024 * 1024];
+        for (i, byte) in repetitive.iter_mut().enumerate() {
+            *byte = (i % 97) as u8;
+        }
+        // 伪随机内容压缩不动，用来覆盖 raw 分支。
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let raw: Vec<u8> = (0..1024)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed & 0xff) as u8
+            })
+            .collect();
+
+        for (name, data) in [("repetitive", &repetitive), ("raw", &raw)] {
+            let src = dir.0.join(name);
+            fs::write(&src, data).unwrap();
+            let hash = hash_bytes(data);
+            store.put_from_path(&hash, &src).unwrap();
+            let mut reader = store.open(&hash).unwrap();
+            let mut back = Vec::new();
+            reader.read_to_end(&mut back).unwrap();
+            assert_eq!(&back, data, "{name} 流式读回来的内容必须一致");
+        }
+
+        // 重复内容应当被压缩；随机小内容保持原样（多 1 字节标记）。
+        let repetitive_hash = hash_bytes(&repetitive);
+        assert!(store.stored_size(&repetitive_hash).unwrap() < repetitive.len() as u64 / 4);
+        repetitive.clear();
+        assert_eq!(
+            store.stored_size(&hash_bytes(&raw)).unwrap(),
+            raw.len() as u64 + 1
+        );
     }
 
     #[test]

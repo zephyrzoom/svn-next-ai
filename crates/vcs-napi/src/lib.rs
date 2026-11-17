@@ -5,20 +5,24 @@
 //! 这个 crate 只做三件事：类型转换、JSON 序列化、错误码透传——不放任何业务判断。
 //!
 //! 约定：
-//!   - 结构化数据一律用 JSON 字符串进出（`serde_json`），二进制内容用 `Buffer`；
-//!   - 对象内容按「`hashes[i]` ↔ `blobs[i]`」成对传入，缺一个就报错，不做静默补齐；
+//!   - 结构化数据一律用 JSON 字符串进出（`serde_json`）；
+//!   - **对象内容一律走磁盘上的 spool 目录**（CAS 布局：`objects/ab/cdef…`，首字节是
+//!     存储标记），由 native 侧 `FileObjectStore` 流式读取。这样几 GB 的检出 / 更新也
+//!     不会把整库或单个大文件读进内存——把 Buffer 数组传进来是上一版的做法，已废弃；
 //!   - `vcs_core::Error` 统一转成 `"OutOfDate: 本地版本 r1 已落后…"` 这种可读文本，
 //!     JS 侧只负责展示，真正的判定永远发生在 Rust。
 #![deny(clippy::all)]
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
 use serde::{Deserialize, Serialize};
 use vcs_core::{
-    from_hex, hash_bytes, to_hex, ChangeKind, ConflictChoice, EntryKind, FlatEntry, Hash,
-    MemoryObjectStore, ObjectStore, RemoteChange, WcState, WorkingCopy,
+    from_hex, hash_bytes, hash_file, to_hex, ChangeKind, ConflictChoice, EntryKind,
+    FileObjectStore, FlatEntry, Hash, ObjectReader, ObjectStore, RemoteChange, WcState,
+    WorkingCopy,
 };
 
 fn to_napi(err: vcs_core::Error) -> napi::Error {
@@ -90,24 +94,66 @@ fn parse_entry_kind(kind: &str) -> napi::Result<EntryKind> {
     }
 }
 
-/// 用「哈希 ↔ 内容」对搭一个临时对象存储。
+/// 打开下载暂存目录（CAS 布局）作为对象源。
 ///
-/// `WorkingCopy` 的检出 / 更新 / 提交收尾都要 `&dyn ObjectStore`；桌面端没有本地 CAS，
-/// 内容刚从网络或磁盘拿在手上，用内存存储最直接，也复用了同一套经过测试的写入逻辑。
-fn memory_store(hashes: Vec<String>, blobs: Vec<Buffer>) -> napi::Result<MemoryObjectStore> {
-    if hashes.len() != blobs.len() {
-        return Err(bad(format!(
-            "hashes 与 blobs 数量不一致：{} vs {}",
-            hashes.len(),
-            blobs.len()
-        )));
+/// 桌面端把网络上的分片直接落成 `<spool>/objects/ab/cdef…`，这里用 `FileObjectStore`
+/// 打开它：`open()` 是流式的，检出 / 更新按块读，内存与对象大小无关。
+fn spool_store(spool_dir: &str) -> napi::Result<FileObjectStore> {
+    FileObjectStore::open(spool_dir).map_err(to_napi)
+}
+
+/// 以工作目录里的文件为内容源（哈希 → 路径由调用方给出）。
+///
+/// 只用于 `mark_committed` 写 pristine：提交刚成功，磁盘上的字节就是刚提交的那份，
+/// 没必要再从网络或内存里搬一遍。同样走流式读。
+struct WorkingDirectoryStore {
+    paths: HashMap<String, PathBuf>,
+}
+
+impl ObjectStore for WorkingDirectoryStore {
+    fn get(&self, hash: &Hash) -> vcs_core::Result<Vec<u8>> {
+        let path = self.paths.get(&to_hex(hash)).ok_or_else(|| {
+            vcs_core::Error::new(vcs_core::ErrorCode::ObjectMissing, "本地没有这份内容")
+        })?;
+        std::fs::read(path)
+            .map_err(|e| vcs_core::Error::new(vcs_core::ErrorCode::IoError, format!("读取 {e}")))
     }
-    let store = MemoryObjectStore::new();
-    for (hex, data) in hashes.iter().zip(blobs.iter()) {
-        let hash: Hash = from_hex(hex).map_err(to_napi)?;
-        store.put(&hash, data.as_ref()).map_err(to_napi)?;
+
+    fn open(&self, hash: &Hash) -> vcs_core::Result<ObjectReader> {
+        let path = self.paths.get(&to_hex(hash)).ok_or_else(|| {
+            vcs_core::Error::new(vcs_core::ErrorCode::ObjectMissing, "本地没有这份内容")
+        })?;
+        let file = std::fs::File::open(path)
+            .map_err(|e| vcs_core::Error::new(vcs_core::ErrorCode::IoError, format!("读取 {e}")))?;
+        Ok(Box::new(file))
     }
-    Ok(store)
+
+    fn put(&self, _hash: &Hash, _data: &[u8]) -> vcs_core::Result<()> {
+        Err(vcs_core::Error::new(
+            vcs_core::ErrorCode::InvalidSession,
+            "工作目录存储是只读的",
+        ))
+    }
+
+    fn exists(&self, hash: &Hash) -> bool {
+        self.paths.contains_key(&to_hex(hash))
+    }
+
+    fn remove(&self, _hash: &Hash) -> vcs_core::Result<()> {
+        Err(vcs_core::Error::new(
+            vcs_core::ErrorCode::InvalidSession,
+            "工作目录存储是只读的",
+        ))
+    }
+
+    fn stored_size(&self, hash: &Hash) -> vcs_core::Result<u64> {
+        let path = self.paths.get(&to_hex(hash)).ok_or_else(|| {
+            vcs_core::Error::new(vcs_core::ErrorCode::ObjectMissing, "本地没有这份内容")
+        })?;
+        std::fs::metadata(path)
+            .map(|m| m.len())
+            .map_err(|e| vcs_core::Error::new(vcs_core::ErrorCode::IoError, format!("读取 {e}")))
+    }
 }
 
 #[derive(Serialize)]
@@ -208,6 +254,20 @@ pub fn hash_bytes_hex(data: Buffer) -> String {
     to_hex(&hash_bytes(data.as_ref()))
 }
 
+/// 流式算文件摘要，返回 `{"hash":"…","size":N}`。
+///
+/// 提交前校验「扫描之后用户没再改文件」用它：读一遍就够，不把文件读进内存。
+#[napi]
+pub fn hash_file_hex(path: String) -> napi::Result<String> {
+    let (hash, size) =
+        hash_file(Path::new(&path)).map_err(|e| bad(format!("读取文件失败：{e}")))?;
+    Ok(format!(
+        "{{\"hash\":\"{}\",\"size\":{}}}",
+        to_hex(&hash),
+        size
+    ))
+}
+
 // ---------------- 工作副本 ----------------
 
 /// 工作副本归属与稀疏规则：
@@ -251,7 +311,9 @@ fn parse_sparse_rules(text: &str) -> napi::Result<vcs_core::SparseRules> {
     vcs_core::SparseRules::from_paths(raw).map_err(to_napi)
 }
 
-/// 检出：把服务端给的条目与内容铺到磁盘，并写 pristine 基线。
+/// 检出：把服务端给的条目铺到磁盘，并写 pristine 基线。
+///
+/// 内容从 `spool_dir` 里流式读（CAS 布局，桌面端边下载边写），所以整库多大都不进内存。
 /// `rulesJson` 是稀疏路径数组的 JSON，传 `[]` 表示全量检出。
 #[napi]
 pub fn wc_checkout(
@@ -259,13 +321,12 @@ pub fn wc_checkout(
     repo_id: String,
     rev: u32,
     entries_json: String,
-    hashes: Vec<String>,
-    blobs: Vec<Buffer>,
+    spool_dir: String,
     rules_json: String,
 ) -> napi::Result<u32> {
     let entries: Vec<EntryIn> =
         serde_json::from_str(&entries_json).map_err(|e| bad(format!("解析条目失败：{e}")))?;
-    let store = memory_store(hashes, blobs)?;
+    let store = spool_store(&spool_dir)?;
     let files = parse_entries(&entries)?;
     let rules = parse_sparse_rules(&rules_json)?;
     // 检出是唯一允许「目录不存在就新建」的入口。
@@ -278,7 +339,7 @@ pub fn wc_checkout(
 
 /// 调整稀疏规则：补拉新路径、移除不再需要的路径。
 ///
-/// `entriesJson` / `hashes` / `blobs` 是**新增前缀**下的文件与内容，可以为空；
+/// `entriesJson` 与 `spoolDir` 是**新增前缀**下的文件与内容（内容可为空）；
 /// 有本地改动挡路时 core 会直接报错，一个文件都不会删。
 #[napi]
 pub fn wc_apply_sparse_rules(
@@ -286,13 +347,12 @@ pub fn wc_apply_sparse_rules(
     rules_json: String,
     rev: u32,
     entries_json: String,
-    hashes: Vec<String>,
-    blobs: Vec<Buffer>,
+    spool_dir: String,
 ) -> napi::Result<String> {
     let rules = parse_sparse_rules(&rules_json)?;
     let entries: Vec<EntryIn> =
         serde_json::from_str(&entries_json).map_err(|e| bad(format!("解析条目失败：{e}")))?;
-    let store = memory_store(hashes, blobs)?;
+    let store = spool_store(&spool_dir)?;
     let files = parse_entries(&entries)?;
     // 调整规则必须作用在已存在的工作副本上，绝不在空目录里凭空建一份。
     let mut wc = open_existing(&dir)?;
@@ -360,7 +420,7 @@ pub fn wc_diff(dir: String) -> napi::Result<String> {
 pub fn wc_mark_committed(dir: String, rev: u32, changes_json: String) -> napi::Result<()> {
     let incoming: Vec<ChangeIn> =
         serde_json::from_str(&changes_json).map_err(|e| bad(format!("解析变更失败：{e}")))?;
-    let store = MemoryObjectStore::new();
+    let mut paths: HashMap<String, PathBuf> = HashMap::new();
     let mut changes = Vec::with_capacity(incoming.len());
     for change in &incoming {
         let kind = parse_change_kind(&change.kind)?;
@@ -369,10 +429,11 @@ pub fn wc_mark_committed(dir: String, rev: u32, changes_json: String) -> napi::R
             None => None,
         };
         if let Some(hash) = hash {
-            // 读不到就跳过基线缓存：缺 pristine 只影响离线 diff 的显示，
-            // 不影响已提交结果的正确性（服务端早已有这份内容）。
-            if let Ok(data) = std::fs::read(Path::new(&dir).join(&change.path)) {
-                store.put(&hash, &data).map_err(to_napi)?;
+            // 内容从工作目录流式读，不整份进内存；读不到就跳过基线缓存——缺 pristine
+            // 只影响离线 diff 的显示，不影响已提交结果的正确性（服务端早已有这份内容）。
+            let path = Path::new(&dir).join(&change.path);
+            if path.is_file() {
+                paths.insert(to_hex(&hash), path);
             }
         }
         changes.push(vcs_core::LocalChange {
@@ -383,6 +444,7 @@ pub fn wc_mark_committed(dir: String, rev: u32, changes_json: String) -> napi::R
             size: change.size,
         });
     }
+    let store = WorkingDirectoryStore { paths };
     let mut wc = open_existing(&dir)?;
     wc.mark_committed(rev as u64, &changes, &store)
         .map_err(to_napi)?;
@@ -396,12 +458,11 @@ pub fn wc_apply_update(
     repo_id: String,
     target_rev: u32,
     changes_json: String,
-    hashes: Vec<String>,
-    blobs: Vec<Buffer>,
+    spool_dir: String,
 ) -> napi::Result<String> {
     let incoming: Vec<ChangeIn> =
         serde_json::from_str(&changes_json).map_err(|e| bad(format!("解析变更失败：{e}")))?;
-    let store = memory_store(hashes, blobs)?;
+    let store = spool_store(&spool_dir)?;
     let mut remote = Vec::with_capacity(incoming.len());
     for change in &incoming {
         remote.push(RemoteChange {
@@ -474,10 +535,19 @@ pub struct ConflictDetail {
     pub theirs: Option<Buffer>,
 }
 
+/// 三方合并窗口只处理「人能看懂」的内容：超过这个体积就不往 JS 里搬了。
+///
+/// 冲突编辑器本来就没法编辑一个几 GB 的文件，读进来只会把主进程撑爆；
+/// 返回 None 时界面显示「（内容过大，请用外部工具合并）」。
+const CONFLICT_CONTENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
 fn pristine_or_none(wc: &WorkingCopy, hash: Option<Hash>) -> Option<Buffer> {
     // 读不到就返回 None：三栏里显示「（无此版本）」比整块报错有用。
-    hash.and_then(|hash| wc.read_pristine(&hash).ok())
-        .map(Buffer::from)
+    let hash = hash?;
+    if wc.pristine_size(&hash).unwrap_or(0) > CONFLICT_CONTENT_MAX_BYTES {
+        return None;
+    }
+    wc.read_pristine(&hash).ok().map(Buffer::from)
 }
 
 #[napi]
@@ -487,9 +557,14 @@ pub fn wc_conflict_detail(dir: String, path: String) -> napi::Result<ConflictDet
         .conflict_record(&path)
         .map_err(to_napi)?
         .ok_or_else(|| bad(format!("{path} 没有未解决的冲突")))?;
-    let mine = std::fs::read(Path::new(&dir).join(&path))
-        .ok()
-        .map(Buffer::from);
+    let mine_path = Path::new(&dir).join(&path);
+    let mine = if std::fs::metadata(&mine_path).map(|m| m.len()).unwrap_or(0)
+        > CONFLICT_CONTENT_MAX_BYTES
+    {
+        None
+    } else {
+        std::fs::read(&mine_path).ok().map(Buffer::from)
+    };
     Ok(ConflictDetail {
         path: record.path,
         kind: record.kind,

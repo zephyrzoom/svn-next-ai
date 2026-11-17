@@ -87,13 +87,13 @@ export interface UpdateOutcome {
 interface NativeBinding {
   hashBytesHex(data: Buffer): string;
   wcInfo(dir: string): string;
+  hashFileHex(path: string): string;
   wcCheckout(
     dir: string,
     repoId: string,
     rev: number,
     entriesJson: string,
-    hashes: string[],
-    blobs: Buffer[],
+    spoolDir: string,
     rulesJson: string,
   ): number;
   wcApplySparseRules(
@@ -101,8 +101,7 @@ interface NativeBinding {
     rulesJson: string,
     rev: number,
     entriesJson: string,
-    hashes: string[],
-    blobs: Buffer[],
+    spoolDir: string,
   ): string;
   wcStatus(dir: string): string;
   wcDiff(dir: string): string;
@@ -113,8 +112,7 @@ interface NativeBinding {
     repoId: string,
     targetRev: number,
     changesJson: string,
-    hashes: string[],
-    blobs: Buffer[],
+    spoolDir: string,
   ): string;
   wcAdvanceBase(dir: string, rev: number): number;
   wcRevert(dir: string, pathsJson: string): number;
@@ -168,6 +166,16 @@ export function hashBytes(data: Buffer): string {
   return native.hashBytesHex(data);
 }
 
+/**
+ * 流式算文件摘要与字节数（原生侧边读边算）。
+ *
+ * 提交前的「扫描之后有没有再改过」校验用它：不需要把文件读进 JS 内存，
+ * 几个 GB 的文件也一样。
+ */
+export function hashFile(path: string): { hash: string; size: number } {
+  return JSON.parse(native.hashFileHex(path)) as { hash: string; size: number };
+}
+
 /** 工作副本归属与基线版本。 */
 export function openInfo(dir: string): WorkingCopyInfo {
   return JSON.parse(native.wcInfo(dir)) as WorkingCopyInfo;
@@ -176,33 +184,23 @@ export function openInfo(dir: string): WorkingCopyInfo {
 /**
  * 检出：把服务端的 (路径 → 内容哈希) 与对象内容铺到磁盘，并写 pristine 基线。
  *
- * `contents` 以哈希为键，正是 Checkout 流回来的形态；同一份内容被多路径引用时只落一份基线。
+ * 内容来自 `spoolDir`（CAS 布局的下载暂存目录），native 侧流式读——内存与仓库大小无关。
+ * 同一份内容被多路径引用时只落一份基线。
  */
 export function checkout(
   dir: string,
   repoId: string,
   rev: number,
   entries: CheckoutEntry[],
-  contents: Map<string, Buffer>,
+  spoolDir: string,
   rules: string[] = [],
 ): number {
-  const hashes: string[] = [];
-  const blobs: Buffer[] = [];
-  for (const entry of entries) {
-    const data = contents.get(entry.hash);
-    if (!data) {
-      throw new Error(`缺少对象 ${entry.hash}（${entry.path}），检出中断`);
-    }
-    hashes.push(entry.hash);
-    blobs.push(data);
-  }
   return native.wcCheckout(
     dir,
     repoId,
     rev,
     JSON.stringify(entries),
-    hashes,
-    blobs,
+    spoolDir,
     JSON.stringify(rules),
   );
 }
@@ -216,25 +214,14 @@ export function applySparseRules(
   rules: string[],
   rev: number,
   entries: CheckoutEntry[],
-  contents: Map<string, Buffer>,
+  spoolDir: string,
 ): SparseOutcome {
-  const hashes: string[] = [];
-  const blobs: Buffer[] = [];
-  for (const entry of entries) {
-    const data = contents.get(entry.hash);
-    if (!data) {
-      throw new Error(`缺少对象 ${entry.hash}（${entry.path}），调整稀疏规则中断`);
-    }
-    hashes.push(entry.hash);
-    blobs.push(data);
-  }
   const raw = native.wcApplySparseRules(
     dir,
     JSON.stringify(rules),
     rev,
     JSON.stringify(entries),
-    hashes,
-    blobs,
+    spoolDir,
   );
   return JSON.parse(raw) as SparseOutcome;
 }
@@ -265,28 +252,10 @@ export function applyUpdate(
   repoId: string,
   targetRev: number,
   changes: LocalChange[],
-  contents: Map<string, Buffer>,
+  spoolDir: string,
 ): UpdateOutcome {
-  // 只为真正需要的对象准备内容：删除类变更没有 hash。
-  const hashes: string[] = [];
-  const blobs: Buffer[] = [];
-  for (const change of changes) {
-    if (!change.hash) continue;
-    const data = contents.get(change.hash);
-    if (!data) {
-      throw new Error(`缺少对象 ${change.hash}（${change.path}），更新中断`);
-    }
-    hashes.push(change.hash);
-    blobs.push(data);
-  }
-  const raw = native.wcApplyUpdate(
-    dir,
-    repoId,
-    targetRev,
-    JSON.stringify(changes),
-    hashes,
-    blobs,
-  );
+  // 内容已由调用方下载到 spool 目录，这里只给路径：native 流式读。
+  const raw = native.wcApplyUpdate(dir, repoId, targetRev, JSON.stringify(changes), spoolDir);
   const parsed = JSON.parse(raw) as {
     rev: number;
     updated: number;
