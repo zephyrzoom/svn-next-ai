@@ -112,6 +112,10 @@ async function main() {
       check(res.status === 200, `${route} 返回 ${res.status}`);
       check((await res.text()).includes(needle), `${route} 内容缺失`);
     }
+    const html = await (await fetch(`${base}/`)).text();
+    check(!html.includes('refresh-space'), '空间治理不应再有「加载」按钮');
+    const js = await (await fetch(`${base}/app.js`)).text();
+    check(js.includes('space: loadSpace'), '空间治理应随切换自动加载');
     let res = await api(base, '/api/overview');
     check(res.status === 401, `未登录应返回 401，实际 ${res.status}`);
     res = await api(base, '/api/login', { method: 'POST', body: { username: 'alice', password: 'wrong' } });

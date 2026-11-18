@@ -1725,6 +1725,7 @@ checkout → Rust 工具链 + 缓存 → Node 22 + npm 缓存
 - **仓库级治理用 `Session::system()`**。成员门的设计是「全局 admin 也不能绕过」，但管理后台必须能治理任意仓库。做法是：中间件先完成管理员鉴权，再克隆会话、把 `kind` 标成 `System`（user_id 保留，审计仍是真人）。`ServerStore` 的成员管理三处与 `list_members` 增加 system 例外；桌面端 / gRPC 客户端拿不到 system 身份，成员门不变。
 - **状态 / 角色变更递增 `token_version`**，停用或降级的账号已签发 JWT 立即失效；禁止停用自己、禁止动最后一个可用管理员。
 - 存储调用一律走 `spawn_blocking` 并在闭包内取锁，避免阻塞 tokio worker；注意 `std::sync::Mutex` 不可重入，不在 `match` 表达式里直接持有 guard。
+- **切页即加载**。`setView()` 按视图分派 loader，导航只切换 class + 请求数据；空间治理页因此不再单独放「加载」按钮（2026-11-18 去掉），仓库下拉的 `change` 也直接触发重载，只有表单提交 / 清理 / GC 这类动作后由代码显式 `loadSpace()` 刷新。
 
 ### 34.3 桌面端：菜单式布局
 

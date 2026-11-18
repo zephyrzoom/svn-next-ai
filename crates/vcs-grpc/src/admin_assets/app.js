@@ -674,7 +674,10 @@ async function loadSpace() {
   $('space-result').textContent = '';
 }
 
-$('space-repo').addEventListener('change', () => { selectedRepo = $('space-repo').value; });
+$('space-repo').addEventListener('change', () => {
+  selectedRepo = $('space-repo').value;
+  void act(loadSpace);
+});
 
 $('estimate-purge').addEventListener('click', () => {
   void act(async () => {
@@ -773,7 +776,6 @@ async function retention(dryRun) {
 
 $('preview-retention').addEventListener('click', () => void act(() => retention(true)));
 $('apply-retention').addEventListener('click', () => void act(() => retention(false)));
-$('refresh-space').addEventListener('click', () => void act(loadSpace));
 
 /* ---------------- 启动 ---------------- */
 
