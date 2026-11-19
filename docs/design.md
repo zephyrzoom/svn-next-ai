@@ -336,7 +336,7 @@ LDAP 首次登录成功 ──────────────────�
 | --- | --- | --- |
 | 提交扩容 | 仓库 + 可选说明 | 服务端读当前生效上限，按 `REPO_QUOTA_EXPANSION_STEP_BYTES`（10 GiB）算出目标值，写 `repo_quota_requests` |
 | 审批通过 | 仅审批意见 | 单事务内 `repos.quota_bytes = 当前生效值 + 10 GiB`、更新申请、写审计 |
-| 审批驳回 | 原因（必填） | 申请置 `REJECTED`，配额不变 |
+| 审批驳回 | 原因（可选） | 申请置 `REJECTED`，配额不变；没填原因 `decision_note` 落 NULL |
 
 - **成员门**：只有仓库拥有者（`owner`）能提交扩容申请；只读 / 读写成员只能查看容量（生效上限、已用量与来源），不能申请扩容。同一仓库同时只允许一条 `PENDING` 申请，避免连点两下抬两档。
 - **过期**：与建库申请同一套惰性过期机制（7 天 TTL），`PENDING` 到期自动置 `EXPIRED`。
@@ -605,7 +605,7 @@ vcs --store /srv/vcs import reports ./src -m "初始导入"  # 本地直连的�
 | `get` / `update` / `test` LDAP 配置 RPC | `GetLdapConfig` / `UpdateLdapConfig` / `TestLdapConnection` | 仅管理员；桌面端「目录设置」走这三个接口 |
 | `vcs register-list` | `ListRegistrations` | **M3**：管理员查看申请（可按状态过滤） |
 | `vcs register-approve` | `ApproveRegistration` | **M3**：通过审批并激活账号（密码由申请人注册时设置） |
-| `vcs register-reject` | `RejectRegistration` | **M3**：驳回，必须写原因 |
+| `vcs register-reject` | `RejectRegistration` | **M3**：驳回，原因可选 |
 | `vcs repo-request` / `repo-request-list` | `RequestRepo` / `ListRepoCreations` | **M3**：任何 ACTIVE 用户可申请建库；容量固定 10 GiB，普通用户只看自己的申请 |
 | `vcs repo-approve` / `repo-reject` | `ApproveRepoCreation` / `RejectRepoCreation` | **M3**：管理员只决定同意或拒绝，单事务建库 + owner + r0 |
 | `vcs repo-expand` / `repo-expand-list` | `RequestRepoExpansion` / `ListRepoQuotaRequests` | **M3**：固定 +10 GiB，仅成员可申请；列表带数据盘可用空间 |
@@ -747,7 +747,7 @@ CLI 先行、GUI 后置，目的是先用最低成本验证版本语义是否正
 
 | 决策 | 结论与理由 |
 | --- | --- |
-| 新增错误码 `INVALID_ARGUMENT = 36` | 「驳回必须写原因」「scope 不在白名单」「过期时间早于现在」都是入参问题。复用 `INVALID_SESSION` 会让客户端误判成登录态失效并跳去重新登录，把用户带进死循环。 |
+| 新增错误码 `INVALID_ARGUMENT = 36` | 「scope 不在白名单」「过期时间早于现在」都是入参问题。复用 `INVALID_SESSION` 会让客户端误判成登录态失效并跳去重新登录，把用户带进死循环。 |
 | 注册与账号在同一事务里创建 | `users(status='pending')` + `registration_requests(pending)` 必须一起出现，否则会出现「有申请无账号」或「有账号无申请」，审批时无从下手。 |
 | 用户名冲突分三种提示 | 已被本地账号占用 / 属于 LDAP 账号 / 已有待审批申请。笼统的「已存在」会让用户反复重试或以为系统坏了。 |
 | 审批通过时也递增 `token_version` | 与禁用账号同一机制：即便此前有人拿到过该账号的任何凭证，审批动作本身就把它们全部作废。 |

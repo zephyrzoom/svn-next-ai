@@ -267,7 +267,7 @@ async function loadApprovals() {
         <div class="meta">申请人 ${esc(r.requester_user_id)} · 默认容量 ${esc(humanBytes(r.requested_quota_bytes))} · ${esc(fmtTime(r.submitted_at))}<br />理由：${esc(r.reason || '—')}</div>
       </div>
       <div class="actions">
-        <input data-field="note" placeholder="审批意见" />
+        <input data-field="note" placeholder="审批意见（可选）" />
         <button class="mini primary" data-action="approve-req">通过</button>
         <button class="mini danger" data-action="reject-req">拒绝</button>
       </div>
@@ -284,7 +284,7 @@ async function loadApprovals() {
         <div class="meta">申请人 ${esc(r.requester_user_id)} · 上限 ${esc(humanBytes(r.quota_before_bytes))} → ${esc(humanBytes(r.target_quota_bytes))}（+${esc(humanBytes(r.increment_bytes))}） · ${esc(fmtTime(r.submitted_at))}<br />说明：${esc(r.reason || '—')}</div>
       </div>
       <div class="actions">
-        <input data-field="note" placeholder="审批意见" />
+        <input data-field="note" placeholder="审批意见（可选）" />
         <button class="mini primary" data-action="approve-expansion">通过</button>
         <button class="mini danger" data-action="reject-expansion">拒绝</button>
       </div>
@@ -294,6 +294,12 @@ async function loadApprovals() {
 function field(row, name) {
   const node = row.querySelector(`[data-field="${name}"]`);
   return node ? node.value.trim() : '';
+}
+
+/// 拒绝请求体：审批意见框有内容才带 reason（没有该输入框的卡片返回空体）。
+function rejectBody(row) {
+  const note = field(row, 'note');
+  return note ? { reason: note } : {};
 }
 
 $('reg-list').addEventListener('click', (event) => {
@@ -306,9 +312,8 @@ $('reg-list').addEventListener('click', (event) => {
       await post(`/registrations/${encodeURIComponent(id)}/approve`, {});
       toast('已通过，申请人成为普通用户，可直接用注册时设置的密码登录');
     } else {
-      const reason = window.prompt('拒绝原因（必填）', '');
-      if (!reason) return;
-      await post(`/registrations/${encodeURIComponent(id)}/reject`, { reason });
+      // 拒绝不强制填原因：审批意见框填了就带上，空着就只标记拒绝。
+      await post(`/registrations/${encodeURIComponent(id)}/reject`, rejectBody(row));
       toast('已拒绝该申请');
     }
     await loadApprovals();
@@ -327,9 +332,7 @@ $('req-list').addEventListener('click', (event) => {
       });
       toast('建库申请已通过，仓库已按 10 GiB 初始容量创建');
     } else {
-      const reason = window.prompt('拒绝原因（必填）', '');
-      if (!reason) return;
-      await post(`/repo-requests/${encodeURIComponent(id)}/reject`, { reason });
+      await post(`/repo-requests/${encodeURIComponent(id)}/reject`, rejectBody(row));
       toast('已拒绝该申请');
     }
     await loadApprovals();
@@ -348,9 +351,7 @@ $('expansion-list').addEventListener('click', (event) => {
       });
       toast('扩容申请已通过，仓库上限已增加 10 GiB');
     } else {
-      const reason = window.prompt('拒绝原因（必填）', '');
-      if (!reason) return;
-      await post(`/repo-expansions/${encodeURIComponent(id)}/reject`, { reason });
+      await post(`/repo-expansions/${encodeURIComponent(id)}/reject`, rejectBody(row));
       toast('已拒绝该扩容申请');
     }
     await loadApprovals();

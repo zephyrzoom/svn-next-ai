@@ -3203,7 +3203,7 @@ impl ServerStore {
         Ok(ApprovedRegistration { user_id })
     }
 
-    /// 拒绝申请必须写原因：用户需要知道为什么被拒，否则只会反复重试。
+    /// 拒绝申请：原因可选，留空就直接驳回（管理端一键拒绝不必额外填写）。
     pub fn reject_registration(
         &self,
         actor: &Session,
@@ -3212,8 +3212,11 @@ impl ServerStore {
     ) -> Result<()> {
         self.require_admin(actor, "驳回注册申请")?;
         let reason = reason.trim();
-        if reason.is_empty() {
-            return Err(Error::new(ErrorCode::InvalidArgument, "驳回必须填写原因"));
+        if reason.chars().count() > 200 {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "驳回说明不超过 200 个字符",
+            ));
         }
         self.expire_stale_requests()?;
         let (username, state) = self.load_registration(request_id)?;
@@ -3237,7 +3240,7 @@ impl ServerStore {
             "UPDATE registration_requests
              SET status = 'rejected', decided_at = ?2, decided_by = ?3, decision_note = ?4
              WHERE request_id = ?1",
-            params![request_id, now, actor.user_id, reason],
+            params![request_id, now, actor.user_id, opt_note(reason)],
         )
         .map_err(db("更新注册申请失败"))?;
         write_audit(
@@ -3246,7 +3249,7 @@ impl ServerStore {
             &actor.user_id,
             "user.reject",
             &username,
-            Some(&format!("{{\"reason\":\"{}\"}}", json_escape(reason))),
+            Some(&note_detail(reason)),
             now,
         )?;
         tx.commit().map_err(db("提交驳回事务失败"))?;
@@ -3553,8 +3556,11 @@ impl ServerStore {
     ) -> Result<()> {
         self.require_admin(actor, "驳回仓库申请")?;
         let reason = reason.trim();
-        if reason.is_empty() {
-            return Err(Error::new(ErrorCode::InvalidArgument, "驳回必须填写原因"));
+        if reason.chars().count() > 200 {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "驳回说明不超过 200 个字符",
+            ));
         }
         self.expire_stale_requests()?;
         let state: String = self
@@ -3582,7 +3588,7 @@ impl ServerStore {
             "UPDATE repo_creation_requests
              SET status = 'rejected', decided_at = ?2, decided_by = ?3, decision_note = ?4
              WHERE request_id = ?1",
-            params![request_id, now, actor.user_id, reason],
+            params![request_id, now, actor.user_id, opt_note(reason)],
         )
         .map_err(db("更新仓库申请失败"))?;
         write_audit(
@@ -3591,7 +3597,7 @@ impl ServerStore {
             &actor.user_id,
             "repo.reject",
             request_id,
-            Some(&format!("{{\"reason\":\"{}\"}}", json_escape(reason))),
+            Some(&note_detail(reason)),
             now,
         )?;
         tx.commit().map_err(db("提交驳回事务失败"))?;
@@ -3883,8 +3889,11 @@ impl ServerStore {
     ) -> Result<()> {
         self.require_admin(actor, "驳回扩容申请")?;
         let reason = reason.trim();
-        if reason.is_empty() {
-            return Err(Error::new(ErrorCode::InvalidArgument, "驳回必须填写原因"));
+        if reason.chars().count() > 200 {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "驳回说明不超过 200 个字符",
+            ));
         }
         self.expire_stale_requests()?;
         let (repo_id, state): (String, String) = self
@@ -3912,7 +3921,7 @@ impl ServerStore {
             "UPDATE repo_quota_requests
              SET status = 'rejected', decided_at = ?2, decided_by = ?3, decision_note = ?4
              WHERE request_id = ?1",
-            params![request_id, now, actor.user_id, reason],
+            params![request_id, now, actor.user_id, opt_note(reason)],
         )
         .map_err(db("更新扩容申请失败"))?;
         write_audit(
@@ -3921,7 +3930,7 @@ impl ServerStore {
             &actor.user_id,
             "repo.expand.reject",
             request_id,
-            Some(&format!("{{\"reason\":\"{}\"}}", json_escape(reason))),
+            Some(&note_detail(reason)),
             now,
         )?;
         tx.commit().map_err(db("提交驳回事务失败"))?;
@@ -5657,6 +5666,24 @@ fn index_object(
     )
     .map_err(db("写入对象索引失败"))?;
     Ok(if inserted > 0 { stored } else { 0 })
+}
+
+/// 驳回归档用的 `decision_note`：原因为空时落 NULL，读出来就是「未填写」。
+fn opt_note(reason: &str) -> Option<&str> {
+    if reason.is_empty() {
+        None
+    } else {
+        Some(reason)
+    }
+}
+
+/// 驳回审计里的 detail：没写原因就只记一个空对象，不伪造字段。
+fn note_detail(reason: &str) -> String {
+    if reason.is_empty() {
+        "{}".to_string()
+    } else {
+        format!("{{\"reason\":\"{}\"}}", json_escape(reason))
+    }
 }
 
 fn write_audit(

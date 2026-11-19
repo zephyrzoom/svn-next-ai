@@ -1019,14 +1019,17 @@ fn registration_rejects_duplicates_and_empty_reasons() {
     assert_eq!(err.code, ErrorCode::RegistrationExists);
 
     let reg = store.register("carol", "王佳", PASSWORD, "申请").unwrap();
-    let err = store
-        .reject_registration(&alice, &reg.info.request_id, "   ")
-        .unwrap_err();
-    assert_eq!(err.code, ErrorCode::InvalidArgument, "驳回必须写原因");
-
+    // 原因可以留空：管理端一键拒绝不再强制填写说明。
     store
-        .reject_registration(&alice, &reg.info.request_id, "用途不明确")
+        .reject_registration(&alice, &reg.info.request_id, "   ")
         .unwrap();
+    let rejected = store
+        .list_registrations(&alice, None, 10)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.request_id == reg.info.request_id)
+        .expect("驳回后的申请仍在列表里");
+    assert_eq!(rejected.decision_note, None, "没填原因就不该写说明");
     let err = store.login("carol", PASSWORD).unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidCredentials);
     // 已处理的申请不能重复处理。
@@ -1229,14 +1232,12 @@ fn repo_request_rejects_duplicates_and_limits_visibility() {
     let all = store.list_repo_requests(&alice, None, 10).unwrap();
     assert_eq!(all.len(), 1);
 
-    // 驳回必须写原因；驳回后状态是 rejected 且仍然没有仓库。
-    let err = store
-        .reject_repo_request(&alice, &req.request_id, "")
-        .unwrap_err();
-    assert_eq!(err.code, ErrorCode::InvalidArgument);
+    // 原因可留空：驳回后状态是 rejected 且仍然没有仓库。
     store
-        .reject_repo_request(&alice, &req.request_id, "暂不开放个人仓库")
+        .reject_repo_request(&alice, &req.request_id, "")
         .unwrap();
+    let rejected = store.list_repo_requests(&alice, None, 10).unwrap();
+    assert_eq!(rejected[0].decision_note, None);
     assert!(store.find_repo("grace-repo").is_err());
 
     // 已占用名字不能再申请。

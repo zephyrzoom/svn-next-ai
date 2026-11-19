@@ -116,6 +116,9 @@ async function main() {
     check(!html.includes('refresh-space'), '空间治理不应再有「加载」按钮');
     const js = await (await fetch(`${base}/app.js`)).text();
     check(js.includes('space: loadSpace'), '空间治理应随切换自动加载');
+    // 审批拒绝不强制填原因：点「拒绝」就提交，审批意见框有内容才带上。
+    check(!js.includes('拒绝原因（必填）'), '拒绝不应再弹「拒绝原因（必填）」');
+    check(js.includes('rejectBody'), '拒绝应复用可选审批意见');
     let res = await api(base, '/api/overview');
     check(res.status === 401, `未登录应返回 401，实际 ${res.status}`);
     res = await api(base, '/api/login', { method: 'POST', body: { username: 'alice', password: 'wrong' } });

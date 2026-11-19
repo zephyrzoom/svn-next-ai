@@ -642,6 +642,7 @@ message ApproveRegistrationResponse {
 
 message RejectRegistrationRequest {
   string request_id = 1;
+  // 可选：留空表示直接驳回，不回传原因。
   string reason = 2;
 }
 
@@ -872,6 +873,7 @@ message ApproveRepoCreationResponse {
 
 message RejectRepoCreationRequest {
   string request_id = 1;
+  // 可选：留空表示直接驳回，不回传原因。
   string reason = 2;
 }
 
@@ -933,6 +935,7 @@ message ApproveRepoQuotaRequestResponse {
 
 message RejectRepoQuotaRequestRequest {
   string request_id = 1;
+  // 可选：留空表示直接驳回，不回传原因。
   string reason = 2;
 }
 

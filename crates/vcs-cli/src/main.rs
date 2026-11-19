@@ -298,10 +298,10 @@ enum Cmd {
     },
     /// 审批通过注册申请（仅管理员；只放行，通过即普通用户，申请人用注册时的密码登录）
     RegisterApprove { request_id: String },
-    /// 驳回注册申请（仅管理员，必须写原因）
+    /// 驳回注册申请（仅管理员，原因可选）
     RegisterReject {
         request_id: String,
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         reason: String,
     },
     /// 查看目录服务配置（不回显 bind 密码）
@@ -359,10 +359,10 @@ enum Cmd {
         #[arg(long, default_value = "")]
         note: String,
     },
-    /// 驳回仓库申请（仅管理员，必须写原因）
+    /// 驳回仓库申请（仅管理员，原因可选）
     RepoReject {
         request_id: String,
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         reason: String,
     },
     /// 申请扩容（仅仓库拥有者；一次固定 +10 GiB，容量无需填写）
@@ -384,10 +384,10 @@ enum Cmd {
         #[arg(long, default_value = "")]
         note: String,
     },
-    /// 驳回扩容申请（仅管理员，必须写原因）
+    /// 驳回扩容申请（仅管理员，原因可选）
     RepoExpandReject {
         request_id: String,
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         reason: String,
     },
     /// 创建访问令牌（明文只显示一次）
