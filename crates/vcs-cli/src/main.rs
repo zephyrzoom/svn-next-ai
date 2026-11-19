@@ -966,7 +966,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 usage.logical_bytes
             );
             println!(
-                "对象池占用 : {} 字节（{} 个对象，全库共享）",
+                "仓库占用   : {} 字节（{} 个对象，含历史版本，按仓库独立计量）",
                 usage.used_bytes, usage.object_count
             );
             println!(

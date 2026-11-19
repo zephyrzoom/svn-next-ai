@@ -19,7 +19,7 @@
 //!   - 配额只有一条上限，解析复用 `vcs-core::resolve_effective_quota`，不重复实现；
 //!   - 每次提交用同一事务分配 rev，`head_rev` 乐观并发。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -466,6 +466,12 @@ pub struct ServerStore {
     signer: TokenSigner,
     /// 与 JWT 同源的主机密钥，另用于加密 LDAP bind 密码（域分隔见 auth::seal_secret）。
     secret: Vec<u8>,
+    /// 每仓库占用的缓存：`repo_id → (head_rev, used_bytes, object_count)`。
+    ///
+    /// 共享 CAS 里对象没有归属字段，按仓库统计只能从版本根往下遍历，代价随历史线性增长；
+    /// 对象内容不可变，只有「新区提交（head_rev 变）/ GC 物理删除」才会改变结果，
+    /// 所以用 head_rev 当版本号就够，GC 清扫完再整表清空（见 `run_gc_job`）。
+    usage_cache: std::sync::Mutex<BTreeMap<String, (i64, u64, u64)>>,
 }
 
 impl ServerStore {
@@ -496,6 +502,7 @@ impl ServerStore {
             objects,
             signer,
             secret,
+            usage_cache: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -2479,14 +2486,11 @@ impl ServerStore {
         let flat = tree::flatten_tree(&self.objects, &root)?;
         let logical_bytes: u64 = flat.iter().map(|e| e.size).sum();
 
-        // 共享 CAS 下这是「全库对象池」的实际内容字节：同一份内容被多个仓库共享时只算一次，
-        // 也正是磁盘上真正被吃掉的空间。按仓库切分的 unique_bytes 需要 GC 标记阶段的
-        // 反向引用集合（M2），这里不假装能算准。
-        //
-        // 直接读对象目录而不是 SUM(objects.stored_size)：索引表可能因为历史原因缺行，
-        // 但磁盘上的字节数永远是事实。
-        let object_count = self.objects.list_hashes()?.len() as u64;
-        let used_bytes = self.objects.total_stored_bytes()?;
+        // 配额是每个仓库独立的账：只能统计「本仓库历史版本可达的对象」，
+        // 拿全库对象池的字节数冒充会把同一个账号下所有仓库的用量绑在一起
+        // （A 仓库写满 6 GiB 后，B 仓库一建出来就显示已用 6 GiB、还可能直接被闸门拒掉）。
+        // 跨仓库共享的对象按「本仓库引用即计入」：去重是磁盘优化，不是配额优惠。
+        let (used_bytes, object_count) = self.repo_stored_usage(repo_id, head_rev)?;
 
         Ok(UsageInfo {
             logical_bytes,
@@ -2495,6 +2499,119 @@ impl ServerStore {
             quota: self.effective_quota(repo_id)?,
             file_count: flat.len() as u64,
         })
+    }
+
+    /// 单仓库占用的实际计算（带缓存）：该仓库**所有版本**可达对象（树 + 文件）去重后的字节和。
+    ///
+    /// 为什么遍历全部版本而不是只看 HEAD：删掉一个大目录后历史仍然占着盘，
+    /// 只算 HEAD 会让配额变成可以反复「删了再传」的橡皮筋；历史里的内容在
+    /// `Purge` + GC 真正回收后才不计入。
+    fn repo_stored_usage(&self, repo_id: &str, head_rev: i64) -> Result<(u64, u64)> {
+        if let Some((cached_rev, used, count)) = self
+            .usage_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(repo_id).copied())
+        {
+            if cached_rev == head_rev {
+                return Ok((used, count));
+            }
+        }
+
+        let roots: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT DISTINCT root_tree FROM revisions WHERE repo_id = ?1")
+                .map_err(db("读取版本失败"))?;
+            let rows = stmt
+                .query_map(params![repo_id], |r| r.get::<_, String>(0))
+                .map_err(db("读取版本失败"))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(db("读取版本失败"))?);
+            }
+            out
+        };
+
+        let mut hashes: BTreeSet<Hash> = BTreeSet::new();
+        let mut seen_trees: BTreeSet<Hash> = BTreeSet::new();
+        for hex in roots {
+            let root = vcs_core::from_hex(&hex)?;
+            self.collect_reachable(&root, &mut seen_trees, &mut hashes)?;
+        }
+
+        let used_bytes = self.sum_stored_bytes(&hashes)?;
+        let object_count = hashes.len() as u64;
+        if let Ok(mut cache) = self.usage_cache.lock() {
+            cache.insert(repo_id.to_string(), (head_rev, used_bytes, object_count));
+        }
+        Ok((used_bytes, object_count))
+    }
+
+    /// 从一棵树开始收集可达对象：树按哈希去重（内容相同的目录只走一遍），
+    /// 规模与「历史目录节点数」同阶，而不是「提交数 × 文件数」。
+    fn collect_reachable(
+        &self,
+        tree_hash: &Hash,
+        seen_trees: &mut BTreeSet<Hash>,
+        out: &mut BTreeSet<Hash>,
+    ) -> Result<()> {
+        if !seen_trees.insert(*tree_hash) {
+            return Ok(());
+        }
+        out.insert(*tree_hash);
+        let entries = match tree::read_tree(&self.objects, tree_hash) {
+            Ok(entries) => entries,
+            // 历史残留（树对象被手工删掉）：跳过这一支，不能让整个容量面板报错。
+            Err(err) if err.code == ErrorCode::ObjectMissing => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        for entry in entries {
+            out.insert(entry.hash);
+            if entry.kind == EntryKind::Dir {
+                self.collect_reachable(&entry.hash, seen_trees, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 一组对象的磁盘占用之和。
+    ///
+    /// 优先读索引表（一次 IN 查询，避免逐对象 stat），缺行时回落到磁盘实测——
+    /// 历史库的 `objects` 表可能不完整，但磁盘上的字节数永远是事实。
+    fn sum_stored_bytes(&self, hashes: &BTreeSet<Hash>) -> Result<u64> {
+        const CHUNK: usize = 400;
+        let hexes: Vec<String> = hashes.iter().map(to_hex).collect();
+        let mut total = 0u64;
+        for chunk in hexes.chunks(CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql =
+                format!("SELECT hash, stored_size FROM objects WHERE hash IN ({placeholders})");
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(db("读取对象索引失败"))?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })
+                .map_err(db("读取对象索引失败"))?;
+            let mut found: BTreeSet<String> = BTreeSet::new();
+            for row in rows {
+                let (hex, stored) = row.map_err(db("读取对象索引失败"))?;
+                found.insert(hex);
+                total = total.saturating_add(stored.max(0) as u64);
+            }
+            for hex in chunk {
+                if found.contains(hex) {
+                    continue;
+                }
+                if let Ok(hash) = vcs_core::from_hex(hex) {
+                    total = total.saturating_add(self.objects.stored_size(&hash).unwrap_or(0));
+                }
+            }
+        }
+        Ok(total)
     }
 
     // ---------------- 用户体系：自助注册、审批、PAT ----------------
@@ -5401,6 +5518,12 @@ impl ServerStore {
                 params![job_id, swept as i64, reclaimed as i64, now_secs()],
             )
             .map_err(db("更新 GC 任务失败"))?;
+
+        // 本轮真正删掉了对象，但 head_rev 不一定变（宽限期到点的清理由 GC 转正）：
+        // 按仓库占用的缓存必须整表作废，否则容量面板会继续显示已回收的字节。
+        if let Ok(mut cache) = self.usage_cache.lock() {
+            cache.clear();
+        }
 
         self.gc_status_raw(job_id)
     }

@@ -591,7 +591,7 @@ vcs --store /srv/vcs import reports ./src -m "初始导入"  # 本地直连的�
 | `vcs log` | `GetLog` | 含每版本变更清单 |
 | `vcs status` / `diff` | 无（纯本地） | 完全离线，不访问服务端 |
 | `vcs cat` | `GetFile` | 输出指定版本文件内容；内容已裁剪时返回 `CONTENT_PURGED` |
-| `vcs info` | `GetQuota` | 文件数、逻辑大小、对象池占用、生效配额与来源 |
+| `vcs info` | `GetQuota` | 文件数、逻辑大小、**本仓库**占用（含历史、跨仓库不共享计量，见 §43）、生效配额与来源 |
 | `vcs estimate` | `EstimatePurge` | **M2**：dry-run，给出可释放 / 共享 / 影响版本数 |
 | `vcs purge` | `Purge` | **M2**：删除提交 + 路径裁剪标记 + GC（`--immediate` 立即释放） |
 | `vcs gc` / `gc-status` | `GetGcStatus` | **M2**：手动全库回收 / 查任务进度 |
@@ -1330,13 +1330,13 @@ bob 的仓库 bob-repo：alice（管理员）加人前 getHead → REPO_NOT_MEMB
 ### 25.3 冒烟新增链路
 
 ```
-GetQuota → used=578 字节，来源=系统兜底
+GetQuota → used=578 字节（本仓库可达对象，见 §43），来源=系统兜底
 → ListPurgeCandidates → 202610：可释放 58 / 当前 32
 → EstimatePurge(202610) → 可释放 58 字节，影响 3 个历史版本（未改动数据）
 → Purge(202610, immediate) → 生成 r4
 → GetGcStatus → DONE，清扫 3 个对象，释放 58 字节
 → GetTree(HEAD) → 不再包含 202610/*
-→ GetQuota → 对象池 578 → 520 字节
+→ GetQuota → 本仓库占用 578 → 520 字节
 ```
 
 ### 25.4 本阶段未覆盖
@@ -2021,3 +2021,40 @@ JS 线程上。一份 3 GB 的文件，提交要算两遍摘要（扫描 + 提�
   在服务端拼一张统一表会把展示口径写死；前端三路合并更轻，也复用了既有的状态筛选能力。
 - **不做服务端分页**。沿用既有「单次上限 200 条」的口径，历史视图只是这一口径的可视化；将来要翻旧账再加游标。
 - **历史不代表责任转移**。审批意见仍可为空（见 §33 的拒绝规则），表格里空值统一显示 `—`，不伪造说明。
+
+## 43. 配额按仓库独立计量（2026-11-19）
+
+### 43.1 问题
+
+用户反馈：「同一个账号下创建的多个仓库容量配额成共享的了，各个仓库容量配额应该是独立的」。
+
+根因不在配额阈值（`repos.quota_bytes` 一直是每个仓库一行的独立值），而在**用量口径**：
+`ServerStore::usage()` 的 `used_bytes` / `object_count` 取的是共享 CAS 的**全库对象池**字节数
+（`objects.total_stored_bytes()` / `list_hashes()`）。于是一个账号下：
+
+- 第二个仓库一建出来就显示「已用 = 第一个仓库的全部内容」，看起来配额被共享；
+- `begin_commit` 的配额闸门也拿这个数做预检，B 仓库会被 A 仓库的用量顶爆（`QUOTA_EXCEEDED`）。
+
+### 43.2 口径
+
+`used_bytes` 改为**本仓库所有版本可达对象（树 + 文件）去重后的磁盘占用**：
+
+| 项 | 口径 |
+| --- | --- |
+| 可达集合 | 遍历该仓库 `SELECT DISTINCT root_tree FROM revisions`，树按哈希去重，收集树与文件对象 |
+| 字节数 | 对象的 `stored_size`（压缩后）。批量 `IN` 查询 `objects` 表，缺行回落磁盘实测 |
+| 历史 | **计入全部版本**。只算 HEAD 会让「删掉再传」变成绕过配额的橡皮筋；`Purge` + GC 真正回收后才不计入 |
+| 跨仓库共享 | **本仓库引用即计入**。去重是磁盘优化，不是配额优惠：同一份内容被两个仓库引用，两边各自记账 |
+| `object_count` | 同上可达集合的对象数（不再是全库对象数） |
+| `logical_bytes` / `file_count` | 不变，仍是 HEAD 展开后的逻辑大小与文件数 |
+
+### 43.3 实现与代价
+
+- 新增 `repo_stored_usage()` / `collect_reachable()` / `sum_stored_bytes()`，`ServerStore` 里加
+  `usage_cache: Mutex<BTreeMap<repo_id, (head_rev, used, count)>>`。对象内容不可变，只有「新区提交」
+  （`head_rev` 变）与「GC 物理删除」会改变结果，所以用 `head_rev` 当版本号即可；`run_gc_job`
+  清扫完直接整表清空（宽限期到点的清理由 GC 转正，此时 `head_rev` 不一定变）。
+- 遍历代价与「历史目录节点数」同阶（内容相同的版本、内容相同的子树都只走一遍），
+  首次计算后按 `head_rev` 命中缓存；旧版本里被手工删掉的树对象只跳过该分支，不让容量面板整体报错。
+- 回归：`crates/vcs-server/tests/lifecycle.rs::quota_usage_is_per_repo_not_shared_across_the_same_owner`
+  同时钉住三件事——空仓库用量接近 0、A 仓库写入后 B 仓库用量不涨、同一份内容推进 B 不会被 A 的用量挡住。

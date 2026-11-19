@@ -352,6 +352,70 @@ fn log_and_read_file_reflect_each_revision() {
 // ---------------- 配额 ----------------
 
 #[test]
+fn quota_usage_is_per_repo_not_shared_across_the_same_owner() {
+    // 回归用例：`usage()` 曾经直接返回全库对象池的字节数，
+    // 于是同一个账号下第二个仓库一建出来就「已用 = 第一个仓库的全部内容」，
+    // 既让容量面板看起来配额是共享的，也会把正常提交挡在闸门外。
+    let sb = Sandbox::new("quota-per-repo");
+    let store = sb.store();
+    let alice = admin(&store);
+
+    let quota = 64 * 1024;
+    let repo_a = store.create_repo_direct(&alice, "alpha", quota).unwrap();
+    let repo_b = store.create_repo_direct(&alice, "beta", quota).unwrap();
+
+    // 空仓库的占用量只有一棵空树，远小于配额。
+    let empty = store.usage(&repo_b.repo_id).unwrap();
+    assert!(
+        empty.used_bytes < 1024,
+        "空仓库不该背别人的用量：{} 字节",
+        empty.used_bytes
+    );
+    // 对象数同样按仓库统计，不能报全库对象数。
+    assert!(empty.object_count <= 1, "空仓库对象数 {}", empty.object_count);
+
+    // 用不可压缩的内容，避免 zstd 让 stored_size 与逻辑大小差一个数量级。
+    let mut state: u32 = 0x1234_5678;
+    let mut rng = move || {
+        state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        (state >> 16) as u8
+    };
+    let payload: Vec<u8> = (0..40 * 1024).map(|_| rng()).collect();
+
+    let src = sb.dir("src");
+    write_file(&src, "pack/main.bin", &payload);
+    store
+        .import_dir(&alice, &repo_a.repo_id, &src, "写入 alpha")
+        .unwrap();
+
+    let used_a = store.usage(&repo_a.repo_id).unwrap().used_bytes;
+    assert!(used_a > 0, "alpha 写入后占用不该为 0");
+
+    // alpha 已经用掉大半配额；beta 仍然是空的，不能被 alpha 的用量牵连。
+    let after_a = store.usage(&repo_b.repo_id).unwrap();
+    assert!(
+        after_a.used_bytes < 1024,
+        "beta 的用量跟着 alpha 涨了：{} 字节",
+        after_a.used_bytes
+    );
+
+    // 同一份内容推给 beta 也必须成功：旧逻辑下这里会被 alpha 的用量顶爆配额。
+    let src_b = sb.dir("src-b");
+    write_file(&src_b, "pack/main.bin", &payload);
+    store
+        .import_dir(&alice, &repo_b.repo_id, &src_b, "写入 beta")
+        .unwrap();
+    let used_b = store.usage(&repo_b.repo_id).unwrap().used_bytes;
+    assert!(
+        used_b < used_a * 2,
+        "beta 的占用把 alpha 也算进去了：alpha={used_a} beta={used_b}"
+    );
+
+    // 反过来，alpha 自己的用量不受 beta 影响。
+    assert_eq!(store.usage(&repo_a.repo_id).unwrap().used_bytes, used_a);
+}
+
+#[test]
 fn quota_is_enforced_before_allocating_a_revision() {
     let sb = Sandbox::new("quota");
     let store = sb.store();
