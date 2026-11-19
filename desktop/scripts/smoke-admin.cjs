@@ -119,6 +119,10 @@ async function main() {
     // 审批拒绝不强制填原因：点「拒绝」就提交，审批意见框有内容才带上。
     check(!js.includes('拒绝原因（必填）'), '拒绝不应再弹「拒绝原因（必填）」');
     check(js.includes('rejectBody'), '拒绝应复用可选审批意见');
+    // 审批历史：处理过的申请要能在管理端翻到。
+    check(html.includes('审批历史'), '审批台应有「审批历史」入口');
+    check(html.includes('history-table'), '审批历史应有合并表');
+    check(js.includes('loadApprovalHistory'), '审批历史应有独立加载逻辑');
     let res = await api(base, '/api/overview');
     check(res.status === 401, `未登录应返回 401，实际 ${res.status}`);
     res = await api(base, '/api/login', { method: 'POST', body: { username: 'alice', password: 'wrong' } });
@@ -143,6 +147,18 @@ async function main() {
     check(res.status === 200 && Array.isArray(res.data.data.items), '扩容申请列表结构不对');
     check(res.data.data.storage.total_bytes > 0, '扩容审批页应带出磁盘容量');
     check(res.data.data.step_bytes > 0, '扩容步长缺失');
+
+    step('审批历史接口');
+    // 历史视图按类型各取一次「不带 state」的完整列表，再按结果筛选；三个状态过滤也都要通。
+    for (const route of ['/api/registrations', '/api/repo-requests', '/api/repo-expansions']) {
+      res = await api(base, route, { token });
+      check(res.status === 200 && Array.isArray(res.data.data.items), `${route} 历史列表结构不对`);
+    }
+    for (const route of ['/api/registrations?state=approved', '/api/repo-requests?state=rejected',
+      '/api/repo-expansions?state=expired']) {
+      res = await api(base, route, { token });
+      check(res.status === 200 && Array.isArray(res.data.data.items), `${route} 状态过滤不可用`);
+    }
 
     step('直通建库与仓库治理');
     res = await api(base, '/api/repos', {

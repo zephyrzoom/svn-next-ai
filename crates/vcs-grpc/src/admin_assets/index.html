@@ -58,20 +58,56 @@
           </section>
 
           <section class="view hidden" id="view-approvals">
-            <div class="page-head"><h2>审批台</h2><button id="refresh-approvals" class="ghost">刷新</button></div>
-            <div class="card">
-              <h3>注册申请</h3>
-              <div id="reg-list" class="list"></div>
+            <div class="page-head">
+              <h2>审批台</h2>
+              <div class="row">
+                <div class="segmented" id="approval-mode">
+                  <button class="seg active" data-mode="pending" type="button">待处理</button>
+                  <button class="seg" data-mode="history" type="button">审批历史</button>
+                </div>
+                <button id="refresh-approvals" class="ghost">刷新</button>
+              </div>
             </div>
-            <div class="card">
-              <h3>建库申请</h3>
-              <p class="muted">通过即建库，容量固定为 10 GiB，无需核定；空间不够时由用户在客户端申请扩容。</p>
-              <div id="req-list" class="list"></div>
+            <div id="approval-pending">
+              <div class="card">
+                <h3>注册申请</h3>
+                <div id="reg-list" class="list"></div>
+              </div>
+              <div class="card">
+                <h3>建库申请</h3>
+                <p class="muted">通过即建库，容量固定为 10 GiB，无需核定；空间不够时由用户在客户端申请扩容。</p>
+                <div id="req-list" class="list"></div>
+              </div>
+              <div class="card">
+                <h3>扩容申请 <span id="storage-note" class="muted"></span></h3>
+                <p class="muted">每次申请固定增加 10 GiB。审批前请确认服务器磁盘还有余量。</p>
+                <div id="expansion-list" class="list"></div>
+              </div>
             </div>
-            <div class="card">
-              <h3>扩容申请 <span id="storage-note" class="muted"></span></h3>
-              <p class="muted">每次申请固定增加 10 GiB。审批前请确认服务器磁盘还有余量。</p>
-              <div id="expansion-list" class="list"></div>
+            <div id="approval-history" class="hidden">
+              <div class="card">
+                <p class="muted" id="history-note">已处理过的申请会永久保留在这里（通过 / 拒绝 / 过期都算），可按类型与结果筛选。</p>
+                <div class="row history-filters">
+                  <select id="history-kind">
+                    <option value="">全部类型</option>
+                    <option value="register">注册申请</option>
+                    <option value="repo">建库申请</option>
+                    <option value="expansion">扩容申请</option>
+                  </select>
+                  <select id="history-state">
+                    <option value="">全部结果</option>
+                    <option value="Approved">已通过</option>
+                    <option value="Rejected">已拒绝</option>
+                    <option value="Expired">已过期</option>
+                  </select>
+                </div>
+                <div class="table-wrap">
+                  <table id="history-table">
+                    <thead><tr><th>类型</th><th>申请对象</th><th>结果</th><th>申请说明</th><th>提交时间</th><th>处理时间</th><th>处理人</th><th>审批意见</th></tr></thead>
+                    <tbody></tbody>
+                  </table>
+                </div>
+              </div>
             </div>
           </section>
 

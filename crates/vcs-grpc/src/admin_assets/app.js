@@ -242,7 +242,15 @@ $('refresh-overview').addEventListener('click', () => void act(loadOverview));
 
 /* ---------------- 审批台 ---------------- */
 
+/* 审批台两个视图：待处理（默认）与审批历史（已处理的记录永不下线）。 */
+let approvalMode = 'pending';
+let historyRows = [];
+
 async function loadApprovals() {
+  if (approvalMode === 'history') {
+    await loadApprovalHistory();
+    return;
+  }
   const [regs, reqs, expansions] = await Promise.all([
     get('/registrations?state=pending'),
     get('/repo-requests?state=pending'),
@@ -290,6 +298,98 @@ async function loadApprovals() {
       </div>
     </div>`).join('') : empty('没有待审批的扩容申请');
 }
+
+/* 审批历史：三类申请各取最近 200 条（服务端按提交时间倒序），只留已处理的记录。
+   申请单本身在库里是永久保留的，这里不会因为审批完就消失；
+   处理人 / 申请人存的是 user_id，用用户表映射成用户名，映射不到就退回 id。 */
+async function loadApprovalHistory() {
+  const [regs, reqs, expansions, users] = await Promise.all([
+    get('/registrations'),
+    get('/repo-requests'),
+    get('/repo-expansions'),
+    get('/users'),
+  ]);
+  const names = new Map();
+  (users.items || []).forEach((u) => names.set(u.user_id, u.username));
+  const nameOf = (id) => (id ? (names.get(id) || id) : '');
+
+  const rows = [];
+  (regs.items || []).forEach((r) => rows.push({
+    kind: 'register',
+    kindLabel: '注册',
+    target: r.display_name ? `${r.username}（${r.display_name}）` : r.username,
+    state: r.state,
+    reason: r.reason,
+    submitted_at: r.submitted_at,
+    decided_at: r.decided_at,
+    decided_by: nameOf(r.decided_by),
+    note: r.decision_note,
+  }));
+  (reqs.items || []).forEach((r) => rows.push({
+    kind: 'repo',
+    kindLabel: '建库',
+    target: `${r.repo_name} · 初始 ${humanBytes(r.requested_quota_bytes)}`,
+    state: r.state,
+    reason: r.reason,
+    submitted_at: r.submitted_at,
+    decided_at: r.decided_at,
+    decided_by: nameOf(r.decided_by),
+    note: r.decision_note,
+  }));
+  (expansions.items || []).forEach((r) => rows.push({
+    kind: 'expansion',
+    kindLabel: '扩容',
+    target: `${r.repo_name || r.repo_id} · ${humanBytes(r.quota_before_bytes)} → ${humanBytes(r.target_quota_bytes)}`,
+    state: r.state,
+    reason: r.reason,
+    submitted_at: r.submitted_at,
+    decided_at: r.decided_at,
+    decided_by: nameOf(r.decided_by),
+    note: r.decision_note,
+  }));
+
+  historyRows = rows
+    .filter((row) => row.state && row.state !== 'Pending')
+    .sort((a, b) => Number(b.decided_at || b.submitted_at) - Number(a.decided_at || a.submitted_at));
+  renderApprovalHistory();
+}
+
+function renderApprovalHistory() {
+  const kind = $('history-kind').value;
+  const state = $('history-state').value;
+  const rows = historyRows.filter((row) => (!kind || row.kind === kind)
+    && (!state || row.state === state));
+  $('history-note').textContent = historyRows.length
+    ? `已处理 ${historyRows.length} 条（每类最多显示最近 200 条），当前筛选 ${rows.length} 条。`
+    : '还没有已处理的申请；通过 / 拒绝 / 过期都会在这里留档。';
+  const tbody = $('history-table').querySelector('tbody');
+  tbody.innerHTML = rows.length ? rows.map((row) => `
+    <tr>
+      <td>${esc(row.kindLabel)}</td>
+      <td class="wrap">${esc(row.target)}</td>
+      <td>${stateBadge(row.state)}</td>
+      <td class="wrap">${esc(row.reason || '—')}</td>
+      <td class="muted">${esc(fmtTime(row.submitted_at))}</td>
+      <td class="muted">${esc(fmtTime(row.decided_at))}</td>
+      <td>${esc(row.decided_by || '—')}</td>
+      <td class="wrap">${esc(row.note || '—')}</td>
+    </tr>`).join('') : `<tr><td colspan="8">${empty('没有符合条件的记录')}</td></tr>`;
+}
+
+$('approval-mode').addEventListener('click', (event) => {
+  const button = event.target.closest('.seg');
+  if (!button || button.dataset.mode === approvalMode) return;
+  approvalMode = button.dataset.mode;
+  document.querySelectorAll('#approval-mode .seg').forEach((node) => {
+    node.classList.toggle('active', node.dataset.mode === approvalMode);
+  });
+  $('approval-pending').classList.toggle('hidden', approvalMode !== 'pending');
+  $('approval-history').classList.toggle('hidden', approvalMode !== 'history');
+  void act(loadApprovals);
+});
+
+$('history-kind').addEventListener('change', renderApprovalHistory);
+$('history-state').addEventListener('change', renderApprovalHistory);
 
 function field(row, name) {
   const node = row.querySelector(`[data-field="${name}"]`);

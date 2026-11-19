@@ -2196,3 +2196,76 @@ fn ldap_config_requires_admin_when_called_over_the_network_path() {
     store.set_ldap_config(None, &cfg).unwrap();
     assert!(store.ldap_config_public(Some(&alice)).unwrap().is_some());
 }
+
+/// 审批历史永久留档：处理过的申请不会从列表里消失，且带着处理人 / 处理时间 / 审批意见。
+#[test]
+fn approval_history_keeps_decided_records() {
+    let sb = Sandbox::new("approval-history");
+    let store = sb.store();
+    let alice = admin(&store);
+    store
+        .create_user(&alice, "ivan", "尹四", PASSWORD, Role::User)
+        .unwrap();
+    let (token, _) = store.login("ivan", PASSWORD).unwrap();
+    let ivan = store.authenticate(&token).unwrap();
+
+    // 注册：通过一条、驳回一条，两条都要留在历史里。
+    let approved = store.register("judy", "朱迪", PASSWORD, "入职").unwrap();
+    store
+        .approve_registration(&alice, &approved.info.request_id)
+        .unwrap();
+    let rejected = store.register("kate", "凯特", PASSWORD, "试用").unwrap();
+    store
+        .reject_registration(&alice, &rejected.info.request_id, "重复申请")
+        .unwrap();
+
+    let history = store.list_registrations(&alice, None, 200).unwrap();
+    let approved_row = history
+        .iter()
+        .find(|r| r.request_id == approved.info.request_id)
+        .expect("通过的注册申请应留在历史里");
+    assert_eq!(approved_row.state, vcs_core::RegistrationStatus::Approved);
+    assert_eq!(
+        approved_row.decided_by.as_deref(),
+        Some(alice.user_id.as_str())
+    );
+    assert!(approved_row.decided_at.is_some());
+    let rejected_row = history
+        .iter()
+        .find(|r| r.request_id == rejected.info.request_id)
+        .expect("驳回的注册申请应留在历史里");
+    assert_eq!(rejected_row.state, vcs_core::RegistrationStatus::Rejected);
+    assert_eq!(rejected_row.decision_note.as_deref(), Some("重复申请"));
+
+    // 建库：通过后申请单不消失，还能追到落地的仓库 id。
+    let req = store.request_repo(&ivan, "history-repo", "做实验").unwrap();
+    let repo = store
+        .approve_repo_request(&alice, &req.request_id, "同意")
+        .unwrap();
+    let requests = store.list_repo_requests(&alice, None, 200).unwrap();
+    let req_row = requests
+        .iter()
+        .find(|r| r.request_id == req.request_id)
+        .expect("建库申请应留在历史里");
+    assert_eq!(req_row.state, vcs_core::RepoCreationStatus::Approved);
+    assert_eq!(
+        req_row.approved_repo_id.as_deref(),
+        Some(repo.repo_id.as_str())
+    );
+    assert_eq!(req_row.decision_note.as_deref(), Some("同意"));
+
+    // 扩容：申请后被驳回，历史里留下拒绝记录（没写原因就是没写）。
+    let exp = store
+        .request_repo_expansion(&ivan, &repo.repo_id, "要更大")
+        .unwrap();
+    store
+        .reject_repo_quota_request(&alice, &exp.request_id, "")
+        .unwrap();
+    let expansions = store.list_repo_quota_requests(&alice, None, 200).unwrap();
+    let exp_row = expansions
+        .iter()
+        .find(|r| r.request_id == exp.request_id)
+        .expect("扩容申请应留在历史里");
+    assert_eq!(exp_row.state, vcs_core::RepoCreationStatus::Rejected);
+    assert_eq!(exp_row.decision_note, None);
+}

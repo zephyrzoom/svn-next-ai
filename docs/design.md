@@ -1994,3 +1994,30 @@ JS 线程上。一份 3 GB 的文件，提交要算两遍摘要（扫描 + 提�
   `npm run smoke:switch`、`npm run smoke:accounts`、`npm run typecheck`、`npm run build` 均通过。
 - 冒烟脚本里所有 `wc.*` 调用同步补了 `await`；`smoke-single-user` 的「已删除目录必须报错」
   那组探针本来就同时接受同步返回与 Promise，无需改动。
+
+## 42. 审批历史保留与管理端查看（2026-11-19）
+
+### 42.1 诉求与判断
+
+用户要求：「审批历史需要保留，需要可以在管理端查看」。核对现状后确认，申请单本来就是**永久留档**的——
+`registration_requests` / `repo_creation_requests` / `repo_quota_requests` 三张表只有状态流转
+（`pending → approved / rejected / expired`），没有任何删除路径，`decided_at` / `decided_by` /
+`decision_note` 也一直在写。真正缺的是**入口**：管理端审批台只请求 `?state=pending`，处理完的记录
+在界面上等于消失了。
+
+因此这一轮不改数据模型、不改 gRPC 契约，只补「看得到」：
+
+| 层 | 改动 |
+| --- | --- |
+| 管理端页面 | 审批台顶部加「待处理 / 审批历史」分段切换；历史视图是一张合并表（注册 / 建库 / 扩容），列：类型、申请对象、结果、申请说明、提交时间、处理时间、处理人、审批意见 |
+| 数据来源 | 沿用既有列表接口：历史视图按类型各取一次不带 `state` 的列表（服务端按提交时间倒序、每类上限 200 条），前端滤掉 `Pending` 后按处理时间倒序合并 |
+| 筛选 | 「类型」与「结果」（已通过 / 已拒绝 / 已过期）两个下拉，纯前端过滤，切换不发请求 |
+| 人名字段 | 申请单里只存 `requester_user_id` / `decided_by` 的 user_id；历史表额外拉一次 `/api/users` 建 id → 用户名映射，映射不到就退回 id |
+| 回归 | `crates/vcs-server/tests/lifecycle.rs::approval_history_keeps_decided_records` 钉住「通过 / 驳回 / 过期的记录仍在列表里，且带决定人、决定时间与审批意见」；`smoke-admin.cjs` 断言历史视图存在、`?state=approved|rejected|expired` 三个接口都通 |
+
+### 42.2 取舍
+
+- **不新增 `/api/approvals/history` 聚合接口**。三类申请的结构差异大（注册没有仓库名、扩容要算上限），
+  在服务端拼一张统一表会把展示口径写死；前端三路合并更轻，也复用了既有的状态筛选能力。
+- **不做服务端分页**。沿用既有「单次上限 200 条」的口径，历史视图只是这一口径的可视化；将来要翻旧账再加游标。
+- **历史不代表责任转移**。审批意见仍可为空（见 §33 的拒绝规则），表格里空值统一显示 `—`，不伪造说明。
