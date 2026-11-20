@@ -551,11 +551,7 @@ impl ServerStore {
             .map_err(|e| io("启用 WAL 失败", &db_path, e))?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(|e| io("启用外键失败", &db_path, e))?;
-        conn.execute_batch(SERVER_SCHEMA)
-            .map_err(|e| Error::new(ErrorCode::IoError, format!("初始化 server.db 失败：{e}")))?;
-        migrate_single_quota(&conn)?;
-        migrate_user_roles(&conn)?;
-        migrate_repo_recycle_bin(&conn)?;
+        apply_schema_and_migrations(&conn, SERVER_SCHEMA)?;
 
         let secret = load_or_create_secret(&root)?;
         let signer = TokenSigner::new(secret.clone());
@@ -6381,6 +6377,56 @@ fn estimate_new_bytes(
     total
 }
 
+/// 初始化顺序：schema → 迁移。
+///
+/// 老库的坑：`CREATE TABLE IF NOT EXISTS` 不会给已存在的表补列，所以 schema 里
+/// **任何引用新列的语句（索引 / 触发器 / 视图）都会在迁移之前就失败**，
+/// 表现为「no such column: xxx in CREATE INDEX ...」。这里对这一类失败做一次修复重试：
+/// 先把老库迁移到新结构，再把完整 schema 跑一遍（所有语句都是幂等的）。
+/// 空库没有这个问题：建表语句本身就带齐了新列。
+fn apply_schema_and_migrations(conn: &Connection, schema: &str) -> Result<()> {
+    match conn.execute_batch(schema) {
+        Ok(()) => {}
+        Err(err) if is_missing_column(&err) && table_exists(conn, "repos")? => {
+            eprintln!("检测到旧版 server.db：先升级表结构，再重试初始化");
+            migrate_single_quota(conn)?;
+            migrate_user_roles(conn)?;
+            migrate_repo_recycle_bin(conn)?;
+            conn.execute_batch(schema).map_err(|e| schema_error(&e))?;
+        }
+        Err(err) => return Err(schema_error(&err)),
+    }
+    // 迁移都幂等：新库直接返回，老库补列 / 重建表。
+    migrate_single_quota(conn)?;
+    migrate_user_roles(conn)?;
+    migrate_repo_recycle_bin(conn)?;
+    Ok(())
+}
+
+fn schema_error(err: &rusqlite::Error) -> Error {
+    Error::new(ErrorCode::IoError, format!("初始化 server.db 失败：{err}"))
+}
+
+fn is_missing_column(err: &rusqlite::Error) -> bool {
+    err.to_string().contains("no such column")
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |r| r.get(0),
+        )
+        .map_err(|e| {
+            Error::new(
+                ErrorCode::IoError,
+                format!("读取 {table} 是否存在失败：{e}"),
+            )
+        })?;
+    Ok(count > 0)
+}
+
 /// 老库升级：把「软 / 硬两条线」合并成单条 `quota_bytes`。
 ///
 /// `CREATE TABLE IF NOT EXISTS` 不会改已存在的表，所以必须在这里显式补列并回填：
@@ -6989,4 +7035,49 @@ fn io(action: &str, path: &Path, err: impl std::fmt::Display) -> Error {
         ErrorCode::IoError,
         format!("{action}：{}（{err}）", path.display()),
     )
+}
+
+#[cfg(test)]
+mod schema_upgrade_tests {
+    use super::*;
+
+    /// 旧版 `repos`：没有回收站列，CHECK 也不认 'deleted'。
+    const OLD_REPOS: &str = "CREATE TABLE repos (
+       repo_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, head_rev BIGINT NOT NULL DEFAULT 0,
+       status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','disabled','archived')),
+       owner_user_id TEXT NOT NULL, created_from_request TEXT,
+       quota_bytes BIGINT NOT NULL DEFAULT 0, grace_days INTEGER NOT NULL DEFAULT 7,
+       created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL);";
+
+    /// schema 里出现了迁移才会补的列时（最初那条 `idx_repos_purge_after` 就是这样），
+    /// 老库会卡在初始化阶段。修复入口必须「先迁移、再重跑 schema」，并把数据原样带过来。
+    #[test]
+    fn missing_column_in_schema_is_repaired_by_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_REPOS).unwrap();
+        conn.execute(
+            "INSERT INTO repos (repo_id, name, owner_user_id, created_at, updated_at)
+             VALUES ('r1', 'legacy', 'u1', 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        // 故意复现当初的写法：直接跑 schema，老库会在 CREATE INDEX 处失败。
+        let schema =
+            format!("{SERVER_SCHEMA}\nCREATE INDEX idx_legacy_probe ON repos (purge_after);");
+        let err = conn.execute_batch(&schema).unwrap_err().to_string();
+        assert!(
+            err.contains("no such column: purge_after"),
+            "应复现缺列失败：{err}"
+        );
+
+        apply_schema_and_migrations(&conn, &schema).unwrap();
+        assert!(table_has_column(&conn, "repos", "purge_after").unwrap());
+        let name: String = conn
+            .query_row("SELECT name FROM repos WHERE repo_id = 'r1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "legacy", "迁移不能丢数据");
+    }
 }

@@ -2081,6 +2081,10 @@ deleted --(到期后台维护 / PurgeRepo: 仅 admin)--> 物理删除（行不�
 - 新状态 `REPO_STATUS_DELETED`（`repos.status = 'deleted'`），`RepoStatus::is_deleted()`。
 - `repos` 新增 `deleted_at` / `deleted_by` / `delete_reason` / `purge_after` / `prev_status` 五列。
   老库靠 `migrate_repo_recycle_bin()` 重建表补上（SQLite 改不了 CHECK 约束）。
+- 初始化顺序是 schema → 迁移，而 `CREATE TABLE IF NOT EXISTS` 不会给老表补列：schema 里一旦出现
+  引用新列的索引 / 触发器，老库就会卡在 `no such column` 上。所以**不要给新列直接建索引**
+  （`purge_after` 就没有），并且 `apply_schema_and_migrations()` 对「缺列」这类失败做了修复重试：
+  先跑迁移、再把完整 schema 跑一遍（所有语句幂等）；空库与其它错误原样报出。
 - 注销后 `RepoService` 的入口（`require_repo`）直接回 `ERROR_CODE_REPO_DELETED`：
   客户端据此提示「已注销，请联系管理员恢复」，而不是把它当成「不存在」或权限问题。
 - `SetRepoStatus` 拒绝把状态改成 / 改出 `deleted`，强制走 `DeleteRepo` / `RestoreRepo`，
