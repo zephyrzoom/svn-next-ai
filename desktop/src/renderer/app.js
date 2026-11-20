@@ -624,6 +624,8 @@ function isRepoOwner(repo) {
 function renderMemberAccess() {
   const owner = isRepoOwner(currentRepo());
   el('tab-members').classList.toggle('hidden', !owner);
+  // 注销也是 owner 的专属动作：客户端只是入口，服务端按 owner 独立复核。
+  el('delete-repo').classList.toggle('hidden', !owner);
   if (!owner && state.tab === 'members') setTab('wc');
 }
 
@@ -1808,6 +1810,47 @@ async function requestExpansion() {
   banner(`已提交「${repo.name}」的扩容申请（${result.requestId}）：通过后上限增加 10 GiB。`);
 }
 
+/**
+ * 注销仓库（owner 专属）。
+ *
+ * 只做软删除：服务端把仓库挪进回收站，保留期内管理员可原样恢复，到期才彻底删除。
+ * 本地工作副本一律不动——恢复之后绑定还在，接着用即可；就算彻底删了，
+ * 也绝不替用户删本地文件。
+ */
+async function deleteCurrentRepo() {
+  const repo = currentRepo();
+  if (!repo) {
+    banner('请先在左侧选择一个仓库', 'error');
+    return;
+  }
+  if (state.job) {
+    banner(`正在${JOB_LABEL[state.job]}，完成后再注销仓库`, 'error');
+    return;
+  }
+  if (!isRepoOwner(repo)) {
+    banner('只有仓库拥有者可以注销仓库。', 'error');
+    return;
+  }
+  const ok = window.confirm(
+    `注销「${repo.name}」后仓库立即不可用，所有在途提交作废；` +
+      '保留期内可由管理员在管理端恢复，到期会彻底删除并释放空间。\n\n' +
+      '本地工作副本不会被删除。确定注销？',
+  );
+  if (!ok) return;
+  const result = unwrap(await api.deleteRepo(repo.repoId, ''), '注销仓库');
+  const until = result && result.purgeAfter
+    ? new Date(result.purgeAfter * 1000).toLocaleString('zh-CN', { hour12: false })
+    : '';
+  state.repos = state.repos.filter((item) => item.repoId !== repo.repoId);
+  state.selectedRepoId = null;
+  banner(
+    until
+      ? `仓库「${repo.name}」已注销：可在 ${until} 前请管理员恢复，之后彻底删除。`
+      : `仓库「${repo.name}」已注销。`,
+  );
+  await loadRepos();
+}
+
 // ---------------- 差异面板：默认收起，按需展开 ----------------
 
 /**
@@ -2111,6 +2154,7 @@ el('delete-file').addEventListener('click', () =>
 );
 el('do-request').addEventListener('click', () => void guard('提交建库申请', requestRepo));
 el('do-expand').addEventListener('click', () => void guard('提交扩容申请', requestExpansion));
+el('delete-repo').addEventListener('click', () => void guard('注销仓库', deleteCurrentRepo));
 el('disconnect').addEventListener('click', () => void guard('退出登录', disconnect));
 el('pick-checkout-dir').addEventListener('click', () => void guard('选择目录', pickCheckoutDir));
 // 稀疏检出：目录树按需加载，勾选只改界面状态，已检出后点「应用规则」才落盘。

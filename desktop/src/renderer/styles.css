@@ -294,6 +294,12 @@ button.ghost {
   color: var(--muted);
 }
 
+/* 注销仓库这类不可逆操作用红色描边：位置在页头，必须一眼看出是危险动作 */
+button.ghost.danger {
+  color: var(--delete);
+  border-color: #e7c9c5;
+}
+
 .hidden {
   display: none !important;
 }

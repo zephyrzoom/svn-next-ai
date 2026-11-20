@@ -354,12 +354,19 @@ pub enum RepoStatus {
     Active,
     Disabled,
     Archived,
+    /// 已注销：进入回收站，保留期内管理员可恢复，到期彻底删除。
+    Deleted,
 }
 
 impl RepoStatus {
     /// 只有 ACTIVE 仓库允许执行 RepoService 的任何操作。
     pub fn is_usable(&self) -> bool {
         matches!(self, Self::Active)
+    }
+
+    /// 是否在回收站里（已注销、尚未物理删除）。
+    pub fn is_deleted(&self) -> bool {
+        matches!(self, Self::Deleted)
     }
 }
 
@@ -456,6 +463,8 @@ pub enum ErrorCode {
     /// 入参不合法（必填项为空、枚举值越界等）。刻意与 `InvalidSession` 区分：
     /// 后者会让客户端以为登录态失效并跳去重新登录，而这里只需要用户改输入。
     InvalidArgument,
+    /// 仓库已注销（在回收站里），需要管理员先从管理端恢复。
+    RepoDeleted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -663,6 +672,8 @@ mod tests {
         assert!(RepoStatus::Active.is_usable());
         assert!(!RepoStatus::Disabled.is_usable());
         assert!(!RepoStatus::Archived.is_usable());
+        assert!(!RepoStatus::Deleted.is_usable());
+        assert!(RepoStatus::Deleted.is_deleted());
         assert!(!RepoCreationStatus::Pending.is_terminal());
         assert!(RepoCreationStatus::Approved.is_terminal());
         assert!(RepoCreationStatus::Rejected.is_terminal());

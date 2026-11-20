@@ -201,7 +201,7 @@ vcs ldap-show     # 回显配置，不显示密码
 | 概览 | 账号 / 仓库 / 待审批 / 对象池 / 回收站统计 |
 | 审批台 | 注册申请通过（申请人注册时已设密码，审批只放行、不发放任何凭证）与拒绝、建库申请通过（可填一个配额上限，0=继承全局默认）与拒绝 |
 | 用户 | 全库账号列表、直接建号、停用 / 启用、调整身份（普通用户 / 管理员） |
-| 仓库 | 全库仓库列表、直通新建、启停 / 归档、成员增删与角色、单仓库配额覆盖、状态管理 |
+| 仓库 | 全库仓库列表、直通新建、启停 / 归档、成员增删与角色、单仓库配额覆盖、状态管理、注销与回收站（保留期内恢复 / 立即彻底删除、调整保留天数） |
 | 配额 | 全局默认配额（新仓库继承值） |
 | 目录设置 | LDAP / AD 配置保存与连通性测试（bind 密码不回传） |
 | 空间治理 | 清理候选 / 预估 / 清理 / 立即 GC、回收站撤销、保留策略与试运行 |
@@ -266,6 +266,7 @@ vcs repo-expand-approve <request_id> --note "同意"
 | 还原 | 「全部还原」丢弃本地改动并清冲突（未受控文件不会被删） |
 | 只读容量 | 「仓库」视图显示当前仓库的已用 / 上限（只读，桌面端不能改配额）；不够用时点「申请扩容 +10 GiB」 |
 | 成员 / 配额 | Web 管理端「仓库」页：增删成员与调整角色（owner 受保护）、单仓库配额覆盖与恢复继承；「配额」页设全局默认 |
+| 注销仓库 | 仓库页头「注销仓库」（仅 owner 可见）：二次确认后仓库进入服务端回收站，保留期内管理员可在管理端恢复，到期彻底删除并释放空间；本地工作副本不动 |
 | 空间治理 | Web 管理端「空间治理」页：预估可释放 → 清理所选 → 回收站撤销（内容已被 GC 回收则明确失败）；保留策略先预览、再切为可执行 |
 
 ---
@@ -300,7 +301,7 @@ vcs info reports                                # 用量与生效配额
 | 分组 | 命令 |
 | --- | --- |
 | 账号 / 会话 | `init-admin`、`login`（`--password` / `--pat` / `--ldap`）、`logout`、`user-create`、`register*`、`ldap-config` / `ldap-show` / `ldap-test` |
-| 仓库 | `repo-create`、`repo-request*`、`repo-approve` / `repo-reject`、`repo-expand` / `repo-expand-list`、`repo-expand-approve` / `repo-expand-reject`、`repo-list`、`repo-quota`、`repo-status` |
+| 仓库 | `repo-create`、`repo-request*`、`repo-approve` / `repo-reject`、`repo-expand` / `repo-expand-list`、`repo-expand-approve` / `repo-expand-reject`、`repo-list`、`repo-quota`、`repo-status`、`repo-delete` / `repo-restore` / `repo-purge` / `repo-deleted` / `repo-delete-policy` |
 | 成员 | `member-add` / `member-list` / `member-remove` / `member-set-role` |
 | 读写 | `import`、`checkout`（`-r` 指定历史版本）、`status`、`diff`、`commit`、`update`、`revert`、`log`、`cat` |
 | 容量治理 | `info`、`candidates`、`estimate`、`purge`（`--immediate`）、`gc` / `gc-status`、`purged` / `unpurge`、`retention-*`、`maintenance` |

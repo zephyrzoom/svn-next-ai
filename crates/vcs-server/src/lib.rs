@@ -129,6 +129,66 @@ pub struct RepoInfo {
     pub head_rev: u64,
     pub status: RepoStatus,
     pub owner_user_id: String,
+    /// 注销时间；未注销为 `None`。
+    pub deleted_at: Option<i64>,
+    /// 彻底删除时间（注销时按当时的保留天数固化）；未注销为 `None`。
+    pub purge_after: Option<i64>,
+    /// 注销理由；未注销为 `None`。
+    pub delete_reason: Option<String>,
+}
+
+/// `repos` 表的原始行。
+///
+/// 状态与回收站列在每个查询里都要读一遍，集中成一个结构体，既避免
+/// `Option<(String, String, i64, ...)>` 这种难读的类型，也保证状态解析只有一处。
+struct StoredRepoRow {
+    repo_id: String,
+    name: String,
+    head_rev: i64,
+    status: String,
+    owner_user_id: String,
+    deleted_at: Option<i64>,
+    purge_after: Option<i64>,
+    delete_reason: Option<String>,
+}
+
+impl StoredRepoRow {
+    fn into_info(self) -> Result<RepoInfo> {
+        Ok(RepoInfo {
+            repo_id: self.repo_id,
+            name: self.name,
+            head_rev: self.head_rev.max(0) as u64,
+            status: parse_repo_status(&self.status)?,
+            owner_user_id: self.owner_user_id,
+            deleted_at: self.deleted_at,
+            purge_after: self.purge_after,
+            delete_reason: self.delete_reason,
+        })
+    }
+}
+
+/// 按 `SELECT repo_id, name, head_rev, status, owner_user_id, deleted_at, purge_after, delete_reason`
+/// 的列序读一行。所有查询仓库的 SQL 都必须保持这个列序。
+fn stored_repo_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRepoRow> {
+    Ok(StoredRepoRow {
+        repo_id: r.get(0)?,
+        name: r.get(1)?,
+        head_rev: r.get(2)?,
+        status: r.get(3)?,
+        owner_user_id: r.get(4)?,
+        deleted_at: r.get(5)?,
+        purge_after: r.get(6)?,
+        delete_reason: r.get(7)?,
+    })
+}
+
+/// 仓库物理删除的结果：元数据已删，对象由同一轮 GC 回收。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoPurgeOutcome {
+    pub repo_id: String,
+    pub repo_name: String,
+    pub freed_objects: u64,
+    pub reclaimed_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,6 +333,8 @@ pub struct PurgeOutcome {
 pub struct MaintenanceReport {
     /// 本次从宽限期转正的清理记录数。
     pub promoted_purges: usize,
+    /// 本次因回收站到期而彻底删除的仓库数。
+    pub purged_repos: usize,
     pub gc_job_id: String,
     pub swept_objects: u64,
     pub reclaimed_bytes: u64,
@@ -493,6 +555,7 @@ impl ServerStore {
             .map_err(|e| Error::new(ErrorCode::IoError, format!("初始化 server.db 失败：{e}")))?;
         migrate_single_quota(&conn)?;
         migrate_user_roles(&conn)?;
+        migrate_repo_recycle_bin(&conn)?;
 
         let secret = load_or_create_secret(&root)?;
         let signer = TokenSigner::new(secret.clone());
@@ -841,39 +904,26 @@ impl ServerStore {
             head_rev: 0,
             status: RepoStatus::Active,
             owner_user_id: session.user_id.clone(),
+            deleted_at: None,
+            purge_after: None,
+            delete_reason: None,
         })
     }
 
     pub fn find_repo(&self, name_or_id: &str) -> Result<RepoInfo> {
-        let row: Option<RepoInfo> = self
+        let row: Option<StoredRepoRow> = self
             .conn
             .query_row(
-                "SELECT repo_id, name, head_rev, status, owner_user_id
+                "SELECT repo_id, name, head_rev, status, owner_user_id,
+                        deleted_at, purge_after, delete_reason
                  FROM repos WHERE repo_id = ?1 OR name = ?1",
                 params![name_or_id],
-                |r| {
-                    Ok(RepoInfo {
-                        repo_id: r.get(0)?,
-                        name: r.get(1)?,
-                        head_rev: r.get::<_, i64>(2)? as u64,
-                        status: RepoStatus::Active,
-                        owner_user_id: r.get(4)?,
-                    })
-                },
+                stored_repo_row,
             )
             .optional()
             .map_err(db("查询仓库失败"))?;
-        let mut repo = row.ok_or_else(|| Error::new(ErrorCode::RepoNotFound, "仓库不存在"))?;
-        let status: String = self
-            .conn
-            .query_row(
-                "SELECT status FROM repos WHERE repo_id = ?1",
-                params![repo.repo_id],
-                |r| r.get(0),
-            )
-            .map_err(db("查询仓库状态失败"))?;
-        repo.status = parse_repo_status(&status)?;
-        Ok(repo)
+        row.ok_or_else(|| Error::new(ErrorCode::RepoNotFound, "仓库不存在"))?
+            .into_info()
     }
 
     /// 成员门：非成员一律 `REPO_NOT_MEMBER`，与全局角色无关。
@@ -900,6 +950,9 @@ impl ServerStore {
         if !repo.status.is_usable() {
             return Err(match repo.status {
                 RepoStatus::Disabled => Error::new(ErrorCode::RepoDisabled, "仓库已被禁用"),
+                RepoStatus::Deleted => {
+                    Error::new(ErrorCode::RepoDeleted, "仓库已注销，等待管理员在管理端恢复")
+                }
                 _ => Error::new(ErrorCode::RepoArchived, "仓库已归档"),
             });
         }
@@ -1252,6 +1305,12 @@ impl ServerStore {
         }
         actor.require(SCOPE_ADMIN, "变更仓库状态")?;
         let repo = self.find_repo(name_or_id)?;
+        if repo.status.is_deleted() || status.is_deleted() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "注销 / 恢复仓库请使用回收站接口（DeleteRepo / RestoreRepo）",
+            ));
+        }
         let now = now_secs();
         let tx = self
             .conn
@@ -1288,6 +1347,332 @@ impl ServerStore {
         )?;
         tx.commit().map_err(db("提交仓库状态变更失败"))?;
         self.find_repo(&repo.repo_id)
+    }
+
+    // ---------------- 仓库注销与回收站 ----------------
+
+    /// 全局保留天数：仓库注销后在回收站里待多久。0 表示注销即到期（下一轮维护删除）。
+    ///
+    /// 只影响**之后**注销的仓库：每个仓库的 `purge_after` 在注销那一刻就固化了，
+    /// 改设置不会把已经在回收站里的仓库提前或延后。
+    pub fn repo_delete_grace_days(&self) -> Result<u32> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM system_settings WHERE key = 'repo_delete_grace_days'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db("读取仓库注销保留期失败"))?;
+        Ok(value
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_REPO_DELETE_GRACE_DAYS))
+    }
+
+    /// 调整全局保留天数（仅管理员）。
+    pub fn set_repo_delete_grace_days(&self, actor: &Session, days: u32) -> Result<u32> {
+        self.require_admin(actor, "调整仓库注销保留期")?;
+        let now = now_secs();
+        self.conn
+            .execute(
+                "INSERT INTO system_settings (key, value, updated_at, updated_by)
+                 VALUES ('repo_delete_grace_days', ?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                   updated_at = excluded.updated_at, updated_by = excluded.updated_by",
+                params![days.to_string(), now, actor.user_id],
+            )
+            .map_err(db("保存仓库注销保留期失败"))?;
+        write_audit(
+            &self.conn,
+            "",
+            &actor.user_id,
+            "repo.delete_policy.set",
+            "repo_delete_grace_days",
+            Some(&format!("{{\"days\":{days}}}")),
+            now,
+        )?;
+        Ok(days)
+    }
+
+    /// 注销仓库：立即不可用，进入回收站。
+    ///
+    /// 拥有者可以在客户端注销自己的仓库；管理员也可以（管理端）。注销不做物理删除，
+    /// 元数据与对象都还在，管理员在保留期内可以原样恢复；到期由后台维护彻底删除。
+    pub fn delete_repo(&self, actor: &Session, name_or_id: &str, reason: &str) -> Result<RepoInfo> {
+        let repo = self.find_repo(name_or_id)?;
+        if repo.status.is_deleted() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "仓库已经在回收站里，不需要重复注销",
+            ));
+        }
+        // 管理员有全局权限；其他人必须是该仓库的 owner（读写 / 只读都不行）。
+        if actor.role == Role::Admin {
+            self.require_admin(actor, "注销仓库")?;
+        } else {
+            if !session_is_user(actor) {
+                return Err(Error::new(
+                    ErrorCode::PermissionDenied,
+                    "只有仓库拥有者可以注销仓库",
+                ));
+            }
+            actor.require(SCOPE_WRITE, "注销仓库")?;
+            let role = self.member_role(&repo.repo_id, &actor.user_id)?;
+            if role != RepoMemberRole::Owner {
+                return Err(Error::new(
+                    ErrorCode::PermissionDenied,
+                    "只有仓库拥有者可以注销仓库",
+                ));
+            }
+        }
+
+        let now = now_secs();
+        let grace_days = self.repo_delete_grace_days()? as i64;
+        // 0 天 = 立即到期，下一轮维护就会彻底删除。
+        let purge_after = now + grace_days * 86_400;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(db("开启事务失败"))?;
+        tx.execute(
+            "UPDATE repos SET status = 'deleted', deleted_at = ?2, deleted_by = ?3,
+                    delete_reason = ?4, purge_after = ?5, prev_status = ?6, updated_at = ?2
+             WHERE repo_id = ?1",
+            params![
+                repo.repo_id,
+                now,
+                actor.user_id,
+                reason.trim(),
+                purge_after,
+                repo_status_str(repo.status)
+            ],
+        )
+        .map_err(db("注销仓库失败"))?;
+        let aborted = tx
+            .execute(
+                "UPDATE upload_sessions SET state = 'aborted'
+                 WHERE repo_id = ?1 AND state IN ('open', 'pushing')",
+                params![repo.repo_id],
+            )
+            .map_err(db("中止在途提交失败"))?;
+        // 仓库都要注销了，还挂着的扩容申请没有意义，直接按拒绝收口（审批台不再积压）。
+        tx.execute(
+            "UPDATE repo_quota_requests SET status = 'rejected', decided_at = ?2,
+                    decided_by = ?3, decision_note = '仓库已注销'
+             WHERE repo_id = ?1 AND status = 'pending'",
+            params![repo.repo_id, now, actor.user_id],
+        )
+        .map_err(db("关闭待审批扩容申请失败"))?;
+        write_audit(
+            &tx,
+            &repo.repo_id,
+            &actor.user_id,
+            "repo.delete",
+            &repo.name,
+            Some(&format!(
+                "{{\"reason\":{},\"from\":\"{}\",\"grace_days\":{},\"purge_after\":{},\"aborted_sessions\":{aborted}}}",
+                json_string(reason.trim()),
+                repo_status_str(repo.status),
+                grace_days,
+                purge_after
+            )),
+            now,
+        )?;
+        tx.commit().map_err(db("提交注销事务失败"))?;
+        self.find_repo(&repo.repo_id)
+    }
+
+    /// 从回收站恢复（仅管理员）：状态回到注销前的样子，清零注销字段。
+    pub fn restore_repo(&self, actor: &Session, name_or_id: &str) -> Result<RepoInfo> {
+        self.require_admin(actor, "恢复仓库")?;
+        let repo = self.find_repo(name_or_id)?;
+        if !repo.status.is_deleted() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "仓库不在回收站里，无需恢复",
+            ));
+        }
+        let prev: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT prev_status FROM repos WHERE repo_id = ?1",
+                params![repo.repo_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db("读取注销前状态失败"))?
+            .flatten();
+        let restore_to = match prev.as_deref() {
+            Some("disabled") => RepoStatus::Disabled,
+            Some("archived") => RepoStatus::Archived,
+            _ => RepoStatus::Active,
+        };
+        let now = now_secs();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(db("开启事务失败"))?;
+        tx.execute(
+            "UPDATE repos SET status = ?2, deleted_at = NULL, deleted_by = NULL,
+                    delete_reason = NULL, purge_after = NULL, prev_status = NULL, updated_at = ?3
+             WHERE repo_id = ?1",
+            params![repo.repo_id, repo_status_str(restore_to), now],
+        )
+        .map_err(db("恢复仓库失败"))?;
+        write_audit(
+            &tx,
+            &repo.repo_id,
+            &actor.user_id,
+            "repo.restore",
+            &repo.name,
+            Some(&format!("{{\"to\":\"{}\"}}", repo_status_str(restore_to))),
+            now,
+        )?;
+        tx.commit().map_err(db("提交恢复事务失败"))?;
+        self.find_repo(&repo.repo_id)
+    }
+
+    /// 回收站列表（仅管理员）。`purge_after` 已到期的仓库也会列出来，
+    /// 界面可提示「下一轮维护即删除」并允许立即删除。
+    pub fn list_deleted_repos(&self, actor: &Session, limit: usize) -> Result<Vec<RepoInfo>> {
+        self.require_admin(actor, "查看回收站")?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT repo_id, name, head_rev, status, owner_user_id,
+                        deleted_at, purge_after, delete_reason
+                 FROM repos WHERE status = 'deleted'
+                 ORDER BY COALESCE(purge_after, 0) ASC, name LIMIT ?1",
+            )
+            .map_err(db("查询回收站失败"))?;
+        let rows = stmt
+            .query_map(params![limit.clamp(1, 500) as i64], stored_repo_row)
+            .map_err(db("查询回收站失败"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(db("读取回收站失败"))?.into_info()?);
+        }
+        Ok(out)
+    }
+
+    /// 立即彻底删除一个回收站里的仓库（仅管理员，不可撤销）。
+    pub fn purge_repo(&self, actor: &Session, name_or_id: &str) -> Result<RepoPurgeOutcome> {
+        self.require_admin(actor, "彻底删除仓库")?;
+        let repo = self.find_repo(name_or_id)?;
+        if !repo.status.is_deleted() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "只能彻底删除回收站里的仓库；请先注销",
+            ));
+        }
+        self.purge_repo_rows(&repo, &actor.user_id)?;
+        let gc = self.run_gc_for_repo_purge(&repo.repo_id)?;
+        Ok(RepoPurgeOutcome {
+            repo_id: repo.repo_id,
+            repo_name: repo.name,
+            freed_objects: gc.swept_objects,
+            reclaimed_bytes: gc.reclaimed_bytes,
+        })
+    }
+
+    /// 到期回收站清理：把 `purge_after` 已到的仓库彻底删除。返回删除的仓库数。
+    ///
+    /// 由 `run_maintenance` 每轮先调用；对象回收交给同一轮的全局 GC，
+    /// 这里只删元数据，避免每个仓库各跑一次全库扫描。
+    pub fn purge_expired_repos(&self) -> Result<usize> {
+        let now = now_secs();
+        let expired: Vec<RepoInfo> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT repo_id, name, head_rev, status, owner_user_id,
+                            deleted_at, purge_after, delete_reason
+                     FROM repos
+                     WHERE status = 'deleted' AND purge_after IS NOT NULL AND purge_after <= ?1",
+                )
+                .map_err(db("查询到期仓库失败"))?;
+            let rows = stmt
+                .query_map(params![now], stored_repo_row)
+                .map_err(db("查询到期仓库失败"))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(db("读取到期仓库失败"))?.into_info()?);
+            }
+            out
+        };
+        for repo in &expired {
+            self.purge_repo_rows(repo, "system")?;
+            println!(
+                "回收站到期：仓库 {}（{}）已彻底删除",
+                repo.name, repo.repo_id
+            );
+        }
+        Ok(expired.len())
+    }
+
+    /// 删除仓库的全部元数据（单事务）。对象留给随后的 GC：共享 CAS 里同一对象
+    /// 可能还被别的仓库引用，只有全局可达性分析才能安全回收。
+    fn purge_repo_rows(&self, repo: &RepoInfo, actor_id: &str) -> Result<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(db("开启事务失败"))?;
+        // 先删带外键的子表，再删 revisions，最后删 repos。
+        for sql in [
+            "DELETE FROM revision_changes WHERE repo_id = ?1",
+            "DELETE FROM revisions WHERE repo_id = ?1",
+            "DELETE FROM repo_members WHERE repo_id = ?1",
+            "DELETE FROM purged_paths WHERE repo_id = ?1",
+            "DELETE FROM retention_policies WHERE repo_id = ?1",
+            "DELETE FROM quota_usage WHERE repo_id = ?1",
+            "DELETE FROM upload_sessions WHERE repo_id = ?1",
+            "DELETE FROM locks WHERE repo_id = ?1",
+            "DELETE FROM acl WHERE repo_id = ?1",
+            "DELETE FROM repo_quota_requests WHERE repo_id = ?1",
+            "DELETE FROM gc_jobs WHERE repo_id = ?1",
+        ] {
+            tx.execute(sql, params![repo.repo_id])
+                .map_err(db("删除仓库关联数据失败"))?;
+        }
+        // 建库申请单保留（历史单据不该因为仓库没了就消失），approved_repo_id 只是一段文本。
+        tx.execute(
+            "DELETE FROM repos WHERE repo_id = ?1",
+            params![repo.repo_id],
+        )
+        .map_err(db("删除仓库失败"))?;
+        write_audit(
+            &tx,
+            &repo.repo_id,
+            actor_id,
+            "repo.purge",
+            &repo.name,
+            Some(&format!(
+                "{{\"head_rev\":{},\"deleted_at\":{},\"purge_after\":{}}}",
+                repo.head_rev,
+                repo.deleted_at.unwrap_or(0),
+                repo.purge_after.unwrap_or(0)
+            )),
+            now_secs(),
+        )?;
+        tx.commit().map_err(db("提交彻底删除事务失败"))?;
+        if let Ok(mut cache) = self.usage_cache.lock() {
+            cache.remove(&repo.repo_id);
+        }
+        Ok(())
+    }
+
+    /// 彻底删除后立刻跑一轮 GC，把只属于这个仓库的对象真正从磁盘上抹掉。
+    fn run_gc_for_repo_purge(&self, repo_id: &str) -> Result<GcJobStatus> {
+        let job_id = new_id("gc");
+        self.conn
+            .execute(
+                "INSERT INTO gc_jobs (job_id, repo_id, state, progress_percent)
+                 VALUES (?1, ?2, 'queued', 0)",
+                params![job_id, repo_id],
+            )
+            .map_err(db("创建 GC 任务失败"))?;
+        self.run_gc_job_with(&job_id, true)
     }
 
     fn load_member(&self, repo_id: &str, username: &str) -> Result<(String, RepoMemberRole)> {
@@ -1972,11 +2357,13 @@ impl ServerStore {
             Some(RepoStatus::Active) | None => "active",
             Some(RepoStatus::Disabled) => "disabled",
             Some(RepoStatus::Archived) => "archived",
+            Some(RepoStatus::Deleted) => "deleted",
         };
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT r.repo_id, r.name, r.head_rev, r.status, r.owner_user_id
+                "SELECT r.repo_id, r.name, r.head_rev, r.status, r.owner_user_id,
+                        r.deleted_at, r.purge_after, r.delete_reason
                  FROM repos r
                  JOIN repo_members m ON m.repo_id = r.repo_id
                  WHERE m.user_id = ?1 AND r.status = ?2
@@ -1984,27 +2371,11 @@ impl ServerStore {
             )
             .map_err(db("查询仓库列表失败"))?;
         let rows = stmt
-            .query_map(params![session.user_id, status], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                ))
-            })
+            .query_map(params![session.user_id, status], stored_repo_row)
             .map_err(db("查询仓库列表失败"))?;
         let mut out = Vec::new();
         for row in rows {
-            let (repo_id, name, head_rev, status, owner_user_id) =
-                row.map_err(db("读取仓库行失败"))?;
-            out.push(RepoInfo {
-                repo_id,
-                name,
-                head_rev: head_rev.max(0) as u64,
-                status: parse_repo_status(&status)?,
-                owner_user_id,
-            });
+            out.push(row.map_err(db("读取仓库行失败"))?.into_info()?);
         }
         Ok(out)
     }
@@ -2587,10 +2958,7 @@ impl ServerStore {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql =
                 format!("SELECT hash, stored_size FROM objects WHERE hash IN ({placeholders})");
-            let mut stmt = self
-                .conn
-                .prepare(&sql)
-                .map_err(db("读取对象索引失败"))?;
+            let mut stmt = self.conn.prepare(&sql).map_err(db("读取对象索引失败"))?;
             let rows = stmt
                 .query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
@@ -3662,6 +4030,9 @@ impl ServerStore {
             head_rev: 0,
             status: RepoStatus::Active,
             owner_user_id: requester,
+            deleted_at: None,
+            purge_after: None,
+            delete_reason: None,
         })
     }
 
@@ -5260,7 +5631,9 @@ impl ServerStore {
     /// 这是 `vcs serve` 的定时任务调用的入口——不需要 session，因为它没有调用者。
     /// GC 是全局的（共享 CAS），所以只需一轮；`repo_count` 仅用于日志。
     pub fn run_maintenance(&self) -> Result<MaintenanceReport> {
-        // 先执行保留策略：它会产生删除提交，随后同一轮的转正 + GC 就能接上。
+        // 先回收站到期清理：元数据删掉之后，同一轮 GC 才能把对象当成孤儿回收。
+        let purged_repos = self.purge_expired_repos()?;
+        // 再执行保留策略：它会产生删除提交，随后同一轮的转正 + GC 就能接上。
         let (retention_repos, retention_paths) = self.apply_retention_all()?;
         let promoted = self.promote_pending_purges()?;
         let repo_count: i64 = self
@@ -5277,9 +5650,12 @@ impl ServerStore {
                 params![job_id],
             )
             .map_err(db("创建维护任务失败"))?;
-        let status = self.run_gc_job(&job_id)?;
+        // 维护是唯一会回收「无人可达的树对象」的地方：仓库彻底删除后，
+        // 它的历史目录树不会再有版本引用，留着只是垃圾。
+        let status = self.run_gc_job_with(&job_id, true)?;
         Ok(MaintenanceReport {
             promoted_purges: promoted,
+            purged_repos,
             gc_job_id: job_id,
             swept_objects: status.swept_objects,
             reclaimed_bytes: status.reclaimed_bytes,
@@ -5411,7 +5787,14 @@ impl ServerStore {
     }
 
     /// GC 主体：标记 → 清扫两段式。
+    ///
+    /// `sweep_orphan_trees` 只在对「仓库已被彻底删除」收尾时打开：常规 GC 刻意保留
+    /// tree 对象（旧版本还能展开目录），但仓库都没了，没有任何版本可达的树就是纯垃圾。
     fn run_gc_job(&self, job_id: &str) -> Result<GcJobStatus> {
+        self.run_gc_job_with(job_id, false)
+    }
+
+    fn run_gc_job_with(&self, job_id: &str, sweep_orphan_trees: bool) -> Result<GcJobStatus> {
         let now = now_secs();
         self.conn
             .execute(
@@ -5446,7 +5829,7 @@ impl ServerStore {
         // Finalize 的对象只存在于磁盘、没有索引行，本轮标记和清扫都碰不到它们。
         // （早先按 `created_at >= mark_started` 兜底是错的：秒级精度会把同一秒内提交的
         //   正常内容也当成"并发对象"永久保护起来，导致 GC 一字节都收不回。）
-        let mut marked: Vec<Hash> = Vec::new();
+        let mut marked: BTreeSet<Hash> = BTreeSet::new();
         for hash in sizes.keys() {
             let reachable = match owners.get(hash) {
                 Some(refs) => refs.iter().any(|(repo_id, path)| {
@@ -5460,7 +5843,31 @@ impl ServerStore {
             if reachable {
                 continue;
             }
-            marked.push(*hash);
+            marked.insert(*hash);
+        }
+
+        if sweep_orphan_trees {
+            // 树对象同样按引用图判定：仍有版本可达的树保留（旧版本还能展开），
+            // 一个引用都没有的树（仓库被彻底删除后留下的）直接回收。
+            let trees: Vec<Hash> = {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT hash FROM objects WHERE kind = 'tree' AND pending_delete = 0")
+                    .map_err(db("读取树对象失败"))?;
+                let rows = stmt
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .map_err(db("读取树对象失败"))?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(vcs_core::from_hex(&row.map_err(db("读取树对象失败"))?)?);
+                }
+                out
+            };
+            for hash in trees {
+                if !owners.contains_key(&hash) {
+                    marked.insert(hash);
+                }
+            }
         }
 
         let mut mark_stmt = self
@@ -6009,6 +6416,57 @@ fn migrate_single_quota(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// 老库升级：`repos` 表补上回收站字段与 'deleted' 状态。
+///
+/// SQLite 改不了已存在的 CHECK 约束，只能重建表；`repos` 被 revisions / repo_members /
+/// purged_paths 用外键引用，重建期间必须临时关闭外键（与 `migrate_user_roles` 同一套做法）。
+/// 列名保持不变，代码只按列名读写，重建对业务透明。
+fn migrate_repo_recycle_bin(conn: &Connection) -> Result<()> {
+    if table_has_column(conn, "repos", "purge_after")? {
+        return Ok(());
+    }
+    conn.pragma_update(None, "foreign_keys", "OFF")
+        .map_err(|e| Error::new(ErrorCode::IoError, format!("临时关闭外键失败：{e}")))?;
+    let outcome = conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE repos_upgrade (
+           repo_id               TEXT PRIMARY KEY,
+           name                  TEXT NOT NULL UNIQUE,
+           head_rev              BIGINT NOT NULL DEFAULT 0,
+           status                TEXT NOT NULL DEFAULT 'active'
+                                 CHECK (status IN ('active', 'disabled', 'archived', 'deleted')),
+           owner_user_id         TEXT NOT NULL,
+           created_from_request  TEXT,
+           quota_bytes           BIGINT NOT NULL DEFAULT 0,
+           grace_days            INTEGER NOT NULL DEFAULT 7,
+           deleted_at            BIGINT,
+           deleted_by            TEXT,
+           delete_reason         TEXT,
+           purge_after           BIGINT,
+           prev_status           TEXT,
+           created_at            BIGINT NOT NULL,
+           updated_at            BIGINT NOT NULL
+         );
+         INSERT INTO repos_upgrade
+           (repo_id, name, head_rev, status, owner_user_id, created_from_request,
+            quota_bytes, grace_days, created_at, updated_at)
+         SELECT repo_id, name, head_rev, status, owner_user_id, created_from_request,
+                quota_bytes, grace_days, created_at, updated_at
+         FROM repos;
+         DROP TABLE repos;
+         ALTER TABLE repos_upgrade RENAME TO repos;
+         CREATE INDEX IF NOT EXISTS idx_repos_owner ON repos (owner_user_id, status);
+         COMMIT;",
+    );
+    if outcome.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|e| Error::new(ErrorCode::IoError, format!("恢复外键失败：{e}")))?;
+    outcome.map_err(|e| Error::new(ErrorCode::IoError, format!("升级仓库回收站字段失败：{e}")))?;
+    Ok(())
+}
+
 /// 老库升级：全局身份从「只读 / 可写 / 管理员」收敛为「普通用户 / 管理员」。
 ///
 /// SQLite 改不了已存在的 CHECK 约束，只能重建表：
@@ -6190,6 +6648,16 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// 审计 detail 里的字符串转义：理由由用户输入，必须当成 JSON 字符串写。
+fn json_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// 会话是否是普通用户会话。`System` 身份只由服务端内部构造，不能拿来当 owner 用。
+fn session_is_user(actor: &Session) -> bool {
+    actor.kind == ActorKind::User
+}
+
 /// 字节数的可读形式，只用于错误提示与审计文案。
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -6331,6 +6799,7 @@ fn repo_status_str(status: RepoStatus) -> &'static str {
         RepoStatus::Active => "active",
         RepoStatus::Disabled => "disabled",
         RepoStatus::Archived => "archived",
+        RepoStatus::Deleted => "deleted",
     }
 }
 
@@ -6361,6 +6830,7 @@ fn parse_repo_status(s: &str) -> Result<RepoStatus> {
         "active" => Ok(RepoStatus::Active),
         "disabled" => Ok(RepoStatus::Disabled),
         "archived" => Ok(RepoStatus::Archived),
+        "deleted" => Ok(RepoStatus::Deleted),
         other => Err(Error::new(
             ErrorCode::RepoNotFound,
             format!("未知仓库状态：{other}"),
@@ -6441,6 +6911,8 @@ const ALLOWED_SCOPES: [&str; 3] = [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN];
 const REGISTRATION_TTL_SECONDS: i64 = 7 * 86_400;
 /// 仓库创建申请有效期：7 天。
 const REPO_REQUEST_TTL_SECONDS: i64 = 7 * 86_400;
+/// 仓库注销后默认在回收站保留 30 天（可由管理员调整）。
+pub const DEFAULT_REPO_DELETE_GRACE_DAYS: u32 = 30;
 
 fn reg_status_str(status: core_types::RegistrationStatus) -> &'static str {
     match status {

@@ -951,6 +951,22 @@ export class VcsClient {
     assertOk(resp.status);
   }
 
+  /**
+   * 注销自己的仓库（仅 owner，服务端会独立复核）。
+   *
+   * 注销不是物理删除：仓库进入服务端回收站，保留期内管理员可原样恢复，
+   * 到期才彻底删除并释放空间。返回值带 `purgeAfter`，界面据此提示恢复截止时间。
+   */
+  async deleteRepo(repoId: string, reason = ''): Promise<{ deletedAt: number; purgeAfter: number }> {
+    const resp = await this.invoke<any>(this.admin, 'deleteRepo', { repoId, reason });
+    assertOk(resp.status);
+    const repo = resp.repo ?? {};
+    return {
+      deletedAt: Number(repo.deletedAt ?? 0),
+      purgeAfter: Number(repo.purgeAfter ?? 0),
+    };
+  }
+
   /** 按用户名 / 姓名搜人（只返回 ACTIVE 用户，且只有三项字段）。 */
   async searchUsers(query: string, limit = 20): Promise<UserSummaryRow[]> {
     const resp = await this.invoke<any>(this.admin, 'searchUsers', { query, limit });

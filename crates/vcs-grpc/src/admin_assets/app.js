@@ -130,15 +130,15 @@ function fmtTime(seconds) {
 
 const STATE_LABEL = {
   Pending: '待处理', Approved: '已通过', Rejected: '已拒绝', Expired: '已过期',
-  Active: '正常', Disabled: '停用', Archived: '归档',
+  Active: '正常', Disabled: '停用', Archived: '归档', Deleted: '已注销',
   pending: '待审批', approved: '已通过', rejected: '已拒绝', expired: '已过期',
-  active: '正常', disabled: '停用', archived: '归档',
+  active: '正常', disabled: '停用', archived: '归档', deleted: '已注销',
 };
 
 function stateBadge(state) {
   const label = STATE_LABEL[state] || state || '—';
   const cls = state === 'Pending' ? 'warn'
-    : (state === 'Rejected' || state === 'Expired' || state === 'Disabled') ? 'bad'
+    : (state === 'Rejected' || state === 'Expired' || state === 'Disabled' || state === 'Deleted') ? 'bad'
       : (state === 'Approved' || state === 'Active') ? 'ok' : '';
   return `<span class="badge ${cls}">${esc(label)}</span>`;
 }
@@ -538,7 +538,68 @@ async function loadRepos() {
   select.innerHTML = allRepos.map((r) => `<option value="${esc(r.repo_id)}">${esc(r.name)}</option>`).join('');
   if (allRepos.some((r) => r.repo_id === keep)) select.value = keep;
   selectedRepo = select.value;
+  await loadDeletedRepos();
 }
+
+/* ---------------- 回收站 ---------------- */
+
+async function loadDeletedRepos() {
+  const data = await get('/repos/deleted');
+  $('delete-grace-days').value = data.grace_days;
+  const tbody = $('deleted-table').querySelector('tbody');
+  const nowSeconds = Date.now() / 1000;
+  tbody.innerHTML = data.items.length
+    ? data.items.map((r) => {
+      const expired = Number(r.purge_after || 0) > 0 && Number(r.purge_after) <= nowSeconds;
+      return `
+      <tr data-id="${esc(r.repo_id)}" data-name="${esc(r.name)}">
+        <td>${esc(r.name)}</td>
+        <td>r${esc(r.head_rev)}</td>
+        <td>${esc(fmtTime(r.deleted_at))}</td>
+        <td>${esc(fmtTime(r.purge_after))}${expired ? ' <span class="badge warn">已到期</span>' : ''}</td>
+        <td class="muted">${esc(r.delete_reason || '—')}</td>
+        <td>
+          <button class="mini" data-action="restore">恢复</button>
+          <button class="mini danger" data-action="purge">彻底删除</button>
+        </td>
+      </tr>`;
+    }).join('')
+    : '<tr><td colspan="6">' + empty('回收站是空的') + '</td></tr>';
+}
+
+$('deleted-table').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-action]');
+  if (!button) return;
+  const row = button.closest('tr');
+  const id = row.dataset.id;
+  const name = row.dataset.name;
+  void act(async () => {
+    if (button.dataset.action === 'restore') {
+      await post(`/repos/${encodeURIComponent(id)}/restore`, {});
+      toast(`仓库 ${name} 已恢复`);
+    } else {
+      const ok = window.confirm(
+        `彻底删除「${name}」后不可恢复：历史版本、成员与对象都会从磁盘回收。\n如果只是暂时不用，建议保留到到期自动删除。继续？`,
+      );
+      if (!ok) return;
+      const result = await post(`/repos/${encodeURIComponent(id)}/destroy`, {});
+      toast(`已彻底删除 ${name}，释放 ${humanBytes(result.reclaimed_bytes)}`);
+      if ($('repo-detail').dataset.repo === id) $('repo-detail').classList.add('hidden');
+    }
+    await loadRepos();
+  });
+});
+
+$('refresh-deleted').addEventListener('click', () => void act(loadDeletedRepos));
+
+$('save-delete-policy').addEventListener('click', () => {
+  void act(async () => {
+    const days = Number($('delete-grace-days').value || 0);
+    const data = await put('/repo-delete-policy', { grace_days: days });
+    toast(`注销保留期已设为 ${data.grace_days} 天`);
+    await loadDeletedRepos();
+  });
+});
 
 $('repos-table').addEventListener('click', (event) => {
   const button = event.target.closest('[data-action="detail"]');
@@ -552,6 +613,7 @@ function openRepoDetail(repoId, name) {
   $('repo-detail').classList.remove('hidden');
   $('repo-detail-title').textContent = `仓库详情 · ${name}`;
   $('repo-detail').dataset.repo = repoId;
+  $('repo-detail').dataset.name = name;
   void act(loadRepoDetail);
 }
 
@@ -642,6 +704,24 @@ $('save-repo-status').addEventListener('click', () => {
     await post(`/repos/${encodeURIComponent(id)}/status`, { status: $('repo-status-select').value });
     toast('仓库状态已更新');
     await Promise.all([loadRepos(), loadRepoDetail()]);
+  });
+});
+
+$('do-delete-repo').addEventListener('click', () => {
+  const id = $('repo-detail').dataset.repo;
+  const name = $('repo-detail').dataset.name || id;
+  const ok = window.confirm(
+    `注销「${name}」后仓库立即不可用，所有在途提交作废；保留期内可在回收站恢复，到期彻底删除。继续？`,
+  );
+  if (!ok) return;
+  void act(async () => {
+    const data = await post(`/repos/${encodeURIComponent(id)}/delete`, {
+      reason: $('delete-reason').value.trim(),
+    });
+    toast(`已注销 ${name}，保留至 ${fmtTime((data.repo || {}).purge_after)}`);
+    $('delete-reason').value = '';
+    $('repo-detail').classList.add('hidden');
+    await loadRepos();
   });
 });
 

@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use vcs_core::{ErrorCode, ObjectStore, RepoMemberRole, Role};
+use vcs_core::{ErrorCode, ObjectStore, RepoMemberRole, RepoStatus, Role};
 use vcs_server::ServerStore;
 
 const PASSWORD: &str = "Abcdef1!";
@@ -372,7 +372,11 @@ fn quota_usage_is_per_repo_not_shared_across_the_same_owner() {
         empty.used_bytes
     );
     // 对象数同样按仓库统计，不能报全库对象数。
-    assert!(empty.object_count <= 1, "空仓库对象数 {}", empty.object_count);
+    assert!(
+        empty.object_count <= 1,
+        "空仓库对象数 {}",
+        empty.object_count
+    );
 
     // 用不可压缩的内容，避免 zstd 让 stored_size 与逻辑大小差一个数量级。
     let mut state: u32 = 0x1234_5678;
@@ -2332,4 +2336,243 @@ fn approval_history_keeps_decided_records() {
         .expect("扩容申请应留在历史里");
     assert_eq!(exp_row.state, vcs_core::RepoCreationStatus::Rejected);
     assert_eq!(exp_row.decision_note, None);
+}
+
+// ---------------- 仓库注销与回收站 ----------------
+
+/// 建一个带内容的仓库和一个 writer 账号，供注销相关用例复用。
+fn seed_repo_with_writer(
+    sb: &Sandbox,
+    store: &ServerStore,
+) -> (vcs_server::Session, String, vcs_server::Session) {
+    let alice = admin(store);
+    let repo = store.create_repo_direct(&alice, "reports", 0).unwrap();
+    let src = sb.dir("src");
+    write_file(&src, "202610/report.txt", b"hello\n");
+    store.import_dir(&alice, &repo.repo_id, &src, "r1").unwrap();
+
+    store
+        .create_user(&alice, "bob", "鲍勃", PASSWORD, Role::User)
+        .unwrap();
+    store
+        .add_member(&alice, &repo.repo_id, "bob", RepoMemberRole::Writer)
+        .unwrap();
+    let (token, _) = store.login("bob", PASSWORD).unwrap();
+    let bob = store.authenticate(&token).unwrap();
+    (alice, repo.repo_id, bob)
+}
+
+#[test]
+fn owner_deletes_repo_and_can_restore_it() {
+    let sb = Sandbox::new("repo-delete");
+    let store = sb.store();
+    let (alice, repo_id, bob) = seed_repo_with_writer(&sb, &store);
+
+    let deleted = store.delete_repo(&alice, &repo_id, "项目结束").unwrap();
+    assert_eq!(deleted.status, RepoStatus::Deleted);
+    assert_eq!(deleted.delete_reason.as_deref(), Some("项目结束"));
+    let purge_after = deleted.purge_after.expect("注销必须固化彻底删除时间");
+    assert!(purge_after > deleted.deleted_at.unwrap());
+
+    // 客户端列表只剩 ACTIVE，注销后立刻消失；成员也访问不了。
+    assert!(store.list_repos(&alice, None).unwrap().is_empty());
+    let err = store.head_info(&bob, &repo_id).unwrap_err();
+    assert_eq!(err.code, ErrorCode::RepoDeleted);
+
+    // 回收站里能看见，管理员恢复后原样回到 ACTIVE。
+    let bin = store.list_deleted_repos(&alice, 50).unwrap();
+    assert_eq!(bin.len(), 1);
+    assert_eq!(bin[0].repo_id, repo_id);
+    let restored = store.restore_repo(&alice, &repo_id).unwrap();
+    assert_eq!(restored.status, RepoStatus::Active);
+    assert!(restored.purge_after.is_none());
+    assert!(restored.deleted_at.is_none());
+    assert_eq!(store.list_repos(&bob, None).unwrap().len(), 1);
+    assert_eq!(store.head_info(&bob, &repo_id).unwrap().0, 1);
+}
+
+#[test]
+fn only_owner_or_admin_can_delete_repo() {
+    let sb = Sandbox::new("repo-delete-role");
+    let store = sb.store();
+    let (alice, repo_id, bob) = seed_repo_with_writer(&sb, &store);
+
+    // 读写成员不是 owner，不能注销。
+    let err = store.delete_repo(&bob, &repo_id, "").unwrap_err();
+    assert_eq!(err.code, ErrorCode::PermissionDenied);
+
+    // 另一个管理员不需要成员资格也能注销（管理端走的就是这条路径）。
+    store
+        .create_user(&alice, "ops", "运维", PASSWORD, Role::Admin)
+        .unwrap();
+    let (token, _) = store.login("ops", PASSWORD).unwrap();
+    let ops = store.authenticate(&token).unwrap();
+    let deleted = store.delete_repo(&ops, &repo_id, "管理员注销").unwrap();
+    assert_eq!(deleted.status, RepoStatus::Deleted);
+}
+
+#[test]
+fn recycle_bin_expiry_purges_metadata_and_reclaims_objects() {
+    let sb = Sandbox::new("repo-purge");
+    let store = sb.store();
+    let (alice, repo_id, _) = seed_repo_with_writer(&sb, &store);
+
+    // 保留 0 天：下一轮维护就该彻底删除。
+    assert_eq!(store.set_repo_delete_grace_days(&alice, 0).unwrap(), 0);
+    let deleted = store.delete_repo(&alice, &repo_id, "到期回收").unwrap();
+    assert!(store.objects().exists(&vcs_core::hash_bytes(b"hello\n")));
+    assert_eq!(
+        deleted.purge_after.unwrap(),
+        deleted.deleted_at.unwrap(),
+        "0 天保留期 = 注销即到期"
+    );
+
+    let report = store.run_maintenance().unwrap();
+    assert_eq!(report.purged_repos, 1);
+    assert!(report.swept_objects >= 1);
+    assert!(report.reclaimed_bytes > 0);
+    assert!(
+        !store.objects().exists(&vcs_core::hash_bytes(b"hello\n")),
+        "彻底删除后内容必须从磁盘回收"
+    );
+    assert_eq!(
+        store.find_repo(&repo_id).unwrap_err().code,
+        ErrorCode::RepoNotFound
+    );
+    assert!(store.list_deleted_repos(&alice, 50).unwrap().is_empty());
+
+    // 仓库名随之释放，可以重新建同名仓库。
+    store.create_repo_direct(&alice, "reports", 0).unwrap();
+}
+
+#[test]
+fn default_grace_keeps_repo_restorable() {
+    let sb = Sandbox::new("repo-grace");
+    let store = sb.store();
+    let (alice, repo_id, _) = seed_repo_with_writer(&sb, &store);
+
+    assert_eq!(store.repo_delete_grace_days().unwrap(), 30);
+    let deleted = store.delete_repo(&alice, &repo_id, "先留着").unwrap();
+    let days = (deleted.purge_after.unwrap() - deleted.deleted_at.unwrap()) / 86_400;
+    assert_eq!(days, 30);
+
+    let report = store.run_maintenance().unwrap();
+    assert_eq!(report.purged_repos, 0, "保留期内不该被删");
+    assert_eq!(
+        store.find_repo(&repo_id).unwrap().status,
+        RepoStatus::Deleted
+    );
+
+    // 改全局保留天数不影响已经注销的仓库（purge_after 已固化）。
+    store.set_repo_delete_grace_days(&alice, 1).unwrap();
+    let again = store.find_repo(&repo_id).unwrap();
+    assert_eq!(again.purge_after, deleted.purge_after);
+}
+
+#[test]
+fn purge_requires_recycle_bin_and_admin() {
+    let sb = Sandbox::new("repo-purge-guard");
+    let store = sb.store();
+    let (alice, repo_id, bob) = seed_repo_with_writer(&sb, &store);
+
+    // 还在用的仓库不能直接彻底删除。
+    let err = store.purge_repo(&alice, &repo_id).unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidArgument);
+
+    // 注销也不能走状态接口，避免误把「注销」当成一次普通状态切换。
+    let err = store
+        .set_repo_status(&alice, &repo_id, RepoStatus::Deleted)
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidArgument);
+
+    store.delete_repo(&alice, &repo_id, "").unwrap();
+    // 普通成员不能彻底删除，也不能恢复。
+    let err = store.purge_repo(&bob, &repo_id).unwrap_err();
+    assert_eq!(err.code, ErrorCode::PermissionDenied);
+    let err = store.restore_repo(&bob, &repo_id).unwrap_err();
+    assert_eq!(err.code, ErrorCode::PermissionDenied);
+
+    let outcome = store.purge_repo(&alice, &repo_id).unwrap();
+    assert_eq!(outcome.repo_name, "reports");
+    assert!(outcome.reclaimed_bytes > 0);
+    assert!(store.find_repo(&repo_id).is_err());
+}
+
+#[test]
+fn deleting_closes_pending_expansion_requests() {
+    let sb = Sandbox::new("repo-delete-expansion");
+    let store = sb.store();
+    let (alice, repo_id, _) = seed_repo_with_writer(&sb, &store);
+
+    let exp = store
+        .request_repo_expansion(&alice, &repo_id, "再给点空间")
+        .unwrap();
+    store.delete_repo(&alice, &repo_id, "不要了").unwrap();
+
+    let pending = store
+        .list_repo_quota_requests(&alice, Some(vcs_core::RepoCreationStatus::Pending), 50)
+        .unwrap();
+    assert!(
+        pending.iter().all(|r| r.request_id != exp.request_id),
+        "注销后不该再有待审批的扩容申请"
+    );
+    let all = store.list_repo_quota_requests(&alice, None, 50).unwrap();
+    let row = all.iter().find(|r| r.request_id == exp.request_id).unwrap();
+    assert_eq!(row.state, vcs_core::RepoCreationStatus::Rejected);
+}
+
+/// 老库升级：`repos` 没有回收站列、CHECK 也不认 'deleted'，重新打开时必须自动补齐，
+/// 且既有仓库与数据不能丢（SQLite 改不了 CHECK，只能重建表）。
+#[test]
+fn old_database_gains_recycle_bin_columns() {
+    let sb = Sandbox::new("repo-migrate");
+    let root = sb.root.join("store");
+    {
+        let store = ServerStore::open(&root).unwrap();
+        let alice = admin(&store);
+        store.create_repo_direct(&alice, "legacy", 0).unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(root.join("server.db")).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE repos_old (
+               repo_id               TEXT PRIMARY KEY,
+               name                  TEXT NOT NULL UNIQUE,
+               head_rev              BIGINT NOT NULL DEFAULT 0,
+               status                TEXT NOT NULL DEFAULT 'active'
+                                     CHECK (status IN ('active', 'disabled', 'archived')),
+               owner_user_id         TEXT NOT NULL,
+               created_from_request  TEXT,
+               quota_bytes           BIGINT NOT NULL DEFAULT 0,
+               grace_days            INTEGER NOT NULL DEFAULT 7,
+               created_at            BIGINT NOT NULL,
+               updated_at            BIGINT NOT NULL
+             );
+             INSERT INTO repos_old
+               (repo_id, name, head_rev, status, owner_user_id, created_from_request,
+                quota_bytes, grace_days, created_at, updated_at)
+             SELECT repo_id, name, head_rev, status, owner_user_id, created_from_request,
+                    quota_bytes, grace_days, created_at, updated_at
+             FROM repos;
+             DROP TABLE repos;
+             ALTER TABLE repos_old RENAME TO repos;
+             COMMIT;",
+        )
+        .unwrap();
+    }
+
+    // 重新打开：迁移补列、重建 CHECK，既有仓库原样可读。
+    let store = ServerStore::open(&root).unwrap();
+    let (token, _) = store.login("alice", PASSWORD).unwrap();
+    let alice = store.authenticate(&token).unwrap();
+    let repo = store.find_repo("legacy").unwrap();
+    assert_eq!(repo.status, RepoStatus::Active);
+    assert!(repo.purge_after.is_none());
+
+    // 新状态可用：注销 → 回收站里能看到。
+    let deleted = store.delete_repo(&alice, "legacy", "升级后注销").unwrap();
+    assert_eq!(deleted.status, RepoStatus::Deleted);
+    assert_eq!(store.list_deleted_repos(&alice, 10).unwrap().len(), 1);
 }

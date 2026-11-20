@@ -1290,3 +1290,167 @@ async fn big_object_round_trips_in_chunks() {
     assert!(chunk_messages > 0, "检出大对象必须走分块");
     assert_eq!(got, content);
 }
+
+/// 注销 / 回收站链路：注销后立即不可用，列表不再返回，恢复后原样可用，
+/// 再次注销后可以立即彻底删除。全程走真实 RPC，验证 proto 契约与鉴权。
+#[tokio::test]
+async fn recycle_bin_rpcs_round_trip() {
+    let h = Harness::start("recycle").await;
+    let token = login(&h, "alice", PASSWORD).await;
+
+    let repo = h
+        .admin()
+        .await
+        .create_repo_direct(bearer(
+            Request::new(pb::CreateRepoDirectRequest {
+                repo_name: "recycle".into(),
+                repo_id_hint: String::new(),
+                quota_bytes: 0,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .repo
+        .unwrap();
+
+    // 保留期默认 30 天，可以改。
+    let policy = h
+        .admin()
+        .await
+        .update_repo_delete_policy(bearer(
+            Request::new(pb::UpdateRepoDeletePolicyRequest { grace_days: 7 }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(policy.status.unwrap().code, pb::ErrorCode::Ok as i32);
+    assert_eq!(policy.grace_days, 7);
+
+    let deleted = h
+        .admin()
+        .await
+        .delete_repo(bearer(
+            Request::new(pb::DeleteRepoRequest {
+                repo_id: repo.repo_id.clone(),
+                reason: "下线".into(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(deleted.status.unwrap().code, pb::ErrorCode::Ok as i32);
+    let snapshot = deleted.repo.unwrap();
+    assert_eq!(snapshot.status, pb::RepoStatus::Deleted as i32);
+    assert!(snapshot.purge_after > snapshot.deleted_at);
+
+    // 客户端拿不到已注销的仓库：ListRepos 为空，GetHead 直接报 REPO_DELETED。
+    let listed = h
+        .admin()
+        .await
+        .list_repos(bearer(
+            Request::new(pb::ListReposRequest {
+                filter: pb::RepoStatus::Active as i32,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(listed.repos.is_empty());
+
+    let head = h
+        .repos()
+        .await
+        .get_head(bearer(
+            Request::new(pb::GetHeadRequest {
+                repo_id: repo.repo_id.clone(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        head.status.unwrap().code,
+        pb::ErrorCode::RepoDeleted as i32,
+        "已注销的仓库必须回 REPO_DELETED，不能伪装成不存在"
+    );
+
+    // 回收站列表带出保留天数与彻底删除时间。
+    let bin = h
+        .admin()
+        .await
+        .list_deleted_repos(bearer(
+            Request::new(pb::ListDeletedReposRequest { limit: 0 }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(bin.grace_days, 7);
+    assert_eq!(bin.repos.len(), 1);
+    assert_eq!(bin.repos[0].delete_reason, "下线");
+
+    // 恢复 → 又能正常使用。
+    let restored = h
+        .admin()
+        .await
+        .restore_repo(bearer(
+            Request::new(pb::RestoreRepoRequest {
+                repo_id: repo.repo_id.clone(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(restored.status.unwrap().code, pb::ErrorCode::Ok as i32);
+    assert_eq!(restored.repo.unwrap().status, pb::RepoStatus::Active as i32);
+
+    // 再注销并立即彻底删除：仓库消失。
+    h.admin()
+        .await
+        .delete_repo(bearer(
+            Request::new(pb::DeleteRepoRequest {
+                repo_id: repo.repo_id.clone(),
+                reason: String::new(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap();
+    let purged = h
+        .admin()
+        .await
+        .purge_repo(bearer(
+            Request::new(pb::PurgeRepoRequest {
+                repo_id: repo.repo_id.clone(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(purged.status.unwrap().code, pb::ErrorCode::Ok as i32);
+
+    let missing = h
+        .admin()
+        .await
+        .get_repo(bearer(
+            Request::new(pb::GetRepoQuery {
+                repo_id: repo.repo_id,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        missing.status.unwrap().code,
+        pb::ErrorCode::RepoNotFound as i32
+    );
+}

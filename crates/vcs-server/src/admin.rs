@@ -35,6 +35,8 @@ pub struct AdminOverview {
     pub objects: i64,
     pub object_bytes: i64,
     pub purged_pending: i64,
+    /// 回收站里的仓库数（已注销、尚未彻底删除）。
+    pub deleted_repos: i64,
 }
 
 impl ServerStore {
@@ -72,6 +74,8 @@ impl ServerStore {
             object_bytes,
             purged_pending: self
                 .admin_count("SELECT COUNT(*) FROM purged_paths WHERE state = 'pending'")?,
+            deleted_repos: self
+                .admin_count("SELECT COUNT(*) FROM repos WHERE status = 'deleted'")?,
         })
     }
 
@@ -116,41 +120,30 @@ impl ServerStore {
         self.require_admin_action(actor, "查看全库仓库列表")?;
         let sql = match filter {
             Some(_) => {
-                "SELECT repo_id, name, head_rev, status, owner_user_id FROM repos
-                 WHERE status = ?1 ORDER BY name"
+                "SELECT repo_id, name, head_rev, status, owner_user_id,
+                        deleted_at, purge_after, delete_reason
+                 FROM repos WHERE status = ?1 ORDER BY name"
             }
             None => {
-                "SELECT repo_id, name, head_rev, status, owner_user_id FROM repos ORDER BY name"
+                "SELECT repo_id, name, head_rev, status, owner_user_id,
+                        deleted_at, purge_after, delete_reason
+                 FROM repos ORDER BY name"
             }
         };
         let mut stmt = self.conn.prepare(sql).map_err(db("查询全库仓库失败"))?;
-        let mapper =
-            |r: &rusqlite::Row<'_>| -> rusqlite::Result<(String, String, i64, String, String)> {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            };
-        let rows: Vec<(String, String, i64, String, String)> = match filter {
+        let rows = match filter {
             Some(status) => stmt
-                .query_map(params![repo_status_to_str(status)], mapper)
+                .query_map(params![repo_status_to_str(status)], stored_repo_row)
                 .map_err(db("查询全库仓库失败"))?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(db("读取全库仓库失败"))?,
             None => stmt
-                .query_map([], mapper)
+                .query_map([], stored_repo_row)
                 .map_err(db("查询全库仓库失败"))?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(db("读取全库仓库失败"))?,
         };
-        rows.into_iter()
-            .map(|(repo_id, name, head_rev, status, owner_user_id)| {
-                Ok(RepoInfo {
-                    repo_id,
-                    name,
-                    head_rev: head_rev as u64,
-                    status: parse_repo_status(&status)?,
-                    owner_user_id,
-                })
-            })
-            .collect()
+        rows.into_iter().map(StoredRepoRow::into_info).collect()
     }
 
     /// 启用 / 禁用账号。禁止停用自己，也禁止停用最后一个可用管理员。
@@ -254,5 +247,6 @@ fn repo_status_to_str(status: RepoStatus) -> &'static str {
         RepoStatus::Active => "active",
         RepoStatus::Disabled => "disabled",
         RepoStatus::Archived => "archived",
+        RepoStatus::Deleted => "deleted",
     }
 }

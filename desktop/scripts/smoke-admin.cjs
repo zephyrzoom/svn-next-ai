@@ -123,6 +123,9 @@ async function main() {
     check(html.includes('审批历史'), '审批台应有「审批历史」入口');
     check(html.includes('history-table'), '审批历史应有合并表');
     check(js.includes('loadApprovalHistory'), '审批历史应有独立加载逻辑');
+    // 回收站：注销的仓库要能从管理端恢复或立即彻底删除。
+    check(html.includes('回收站') && html.includes('deleted-table'), '仓库页应有回收站');
+    check(js.includes('loadDeletedRepos'), '回收站应有独立加载逻辑');
     let res = await api(base, '/api/overview');
     check(res.status === 401, `未登录应返回 401，实际 ${res.status}`);
     res = await api(base, '/api/login', { method: 'POST', body: { username: 'alice', password: 'wrong' } });
@@ -175,6 +178,31 @@ async function main() {
     check(res.status === 200 && res.data.ok, '空间治理接口不可达');
     res = await api(base, `${repo}/status`, { method: 'POST', token, body: { status: 'Disabled' } });
     check(res.status === 200 && res.data.ok, '仓库状态变更失败');
+
+    step('注销与回收站');
+    res = await api(base, '/api/repo-delete-policy', { method: 'PUT', token, body: { grace_days: 5 } });
+    check(res.status === 200 && res.data.data.grace_days === 5, '注销保留期保存失败');
+    res = await api(base, `${repo}/delete`, { method: 'POST', token, body: { reason: '冒烟注销' } });
+    check(res.status === 200 && res.data.data.repo.status === 'Deleted', '管理员注销仓库失败');
+    res = await api(base, '/api/repos/deleted', { token });
+    check(res.status === 200 && res.data.data.items.length === 1, '回收站应列出已注销仓库');
+    check(res.data.data.grace_days === 5, '回收站应带出保留天数');
+    check(res.data.data.items[0].delete_reason === '冒烟注销', '回收站应保留注销理由');
+    res = await api(base, '/api/repos', { token });
+    check(!res.data.data.items.some((r) => r.repo_id === repoId), '已注销仓库不该出现在全部仓库里');
+    // 注销后仓库不可用；恢复后回到注销前的状态（这里是停用）。
+    res = await api(base, `${repo}/status`, { method: 'POST', token, body: { status: 'Active' } });
+    check(res.status === 400, '注销的仓库不能用状态接口绕过恢复');
+    res = await api(base, `${repo}/restore`, { method: 'POST', token });
+    check(res.status === 200 && res.data.data.repo.status === 'Disabled', '恢复应回到注销前状态');
+    // 再注销并立即彻底删除：回收站清空。
+    await api(base, `${repo}/delete`, { method: 'POST', token, body: { reason: '' } });
+    res = await api(base, `${repo}/destroy`, { method: 'POST', token });
+    check(res.status === 200 && res.data.data.repo_id === repoId, '彻底删除失败');
+    res = await api(base, '/api/repos/deleted', { token });
+    check(res.data.data.items.length === 0, '彻底删除后回收站应为空');
+    res = await api(base, '/api/repo-delete-policy', { method: 'PUT', token, body: { grace_days: 30 } });
+    check(res.status === 200, '注销保留期恢复默认失败');
 
     step('用户与全局配额');
     res = await api(base, '/api/users', {

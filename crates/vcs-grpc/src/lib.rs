@@ -162,6 +162,7 @@ fn error_number(code: ErrorCode) -> i32 {
         ErrorCode::QuotaConfigInvalid => pb::ErrorCode::QuotaConfigInvalid as i32,
         ErrorCode::IoError => pb::ErrorCode::IoError as i32,
         ErrorCode::InvalidArgument => pb::ErrorCode::InvalidArgument as i32,
+        ErrorCode::RepoDeleted => pb::ErrorCode::RepoDeleted as i32,
     }
 }
 
@@ -219,6 +220,7 @@ fn repo_status_to_pb(status: RepoStatus) -> i32 {
         RepoStatus::Active => pb::RepoStatus::Active as i32,
         RepoStatus::Disabled => pb::RepoStatus::Disabled as i32,
         RepoStatus::Archived => pb::RepoStatus::Archived as i32,
+        RepoStatus::Deleted => pb::RepoStatus::Deleted as i32,
     }
 }
 
@@ -227,6 +229,7 @@ fn parse_repo_status(value: i32) -> Option<RepoStatus> {
         pb::RepoStatus::Active => Some(RepoStatus::Active),
         pb::RepoStatus::Disabled => Some(RepoStatus::Disabled),
         pb::RepoStatus::Archived => Some(RepoStatus::Archived),
+        pb::RepoStatus::Deleted => Some(RepoStatus::Deleted),
         _ => None,
     }
 }
@@ -338,6 +341,9 @@ fn repo_to_pb(repo: &vcs_server::RepoInfo) -> pb::RepoInfo {
         head_rev: repo.head_rev,
         quota_bytes: 0,
         created_at: 0,
+        deleted_at: repo.deleted_at.unwrap_or(0),
+        purge_after: repo.purge_after.unwrap_or(0),
+        delete_reason: repo.delete_reason.clone().unwrap_or_default(),
     }
 }
 
@@ -2816,6 +2822,151 @@ impl RepoAdminService for AdminApi {
             })),
         }
     }
+
+    async fn delete_repo(
+        &self,
+        request: Request<pb::DeleteRepoRequest>,
+    ) -> Result<Response<pb::DeleteRepoResponse>, Status> {
+        let session = self.api.session(&request)?;
+        let req = request.into_inner();
+        let result = {
+            let store = self.api.store();
+            store.delete_repo(&session, &req.repo_id, &req.reason)
+        };
+        match result {
+            Ok(repo) => Ok(Response::new(pb::DeleteRepoResponse {
+                status: Some(status_ok()),
+                repo: Some(repo_to_pb(&repo)),
+            })),
+            Err(err) => Ok(Response::new(pb::DeleteRepoResponse {
+                status: Some(status_err(&err)),
+                repo: None,
+            })),
+        }
+    }
+
+    async fn restore_repo(
+        &self,
+        request: Request<pb::RestoreRepoRequest>,
+    ) -> Result<Response<pb::RestoreRepoResponse>, Status> {
+        let session = self.api.session(&request)?;
+        let req = request.into_inner();
+        let result = {
+            let store = self.api.store();
+            store.restore_repo(&session, &req.repo_id)
+        };
+        match result {
+            Ok(repo) => Ok(Response::new(pb::RestoreRepoResponse {
+                status: Some(status_ok()),
+                repo: Some(repo_to_pb(&repo)),
+            })),
+            Err(err) => Ok(Response::new(pb::RestoreRepoResponse {
+                status: Some(status_err(&err)),
+                repo: None,
+            })),
+        }
+    }
+
+    async fn purge_repo(
+        &self,
+        request: Request<pb::PurgeRepoRequest>,
+    ) -> Result<Response<pb::PurgeRepoResponse>, Status> {
+        let session = self.api.session(&request)?;
+        let req = request.into_inner();
+        let result = {
+            let store = self.api.store();
+            store.purge_repo(&session, &req.repo_id)
+        };
+        match result {
+            Ok(outcome) => Ok(Response::new(pb::PurgeRepoResponse {
+                status: Some(status_ok()),
+                freed_objects: outcome.freed_objects,
+                reclaimed_bytes: outcome.reclaimed_bytes,
+            })),
+            Err(err) => Ok(Response::new(pb::PurgeRepoResponse {
+                status: Some(status_err(&err)),
+                ..Default::default()
+            })),
+        }
+    }
+
+    async fn list_deleted_repos(
+        &self,
+        request: Request<pb::ListDeletedReposRequest>,
+    ) -> Result<Response<pb::ListDeletedReposResponse>, Status> {
+        let session = self.api.session(&request)?;
+        let req = request.into_inner();
+        let limit = if req.limit == 0 {
+            200
+        } else {
+            req.limit as usize
+        };
+        let result = {
+            let store = self.api.store();
+            store.list_deleted_repos(&session, limit).and_then(|repos| {
+                store
+                    .repo_delete_grace_days()
+                    .map(|grace_days| (repos, grace_days))
+            })
+        };
+        match result {
+            Ok((repos, grace_days)) => Ok(Response::new(pb::ListDeletedReposResponse {
+                status: Some(status_ok()),
+                repos: repos.iter().map(repo_to_pb).collect(),
+                grace_days,
+            })),
+            Err(err) => Ok(Response::new(pb::ListDeletedReposResponse {
+                status: Some(status_err(&err)),
+                repos: Vec::new(),
+                grace_days: 0,
+            })),
+        }
+    }
+
+    async fn get_repo_delete_policy(
+        &self,
+        request: Request<pb::GetRepoDeletePolicyRequest>,
+    ) -> Result<Response<pb::GetRepoDeletePolicyResponse>, Status> {
+        let session = self.api.session(&request)?;
+        let result = {
+            let store = self.api.store();
+            store
+                .require_admin_action(&session, "查看仓库注销保留期")
+                .and_then(|_| store.repo_delete_grace_days())
+        };
+        match result {
+            Ok(grace_days) => Ok(Response::new(pb::GetRepoDeletePolicyResponse {
+                status: Some(status_ok()),
+                grace_days,
+            })),
+            Err(err) => Ok(Response::new(pb::GetRepoDeletePolicyResponse {
+                status: Some(status_err(&err)),
+                grace_days: 0,
+            })),
+        }
+    }
+
+    async fn update_repo_delete_policy(
+        &self,
+        request: Request<pb::UpdateRepoDeletePolicyRequest>,
+    ) -> Result<Response<pb::UpdateRepoDeletePolicyResponse>, Status> {
+        let session = self.api.session(&request)?;
+        let req = request.into_inner();
+        let result = {
+            let store = self.api.store();
+            store.set_repo_delete_grace_days(&session, req.grace_days)
+        };
+        match result {
+            Ok(days) => Ok(Response::new(pb::UpdateRepoDeletePolicyResponse {
+                status: Some(status_ok()),
+                grace_days: days,
+            })),
+            Err(err) => Ok(Response::new(pb::UpdateRepoDeletePolicyResponse {
+                status: Some(status_err(&err)),
+                grace_days: 0,
+            })),
+        }
+    }
 }
 
 fn now_secs() -> i64 {
@@ -2891,7 +3042,7 @@ pub async fn serve(config: ServeConfig) -> Result<(), Box<dyn std::error::Error>
     }
     if config.maintenance_interval_secs > 0 {
         println!(
-            "后台维护：每 {} 秒一次（转正到期清理 + 全库 GC）",
+            "后台维护：每 {} 秒一次（回收站到期删除 + 转正到期清理 + 全库 GC）",
             config.maintenance_interval_secs
         );
         spawn_maintenance(store.clone(), config.maintenance_interval_secs);
@@ -2916,9 +3067,8 @@ pub async fn serve(config: ServeConfig) -> Result<(), Box<dyn std::error::Error>
 
 /// 后台维护循环。
 ///
-/// 两件事：把宽限期到点的清理记录转正，然后跑一次全库 GC。
-/// **不做保留策略的自动执行**——那需要以「系统」身份提交版本，得先把提交链路的
-/// 权限模型打通（见设计 §30.4），在那之前宁可少做一步，也不要绕过权限去删数据。
+/// 三件事：把到期的回收站仓库彻底删除、把宽限期到点的清理记录转正，然后跑一次全库 GC。
+/// 保留策略的自动执行也在同一入口里（`apply_retention_all`，走系统身份）。
 fn spawn_maintenance(store: Store, interval_secs: u64) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
@@ -3027,6 +3177,7 @@ mod tests {
             (ErrorCode::QuotaConfigInvalid, 34),
             (ErrorCode::IoError, 35),
             (ErrorCode::InvalidArgument, 36),
+            (ErrorCode::RepoDeleted, 37),
         ];
         for (code, number) in cases {
             assert_eq!(error_number(code), number, "错误码编号漂移：{code:?}");

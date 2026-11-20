@@ -68,6 +68,13 @@ export interface MemberDto {
   role: number;
 }
 
+export interface DeleteRepoResultDto {
+  /** 注销时间（Unix 秒）。 */
+  deletedAt: number;
+  /** 彻底删除时间（Unix 秒）：管理员只能在这个时间之前恢复。 */
+  purgeAfter: number;
+}
+
 export interface UserSummaryDto {
   userId: string;
   username: string;
@@ -263,6 +270,8 @@ export interface VcsApi {
   addMember(repoId: string, userId: string, role: number): Promise<Envelope<null>>;
   setMemberRole(repoId: string, userId: string, role: number): Promise<Envelope<null>>;
   removeMember(repoId: string, userId: string): Promise<Envelope<null>>;
+  /** 注销自己的仓库：进入服务端回收站，保留期内可由管理员恢复。 */
+  deleteRepo(repoId: string, reason?: string): Promise<Envelope<DeleteRepoResultDto>>;
   /** 按用户名 / 姓名搜可添加的账号（服务端只返回 ACTIVE 用户）。 */
   searchUsers(query: string, limit?: number): Promise<Envelope<UserSummaryDto[]>>;
 
@@ -317,6 +326,7 @@ const api: VcsApi = {
   setMemberRole: (repoId, userId, role) =>
     ipcRenderer.invoke('vcs:setMemberRole', repoId, userId, role),
   removeMember: (repoId, userId) => ipcRenderer.invoke('vcs:removeMember', repoId, userId),
+  deleteRepo: (repoId, reason) => ipcRenderer.invoke('vcs:deleteRepo', repoId, reason),
   searchUsers: (query, limit) => ipcRenderer.invoke('vcs:searchUsers', query, limit),
 
   getQuota: (repoId) => ipcRenderer.invoke('vcs:getQuota', repoId),

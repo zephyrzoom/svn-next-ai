@@ -73,7 +73,15 @@ pub fn app(store: Store) -> Router {
         .route("/api/users/:id/status", post(set_user_status))
         .route("/api/users/:id/role", post(set_user_role))
         .route("/api/repos", get(repos).post(create_repo))
+        .route("/api/repos/deleted", get(deleted_repos))
         .route("/api/repos/:id/status", post(set_repo_status))
+        .route("/api/repos/:id/delete", post(delete_repo))
+        .route("/api/repos/:id/restore", post(restore_repo))
+        .route("/api/repos/:id/destroy", post(purge_repo))
+        .route(
+            "/api/repo-delete-policy",
+            get(get_delete_policy).put(set_delete_policy),
+        )
         .route("/api/repos/:id/members", get(members).post(add_member))
         .route(
             "/api/repos/:id/members/:username",
@@ -305,11 +313,13 @@ fn parse_request_status(text: &str) -> Option<RepoCreationStatus> {
     }
 }
 
-fn parse_repo_status(text: &str) -> RepoStatus {
+/// 只接受启用 / 停用 / 归档；注销与恢复必须走专用接口，避免误把仓库「改回启用」。
+fn parse_repo_status(text: &str) -> Option<RepoStatus> {
     match text.to_ascii_lowercase().as_str() {
-        "disabled" => RepoStatus::Disabled,
-        "archived" => RepoStatus::Archived,
-        _ => RepoStatus::Active,
+        "active" => Some(RepoStatus::Active),
+        "disabled" => Some(RepoStatus::Disabled),
+        "archived" => Some(RepoStatus::Archived),
+        _ => None,
     }
 }
 
@@ -363,6 +373,8 @@ fn repo_json(r: &RepoInfo) -> Value {
     json!({
         "repo_id": r.repo_id, "name": r.name, "head_rev": r.head_rev,
         "status": format!("{:?}", r.status), "owner_user_id": r.owner_user_id,
+        "deleted_at": r.deleted_at, "purge_after": r.purge_after,
+        "delete_reason": r.delete_reason,
     })
 }
 
@@ -414,6 +426,7 @@ fn overview_json(o: &AdminOverview) -> Value {
         "pending_quota_requests": o.pending_quota_requests,
         "objects": o.objects, "object_bytes": o.object_bytes,
         "purged_pending": o.purged_pending,
+        "deleted_repos": o.deleted_repos,
     })
 }
 
@@ -870,7 +883,9 @@ async fn repos(State(state): State<AdminState>, headers: HeaderMap) -> Response 
     };
     run(&state, move |store| {
         let items = store.admin_list_repos(&session, None)?;
-        Ok(json!({ "items": items.iter().map(repo_json).collect::<Vec<_>>() }))
+        // 已注销的仓库单独放回收站：混在「全部仓库」里会让人以为它还能用。
+        let live: Vec<&RepoInfo> = items.iter().filter(|r| !r.status.is_deleted()).collect();
+        Ok(json!({ "items": live.iter().map(|r| repo_json(r)).collect::<Vec<_>>() }))
     })
     .await
 }
@@ -902,9 +917,115 @@ async fn set_repo_status(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let status = parse_repo_status(&s(&body, "status"));
+    let status = match parse_repo_status(&s(&body, "status")) {
+        Some(status) => status,
+        None => return failure(StatusCode::BAD_REQUEST, "未知的仓库状态", None),
+    };
     run(&state, move |store| {
         Ok(json!({ "repo": repo_json(&store.set_repo_status(&elevated(&session), &id, status)?) }))
+    })
+    .await
+}
+
+/// 注销仓库（进入回收站）。管理员在这里做的是与客户端 owner 完全相同的动作，
+/// 只是不需要成员资格；保留期与恢复能力一致。
+async fn delete_repo(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let session = match admin_session(&state, &headers).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let reason = s(&body, "reason");
+    run(&state, move |store| {
+        let repo = store.delete_repo(&elevated(&session), &id, &reason)?;
+        let grace_days = store.repo_delete_grace_days()?;
+        Ok(json!({ "repo": repo_json(&repo), "grace_days": grace_days }))
+    })
+    .await
+}
+
+async fn restore_repo(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let session = match admin_session(&state, &headers).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    run(&state, move |store| {
+        let repo = store.restore_repo(&session, &id)?;
+        Ok(json!({ "repo": repo_json(&repo) }))
+    })
+    .await
+}
+
+/// 立即彻底删除：不可撤销，前端必须二次确认。
+async fn purge_repo(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let session = match admin_session(&state, &headers).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    run(&state, move |store| {
+        let outcome = store.purge_repo(&session, &id)?;
+        Ok(json!({
+            "repo_id": outcome.repo_id,
+            "freed_objects": outcome.freed_objects,
+            "reclaimed_bytes": outcome.reclaimed_bytes,
+        }))
+    })
+    .await
+}
+
+async fn deleted_repos(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    let session = match admin_session(&state, &headers).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    run(&state, move |store| {
+        let items = store.list_deleted_repos(&session, 500)?;
+        let grace_days = store.repo_delete_grace_days()?;
+        Ok(json!({
+            "items": items.iter().map(repo_json).collect::<Vec<_>>(),
+            "grace_days": grace_days,
+        }))
+    })
+    .await
+}
+
+async fn get_delete_policy(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    let session = match admin_session(&state, &headers).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    run(&state, move |store| {
+        store.require_admin_action(&session, "查看仓库注销保留期")?;
+        Ok(json!({ "grace_days": store.repo_delete_grace_days()? }))
+    })
+    .await
+}
+
+async fn set_delete_policy(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let session = match admin_session(&state, &headers).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let days = u(&body, "grace_days").min(3650) as u32;
+    run(&state, move |store| {
+        let days = store.set_repo_delete_grace_days(&session, days)?;
+        Ok(json!({ "grace_days": days }))
     })
     .await
 }

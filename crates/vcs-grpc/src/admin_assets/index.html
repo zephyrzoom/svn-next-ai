@@ -145,6 +145,15 @@
               <h3>全部仓库</h3>
               <div class="table-wrap"><table id="repos-table"><thead><tr><th>名称</th><th>版本</th><th>状态</th><th>仓库 ID</th><th>操作</th></tr></thead><tbody></tbody></table></div>
             </div>
+            <div class="card">
+              <div class="page-head"><h3>回收站</h3><button id="refresh-deleted" class="ghost">刷新</button></div>
+              <div class="row">
+                <label>注销保留天数<input id="delete-grace-days" type="number" min="0" max="3650" step="1" value="30" /></label>
+                <button id="save-delete-policy" class="ghost">保存</button>
+              </div>
+              <p class="hint">仓库注销后先进入回收站，保留期内可原样恢复；到期由后台维护彻底删除并释放磁盘空间。0 表示到期即删（最长等待一个维护周期）。改这里只影响之后注销的仓库。</p>
+              <div class="table-wrap"><table id="deleted-table"><thead><tr><th>名称</th><th>版本</th><th>注销时间</th><th>彻底删除时间</th><th>理由</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+            </div>
             <div id="repo-detail" class="card hidden">
               <div class="page-head"><h3 id="repo-detail-title">仓库详情</h3><button id="close-repo-detail" class="ghost">收起</button></div>
               <div class="split">
@@ -171,6 +180,12 @@
                     <select id="repo-status-select"><option value="Active">启用</option><option value="Disabled">停用</option><option value="Archived">归档</option></select>
                     <button id="save-repo-status" class="ghost">应用</button>
                   </div>
+                  <h4>注销</h4>
+                  <div class="row">
+                    <input id="delete-reason" placeholder="注销理由（可选）" spellcheck="false" />
+                    <button id="do-delete-repo" class="ghost danger">注销仓库</button>
+                  </div>
+                  <p class="hint">注销后仓库立即不可用，进入回收站；保留期内可在下方回收站恢复。</p>
                 </div>
               </div>
             </div>

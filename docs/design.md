@@ -2058,3 +2058,83 @@ JS 线程上。一份 3 GB 的文件，提交要算两遍摘要（扫描 + 提�
   首次计算后按 `head_rev` 命中缓存；旧版本里被手工删掉的树对象只跳过该分支，不让容量面板整体报错。
 - 回归：`crates/vcs-server/tests/lifecycle.rs::quota_usage_is_per_repo_not_shared_across_the_same_owner`
   同时钉住三件事——空仓库用量接近 0、A 仓库写入后 B 仓库用量不涨、同一份内容推进 B 不会被 A 的用量挡住。
+
+## 44. 仓库注销与回收站（2026-11-20）
+
+### 44.1 诉求
+
+仓库持有人要能自己把仓库「注销」：立刻停止使用、不再出现在列表里，但**给一次反悔机会**——
+N 天内管理员可以在管理端恢复，到期后彻底删除、释放磁盘空间。管理员自己也需要同一个入口
+（管理端直接注销），而不是只能停用 / 归档。
+
+归档（`ARCHIVED`）解决不了这件事：它语义是「只读封存」，没有删除期限，也不会回收任何字节。
+注销必须是独立状态。
+
+### 44.2 状态机
+
+```
+active / disabled / archived --(DeleteRepo: owner 或 admin)--> deleted
+deleted --(RestoreRepo: 仅 admin)--> 注销前的状态（prev_status）
+deleted --(到期后台维护 / PurgeRepo: 仅 admin)--> 物理删除（行不存在）
+```
+
+- 新状态 `REPO_STATUS_DELETED`（`repos.status = 'deleted'`），`RepoStatus::is_deleted()`。
+- `repos` 新增 `deleted_at` / `deleted_by` / `delete_reason` / `purge_after` / `prev_status` 五列。
+  老库靠 `migrate_repo_recycle_bin()` 重建表补上（SQLite 改不了 CHECK 约束）。
+- 注销后 `RepoService` 的入口（`require_repo`）直接回 `ERROR_CODE_REPO_DELETED`：
+  客户端据此提示「已注销，请联系管理员恢复」，而不是把它当成「不存在」或权限问题。
+- `SetRepoStatus` 拒绝把状态改成 / 改出 `deleted`，强制走 `DeleteRepo` / `RestoreRepo`，
+  避免把注销当成一次普通状态切换、绕过保留期与审计。
+
+### 44.3 保留期
+
+- 全局设置 `repo_delete_grace_days`，默认 **30 天**，管理端回收站卡片可改（0 表示到期即删）。
+- 注销那一刻把 `purge_after = now + N 天` **固化到仓库行**：之后再改全局设置，只影响
+  之后注销的仓库，不会把已经在回收站里的仓库提前删掉或无限延期。
+- 注销同时作废该仓库所有在途提交，并把待审批的扩容申请按「已拒绝（仓库已注销）」收口，
+  审批台不会积压一批永远批不下来的单子。
+- 仓库名在回收站期间仍被占用（`repos.name` 唯一）：恢复后还是同一个仓库，
+  不存在「注销后别人抢注同名」的歧义；彻底删除后名字释放。
+
+### 44.4 彻底删除与空间释放
+
+`purge_repo_rows()` 在单事务里按外键顺序删掉 `revision_changes` / `revisions` /
+`repo_members` / `purged_paths` / `retention_policies` / `quota_usage` / `upload_sessions` /
+`locks` / `acl` / `repo_quota_requests` / `gc_jobs`，最后删 `repos`。
+`audit_log` 与建库申请单**保留**（历史凭证不因为仓库消失而消失），申请单的 `approved_repo_id`
+只是一段文本，没有外键。
+
+删完元数据后再跑一轮 GC（`run_gc_job_with(job_id, sweep_orphan_trees = true)`）：
+
+- `reference_map()` 重新按全库版本计算可达性，只属于这个仓库的 blob 变成孤儿，被清扫；
+- 常规 GC 刻意保留 tree 对象（旧版本还能展开目录），但仓库都删了就没有「旧版本」可言。
+  这一轮额外回收「引用图里一个所有者都没有」的 tree 对象；仍被其它仓库 / 版本引用的树不受影响。
+
+自动回收挂在 `run_maintenance()` 的最前面（`purge_expired_repos()`），`vcs serve` 的维护间隔
+默认 300 秒，所以到期到真正删盘最多差一个周期。管理端的「彻底删除」按钮走 `PurgeRepo`，
+不等保留期，同样立即回收。
+
+### 44.5 入口与接口
+
+| 入口 | 动作 |
+| --- | --- |
+| 桌面端仓库页头「注销仓库」（仅 owner 可见） | `vcs:deleteRepo` → `DeleteRepo`，二次确认后从列表移除并提示恢复截止时间；**不动本地工作副本** |
+| 管理端「仓库详情」→ 注销 | `POST /api/repos/:id/delete` |
+| 管理端「回收站」 | `GET /api/repos/deleted`、`POST /api/repos/:id/restore`、`POST /api/repos/:id/destroy` |
+| 管理端保留期 | `GET/PUT /api/repo-delete-policy` |
+| CLI | `repo-delete` / `repo-restore` / `repo-purge` / `repo-deleted` / `repo-delete-policy` |
+
+管理端「全部仓库」不再返回已注销的仓库（它们只出现在回收站），否则会让人以为还能用。
+恢复回到 `prev_status`：注销前是「停用」的，恢复后仍是停用，不会被偷偷启用。
+
+### 44.6 验收
+
+- `crates/vcs-server/tests/lifecycle.rs`：owner 注销 → 列表消失 / 成员访问报 `RepoDeleted` → 恢复可用；
+  只有 owner 或管理员能注销；保留期为 0 时维护回收元数据与对象且名字可复用；
+  默认 30 天不被误删且 `purge_after` 不随设置变化；彻底删除要求「已在回收站 + 管理员」；
+  注销会关闭待审批扩容。
+- `crates/vcs-grpc/tests/e2e.rs::recycle_bin_rpcs_round_trip`：真实 gRPC 走完
+  改保留期 → 注销 → `ListRepos` 为空 / `GetHead` 回 `REPO_DELETED` → 回收站列表 → 恢复 →
+  再注销 → 彻底删除 → `GetRepo` 回 `REPO_NOT_FOUND`。
+- `desktop/scripts/smoke-admin.cjs`：注销 → 回收站可见（带理由与保留天数）→「全部仓库」不含它 →
+  状态接口不能绕过恢复 → 恢复回停用 → 彻底删除后回收站清空。

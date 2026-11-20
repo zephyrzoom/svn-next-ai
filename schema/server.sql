@@ -14,16 +14,26 @@ CREATE TABLE IF NOT EXISTS repos (
   name                  TEXT NOT NULL UNIQUE,
   head_rev              BIGINT NOT NULL DEFAULT 0,
   status                TEXT NOT NULL DEFAULT 'active'
-                        CHECK (status IN ('active', 'disabled', 'archived')),
+                        CHECK (status IN ('active', 'disabled', 'archived', 'deleted')),
   owner_user_id         TEXT NOT NULL,  -- 审批通过的申请人，或直通创建的管理员
   created_from_request  TEXT,           -- 关联的 repo_creation_requests.request_id
   quota_bytes           BIGINT NOT NULL DEFAULT 0,  -- 配额上限（唯一一条线）；0 表示继承全局默认配额
-  grace_days            INTEGER NOT NULL DEFAULT 7, -- 回收站宽限期
+  grace_days            INTEGER NOT NULL DEFAULT 7, -- 回收站宽限期（路径级清理）
+  -- 仓库注销（回收站）：status='deleted' 时下面四列才有值。
+  -- purge_after 在注销那一刻按当时的全局保留天数固化，之后改全局设置不影响已注销的仓库。
+  deleted_at            BIGINT,
+  deleted_by            TEXT,
+  delete_reason         TEXT,
+  purge_after           BIGINT,
+  -- 注销前的状态，恢复时原样回去（active / disabled / archived）。
+  prev_status           TEXT,
   created_at            BIGINT NOT NULL,
   updated_at            BIGINT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_repos_owner ON repos (owner_user_id, status);
+-- 刻意不给 purge_after 建索引：老库升级时 schema 会先于迁移执行，
+-- 索引引用新列会让整段 schema 直接失败；回收站表很小，全表扫描足够。
 
 -- ---------------- 服务端级配置 ----------------
 
@@ -39,6 +49,11 @@ CREATE TABLE IF NOT EXISTS system_settings (
 -- 两级都未配置时由 vcs-core 内置兜底常量兜底，保证始终存在上限。
 INSERT OR IGNORE INTO system_settings (key, value, updated_at, updated_by)
 VALUES ('default_quota_bytes', '0', 0, 'bootstrap');
+
+-- 预置键：repo_delete_grace_days，仓库注销后在回收站里保留的天数（默认 30）。
+-- 0 表示注销即彻底删除，管理员可在 Web 管理端调整。
+INSERT OR IGNORE INTO system_settings (key, value, updated_at, updated_by)
+VALUES ('repo_delete_grace_days', '30', 0, 'bootstrap');
 
 -- ---------------- 仓库创建申请 ----------------
 

@@ -475,6 +475,14 @@ ipcMain.handle('vcs:removeMember', (_event, repoId: string, userId: string) =>
   }),
 );
 
+/**
+ * 注销仓库：只允许仓库拥有者（服务端按 owner 复核）。
+ * 注销后仓库从列表中消失，进入服务端回收站；本地工作副本不动，恢复后还能接着用。
+ */
+ipcMain.handle('vcs:deleteRepo', (_event, repoId: string, reason = '') =>
+  wrap(async () => requireClient().deleteRepo(repoId, reason)),
+);
+
 /** 按用户名 / 姓名找可添加的 ACTIVE 用户；只返回用户名与姓名，不含敏感信息。 */
 ipcMain.handle('vcs:searchUsers', (_event, query: string, limit = 20) =>
   wrap(async () => requireClient().searchUsers(query, limit)),

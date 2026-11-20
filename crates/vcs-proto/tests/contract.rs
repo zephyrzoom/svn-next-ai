@@ -45,6 +45,7 @@ fn error_code_numbers_are_stable() {
         (pb::ErrorCode::QuotaConfigInvalid, 34),
         (pb::ErrorCode::IoError, 35),
         (pb::ErrorCode::InvalidArgument, 36),
+        (pb::ErrorCode::RepoDeleted, 37),
     ];
     for (code, number) in expected {
         assert_eq!(*code as i32, *number, "错误码编号被改动: {code:?}");

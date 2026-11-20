@@ -434,6 +434,25 @@ enum Cmd {
         #[arg(long)]
         status: String,
     },
+    /// 注销仓库（owner 或管理员）：进入回收站，保留期内可恢复
+    RepoDelete {
+        repo: String,
+        /// 注销理由（写进审计日志与回收站列表）
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// 从回收站恢复仓库（仅管理员）
+    RepoRestore { repo: String },
+    /// 彻底删除回收站里的仓库并立即回收对象（仅管理员，不可撤销）
+    RepoPurge { repo: String },
+    /// 列出回收站里的仓库（仅管理员）
+    RepoDeleted,
+    /// 查看 / 调整仓库注销保留天数（仅管理员）
+    RepoDeletePolicy {
+        /// 要设置的天数；不带则只查看当前值。0 表示到期即删
+        #[arg(long)]
+        days: Option<u32>,
+    },
     /// 列出自己的访问令牌
     PatList,
     /// 撤销访问令牌
@@ -1082,13 +1101,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let report = store.run_maintenance()?;
             println!(
                 "维护完成：保留策略清理 {} 个仓库（{} 个目录），转正 {} 条清理记录，\
-                 清扫 {} 个对象，释放 {}（共 {} 个仓库）",
+                 清扫 {} 个对象，释放 {}（共 {} 个仓库，回收站到期删除 {} 个）",
                 report.retention_repos,
                 report.retention_paths,
                 report.promoted_purges,
                 report.swept_objects,
                 human_bytes_exact(report.reclaimed_bytes),
-                report.repo_count
+                report.repo_count,
+                report.purged_repos
             );
             // 维护任务是系统级的（不属于任何仓库），因此不进 gc-status 的仓库维度查询。
             println!("任务号：{}（系统级任务，不归属任何仓库）", report.gc_job_id);
@@ -1642,6 +1662,84 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
+        Cmd::RepoDelete { repo, reason } => {
+            let store = ServerStore::open(&store_root)?;
+            let session = require_session(&store, &store_root)?;
+            let repo = store.delete_repo(&session, &repo, &reason)?;
+            println!("仓库 {} 已注销，进入回收站", repo.name);
+            match repo.purge_after {
+                Some(ts) => println!(
+                    "保留至 {}；在此之前管理员可执行 repo-restore 恢复，到期后彻底删除",
+                    format_time(ts)
+                ),
+                None => println!("保留期未设置，下一轮维护即彻底删除"),
+            }
+        }
+
+        Cmd::RepoRestore { repo } => {
+            let store = ServerStore::open(&store_root)?;
+            let session = require_session(&store, &store_root)?;
+            let repo = store.restore_repo(&session, &repo)?;
+            println!(
+                "仓库 {} 已从回收站恢复（状态 {}）",
+                repo.name,
+                repo_status_label(repo.status)
+            );
+        }
+
+        Cmd::RepoPurge { repo } => {
+            let store = ServerStore::open(&store_root)?;
+            let session = require_session(&store, &store_root)?;
+            let outcome = store.purge_repo(&session, &repo)?;
+            println!(
+                "仓库 {} 已彻底删除：回收 {} 个对象，释放 {}",
+                outcome.repo_name,
+                outcome.freed_objects,
+                human_bytes_exact(outcome.reclaimed_bytes)
+            );
+        }
+
+        Cmd::RepoDeleted => {
+            let store = ServerStore::open(&store_root)?;
+            let session = require_session(&store, &store_root)?;
+            let repos = store.list_deleted_repos(&session, 200)?;
+            if repos.is_empty() {
+                println!("回收站是空的");
+            } else {
+                println!("保留期：{} 天", store.repo_delete_grace_days()?);
+                for repo in repos {
+                    println!(
+                        "{:<24} r{:<6} 注销于 {}，{} 彻底删除{}",
+                        repo.name,
+                        repo.head_rev,
+                        repo.deleted_at
+                            .map(format_time)
+                            .unwrap_or_else(|| "—".into()),
+                        repo.purge_after
+                            .map(format_time)
+                            .unwrap_or_else(|| "—".into()),
+                        repo.delete_reason
+                            .as_deref()
+                            .filter(|v| !v.is_empty())
+                            .map(|v| format!("（理由：{v}）"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
+        }
+
+        Cmd::RepoDeletePolicy { days } => {
+            let store = ServerStore::open(&store_root)?;
+            match days {
+                Some(days) => {
+                    let session = require_session(&store, &store_root)?;
+                    let days = store.set_repo_delete_grace_days(&session, days)?;
+                    println!("仓库注销保留期已设为 {days} 天（只影响之后注销的仓库）");
+                }
+                None => println!("仓库注销保留期：{} 天", store.repo_delete_grace_days()?),
+            }
+        }
+
         Cmd::RepoStatus { repo, status } => {
             let store = ServerStore::open(&store_root)?;
             let session = require_session(&store, &store_root)?;
@@ -1855,6 +1953,7 @@ fn repo_status_label(status: vcs_core::RepoStatus) -> &'static str {
         vcs_core::RepoStatus::Active => "active",
         vcs_core::RepoStatus::Disabled => "disabled",
         vcs_core::RepoStatus::Archived => "archived",
+        vcs_core::RepoStatus::Deleted => "deleted",
     }
 }
 

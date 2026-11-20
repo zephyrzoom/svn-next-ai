@@ -107,6 +107,8 @@
                 <span class="eyebrow">仓库</span>
                 <h1 id="repo-title">—</h1>
                 <span id="repo-rev" class="pill">HEAD r0</span>
+                <!-- 注销只属于仓库拥有者：不是 owner 时整按钮不出现（服务端仍会复核） -->
+                <button id="delete-repo" class="ghost danger hidden" type="button">注销仓库</button>
                 <button id="refresh-repos" class="ghost">刷新</button>
               </div>
               <!-- 工作副本上下文条：随时看得到「当前在哪个仓库、本地目录在哪」 -->

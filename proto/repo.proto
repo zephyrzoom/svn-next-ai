@@ -86,6 +86,10 @@ enum ErrorCode {
   // 过期时间早于当前时间等）。不能复用 INVALID_SESSION：那会让客户端误判
   // 成"登录态失效"并跳去重新登录。
   ERROR_CODE_INVALID_ARGUMENT = 36;
+
+  // 仓库已注销（在回收站里）。客户端据此提示「仓库已注销，请联系管理员恢复」，
+  // 而不是把它当成权限问题或仓库不存在。
+  ERROR_CODE_REPO_DELETED = 37;
 }
 
 enum GcState {
@@ -791,6 +795,8 @@ enum RepoStatus {
   REPO_STATUS_ACTIVE = 1;
   REPO_STATUS_DISABLED = 2;
   REPO_STATUS_ARCHIVED = 3;
+  // 已注销：进入回收站，保留 N 天后彻底删除。恢复只能由管理员执行。
+  REPO_STATUS_DELETED = 4;
 }
 
 enum RepoCreationStatus {
@@ -810,6 +816,12 @@ message RepoInfo {
   uint64 quota_bytes = 6;  // 0 表示继承全局默认
   int64 created_at = 8;
   reserved 7;  // 原 quota_hard_bytes
+  // 注销时间与「彻底删除时间」；未注销时均为 0。
+  // 注销后的仓库只出现在管理端回收站里，purge_after 到点由后台维护物理删除。
+  int64 deleted_at = 9;
+  int64 purge_after = 10;
+  // 注销理由（仅管理端回收站展示，未注销时为空）。
+  string delete_reason = 11;
 }
 
 message RepoCreationInfo {
@@ -982,6 +994,70 @@ message SetRepoStatusRequest {
 
 message SetRepoStatusResponse {
   Status status = 1;
+}
+
+// ---------------- 仓库注销与回收站 ----------------
+
+// 注销：仓库拥有者（客户端）或管理员（管理端）都可以发起。
+// 注销后仓库立即不可用，进入回收站；保留期（全局 N 天）内管理员可恢复，
+// 到期由后台维护物理删除并回收对象，释放空间。
+message DeleteRepoRequest {
+  string repo_id = 1;
+  // 可选，写进审计日志与回收站列表。
+  string reason = 2;
+}
+
+message DeleteRepoResponse {
+  Status status = 1;
+  // 返回带 deleted_at / purge_after 的仓库快照，客户端据此提示恢复截止时间。
+  RepoInfo repo = 2;
+}
+
+message RestoreRepoRequest {
+  string repo_id = 1;
+}
+
+message RestoreRepoResponse {
+  Status status = 1;
+  RepoInfo repo = 2;
+}
+
+// 立即彻底删除（不等保留期）：仅管理员，不可撤销。
+message PurgeRepoRequest {
+  string repo_id = 1;
+}
+
+message PurgeRepoResponse {
+  Status status = 1;
+  uint64 freed_objects = 2;
+  uint64 reclaimed_bytes = 3;
+}
+
+message ListDeletedReposRequest {
+  uint32 limit = 1;
+}
+
+message ListDeletedReposResponse {
+  Status status = 1;
+  repeated RepoInfo repos = 2;
+  // 当前全局保留天数（注销时已固化到每个仓库的 purge_after 里，改这里只影响之后注销的仓库）。
+  uint32 grace_days = 3;
+}
+
+message GetRepoDeletePolicyRequest {}
+
+message GetRepoDeletePolicyResponse {
+  Status status = 1;
+  uint32 grace_days = 2;
+}
+
+message UpdateRepoDeletePolicyRequest {
+  uint32 grace_days = 1;
+}
+
+message UpdateRepoDeletePolicyResponse {
+  Status status = 1;
+  uint32 grace_days = 2;
 }
 
 // 管理员直通：跳过审批，用于首次部署、迁移与自动化测试，同样写审计日志。
@@ -1192,9 +1268,9 @@ service AuthService {
   rpc SetUserRole(SetUserRoleRequest) returns (SetUserRoleResponse);
 }
 
-// 仓库创建与审批：RequestRepo / RequestRepoExpansion 面向所有 ACTIVE 用户（扩容还要求
-// 是仓库成员），Approve / Reject / CreateRepoDirect / SetRepoStatus / GetStorageCapacity
-// 仅限全局 admin。
+// 仓库创建与审批：RequestRepo / RequestRepoExpansion / DeleteRepo 面向所有 ACTIVE 用户
+// （DeleteRepo 还要求是仓库 owner），Approve / Reject / CreateRepoDirect / SetRepoStatus /
+// RestoreRepo / PurgeRepo / GetStorageCapacity 仅限全局 admin。
 service RepoAdminService {
   rpc RequestRepo(RequestRepoRequest) returns (RequestRepoResponse);
   rpc GetRepoCreation(GetRepoCreationRequest) returns (GetRepoCreationResponse);
@@ -1219,4 +1295,12 @@ service RepoAdminService {
   rpc UpdateQuotaDefaults(UpdateQuotaDefaultsRequest) returns (UpdateQuotaDefaultsResponse);
   rpc GetRepoQuota(GetRepoQuotaRequest) returns (GetRepoQuotaResponse);
   rpc SetRepoQuota(SetRepoQuotaRequest) returns (SetRepoQuotaResponse);
+
+  // 注销 / 回收站：DeleteRepo 由拥有者或管理员发起；恢复与彻底删除仅限管理员。
+  rpc DeleteRepo(DeleteRepoRequest) returns (DeleteRepoResponse);
+  rpc RestoreRepo(RestoreRepoRequest) returns (RestoreRepoResponse);
+  rpc PurgeRepo(PurgeRepoRequest) returns (PurgeRepoResponse);
+  rpc ListDeletedRepos(ListDeletedReposRequest) returns (ListDeletedReposResponse);
+  rpc GetRepoDeletePolicy(GetRepoDeletePolicyRequest) returns (GetRepoDeletePolicyResponse);
+  rpc UpdateRepoDeletePolicy(UpdateRepoDeletePolicyRequest) returns (UpdateRepoDeletePolicyResponse);
 }
