@@ -11,7 +11,7 @@
  * 主进程用系统加密存储保存凭证（默认 30 天免登录，界面无开关），启动时 tryResume 直接恢复会话。
  *
  * 主界面只有一条主线：**仓库**。左侧是仓库列表，选中哪一个，右侧整个工作区就属于它
- * （工作副本 / 提交历史 / 容量三个 tab）。顶部固定一条上下文条，写着当前仓库名、
+ * （工作副本 / 提交历史 / 设置三个 tab；容量与注销都在设置页）。顶部固定一条上下文条，写着当前仓库名、
  * HEAD 版本与本地工作副本目录——工作副本本质上就是这个仓库在本地的一份拷贝，
  * 把它和仓库并列成两个菜单会让人在两个视图之间丢失「我在哪个仓库」的坐标。
  * 目录与仓库对不上时（拷贝过来的工作副本、换了账号），以目录里 wc.db 记录的 repoId
@@ -223,7 +223,7 @@ function setView(name) {
   }
 }
 
-/** 仓库工作区里的 tab：工作副本 / 提交历史 / 容量 / 成员（owner 专属）。 */
+/** 仓库工作区里的 tab：工作副本 / 提交历史 / 设置（容量 + 注销）/ 成员（owner 专属）。 */
 function setTab(name) {
   // 成员页只属于 owner：即使有人手动触发，非 owner 也退回工作副本。
   const next = name === 'members' && !isRepoOwner(currentRepo()) ? 'wc' : name;
@@ -237,7 +237,7 @@ function setTab(name) {
     pane.classList.toggle('hidden', pane.dataset.tab !== next);
   }
   if (next === 'history') void guard('加载历史', loadLog);
-  if (next === 'quota') void guard('加载容量', loadQuota);
+  if (next === 'settings') void guard('加载容量', loadQuota);
   if (next === 'members') void guard('加载成员', loadMembers);
   // 回到工作副本页顺手对一次盘：人可能刚在编辑器里改完文件。
   if (next === 'wc') autoScan();
@@ -577,7 +577,7 @@ async function selectRepo(repoId) {
   setView('repo');
 
   await Promise.all([guard('加载容量', loadQuota), guard('加载历史', loadLog)]);
-  // 停在新仓库的成员页时，成员列表也得跟着换仓库（非 owner 已在 renderMemberAccess 里退回）。
+  // 停在新仓库的成员页时，成员列表也得跟着换仓库（非 owner 已在 renderOwnerAccess 里退回）。
   if (state.tab === 'members') await guard('加载成员', loadMembers);
   if (state.wcDir) await guard('扫描工作副本', refreshStatus);
 }
@@ -610,20 +610,23 @@ function renderRepoHead() {
   el('repo-rev').textContent = repo ? `HEAD r${repo.headRev}` : 'HEAD r0';
   document.title = repo ? `${repo.name} — svn-next` : 'svn-next';
   renderWcBar();
-  renderMemberAccess();
+  renderOwnerAccess();
 }
 
 /**
- * 「成员」页只属于仓库拥有者：owner 唯一且不可转让，所以直接比 ownerUserId。
- * 不是 owner 时整页（连同 tab）都不出现——把人领到一个「无权限」的页面上没有意义。
+ * owner 专属入口：「成员」页与「设置」页里的注销卡片。
+ *
+ * owner 唯一且不可转让，所以直接比 ownerUserId；不是 owner 时整页（连同 tab）与
+ * 注销卡片都不出现——把人领到一个「无权限」的页面上没有意义。服务端仍独立复核。
  */
 function isRepoOwner(repo) {
   return Boolean(repo && state.user && repo.ownerUserId && repo.ownerUserId === state.user.userId);
 }
 
-function renderMemberAccess() {
+function renderOwnerAccess() {
   const owner = isRepoOwner(currentRepo());
   el('tab-members').classList.toggle('hidden', !owner);
+  el('danger-card').classList.toggle('hidden', !owner);
   if (!owner && state.tab === 'members') setTab('wc');
 }
 
@@ -1151,7 +1154,7 @@ async function forgetWorkingCopy(dir, message) {
 
 /** 打开「再检出一份」：输入框必须清空，不能预填正在用的那份目录。 */
 function openCheckout(dir = '') {
-  // 上下文条在历史 / 容量 tab 上也在，回到工作副本 tab 才看得见检出卡片。
+  // 上下文条在历史 / 设置 tab 上也在，回到工作副本 tab 才看得见检出卡片。
   setTab('wc');
   el('dir').value = dir;
   state.checkoutOpen = true;
