@@ -2122,7 +2122,7 @@ deleted --(到期后台维护 / PurgeRepo: 仅 admin)--> 物理删除（行不�
 
 | 入口 | 动作 |
 | --- | --- |
-| 桌面端仓库页头「注销仓库」（仅 owner 可见） | `vcs:deleteRepo` → `DeleteRepo`，二次确认后从列表移除并提示恢复截止时间；**不动本地工作副本** |
+| 桌面端「成员」页底部「注销仓库」（该页仅 owner 可见，不占页头） | `vcs:deleteRepo` → `DeleteRepo`，二次确认后从列表移除并提示恢复截止时间；**不动本地工作副本** |
 | 管理端「仓库详情」→ 注销 | `POST /api/repos/:id/delete` |
 | 管理端「回收站」 | `GET /api/repos/deleted`、`POST /api/repos/:id/restore`、`POST /api/repos/:id/destroy` |
 | 管理端保留期 | `GET/PUT /api/repo-delete-policy` |

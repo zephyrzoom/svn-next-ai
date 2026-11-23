@@ -624,8 +624,6 @@ function isRepoOwner(repo) {
 function renderMemberAccess() {
   const owner = isRepoOwner(currentRepo());
   el('tab-members').classList.toggle('hidden', !owner);
-  // 注销也是 owner 的专属动作：客户端只是入口，服务端按 owner 独立复核。
-  el('delete-repo').classList.toggle('hidden', !owner);
   if (!owner && state.tab === 'members') setTab('wc');
 }
 

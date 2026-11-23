@@ -107,8 +107,6 @@
                 <span class="eyebrow">仓库</span>
                 <h1 id="repo-title">—</h1>
                 <span id="repo-rev" class="pill">HEAD r0</span>
-                <!-- 注销只属于仓库拥有者：不是 owner 时整按钮不出现（服务端仍会复核） -->
-                <button id="delete-repo" class="ghost danger hidden" type="button">注销仓库</button>
                 <button id="refresh-repos" class="ghost">刷新</button>
               </div>
               <!-- 工作副本上下文条：随时看得到「当前在哪个仓库、本地目录在哪」 -->
@@ -355,6 +353,19 @@
                 <p class="hint">
                   搜索不分权限：先选中人，再在添加时分配读写权限。添加立即生效，并写入审计日志。
                 </p>
+              </div>
+
+              <!-- 危险操作收在 owner 专属页的最下面：不在页头抢注意力，需要时又能找到。
+                   服务端仍按 owner 独立复核，界面藏起来不等于权限收窄。 -->
+              <div class="card narrow">
+                <div class="card-head">
+                  <h2>危险操作</h2>
+                </div>
+                <p class="hint">
+                  注销后仓库立即不可用并进入回收站，保留期内可由管理员恢复，到期彻底删除。
+                  本地工作副本不会被删除。
+                </p>
+                <button id="delete-repo" class="ghost danger" type="button">注销仓库</button>
               </div>
             </section>
           </section>
