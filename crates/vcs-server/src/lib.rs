@@ -2858,11 +2858,25 @@ impl ServerStore {
             out
         };
 
+        // 已经彻底删除的路径不该再计入本仓库的账：共享 CAS 下对象可能还留在盘上
+        // （别的仓库 / 本仓库别的路径还引用着），GC 不会删它，但用户已经把这份内容删了。
+        // 统计口径必须和 GC 的标记口径一致，否则「删完容量没变」就是必然结果。
+        let purged = self.active_purge_prefixes(repo_id)?;
         let mut hashes: BTreeSet<Hash> = BTreeSet::new();
-        let mut seen_trees: BTreeSet<Hash> = BTreeSet::new();
-        for hex in roots {
-            let root = vcs_core::from_hex(&hex)?;
-            self.collect_reachable(&root, &mut seen_trees, &mut hashes)?;
+        if purged.is_empty() {
+            let mut seen_trees: BTreeSet<Hash> = BTreeSet::new();
+            for hex in roots {
+                let root = vcs_core::from_hex(&hex)?;
+                self.collect_reachable(&root, &mut seen_trees, &mut hashes)?;
+            }
+        } else {
+            // 同一棵树可能既出现在被删的路径下、又出现在保留的路径下：
+            // 访问标记必须带路径，否则先走到被删的那份就会把保留的那份一起跳过。
+            let mut seen: BTreeSet<(Hash, String)> = BTreeSet::new();
+            for hex in roots {
+                let root = vcs_core::from_hex(&hex)?;
+                self.collect_reachable_skipping(&root, "", &purged, &mut seen, &mut hashes)?;
+            }
         }
 
         let used_bytes = self.sum_stored_bytes(&hashes)?;
@@ -2871,6 +2885,63 @@ impl ServerStore {
             cache.insert(repo_id.to_string(), (head_rev, used_bytes, object_count));
         }
         Ok((used_bytes, object_count))
+    }
+
+    /// 本仓库里已经生效的清理前缀。老库可能留着 `pending` / `reverted` 的历史行：
+    /// 前者迁移时已收口成 `active`，后者表示内容已经恢复，不该跳过。
+    fn active_purge_prefixes(&self, repo_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT path_pattern FROM purged_paths WHERE repo_id = ?1 AND state = 'active'",
+            )
+            .map_err(db("读取清理标记失败"))?;
+        let rows = stmt
+            .query_map(params![repo_id], |r| r.get::<_, String>(0))
+            .map_err(db("读取清理标记失败"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(db("读取清理标记失败"))?);
+        }
+        Ok(out)
+    }
+
+    /// 带路径的可达性收集：落在清理前缀下的条目直接跳过，连子树都不进。
+    ///
+    /// 只在仓库存在清理标记时走这条路（多一次字符串拼接），没有标记时仍用
+    /// 按哈希去重的快路径——绝大多数仓库一辈子都不会清理一次。
+    fn collect_reachable_skipping(
+        &self,
+        tree_hash: &Hash,
+        prefix: &str,
+        purged: &[String],
+        seen: &mut BTreeSet<(Hash, String)>,
+        out: &mut BTreeSet<Hash>,
+    ) -> Result<()> {
+        if !seen.insert((*tree_hash, prefix.to_string())) {
+            return Ok(());
+        }
+        out.insert(*tree_hash);
+        let entries = match tree::read_tree(&self.objects, tree_hash) {
+            Ok(entries) => entries,
+            Err(err) if err.code == ErrorCode::ObjectMissing => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        for entry in entries {
+            let path = if prefix.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{prefix}/{}", entry.name)
+            };
+            if path_under_any(&path, purged) {
+                continue;
+            }
+            out.insert(entry.hash);
+            if entry.kind == EntryKind::Dir {
+                self.collect_reachable_skipping(&entry.hash, &path, purged, seen, out)?;
+            }
+        }
+        Ok(())
     }
 
     /// 从一棵树开始收集可达对象：树按哈希去重（内容相同的目录只走一遍），

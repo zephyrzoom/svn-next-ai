@@ -218,12 +218,6 @@ export interface CandidateRow {
   lastModifiedRev: number;
 }
 
-export interface PurgeEstimateRow {
-  reclaimableBytes: number;
-  affectedRevisions: number;
-  sharedPaths: string[];
-}
-
 export interface PurgeResultRow {
   newRev: number;
   gcJobId: string;
@@ -686,17 +680,6 @@ export class VcsClient {
       firstSeenRev: row.firstSeenRev as number,
       lastModifiedRev: row.lastModifiedRev as number,
     }));
-  }
-
-  /** dry-run：预估清理这些路径能释放多少，不修改任何数据。 */
-  async estimatePurge(repoId: string, paths: string[]): Promise<PurgeEstimateRow> {
-    const resp = await this.invoke<any>(this.repo, 'estimatePurge', { repoId, paths });
-    assertOk(resp.status);
-    return {
-      reclaimableBytes: resp.reclaimableBytes as number,
-      affectedRevisions: resp.affectedRevisions as number,
-      sharedPaths: (resp.sharedPaths ?? []) as string[],
-    };
   }
 
   /**

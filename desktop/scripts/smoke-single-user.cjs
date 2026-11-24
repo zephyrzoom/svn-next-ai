@@ -400,7 +400,7 @@ async function main() {
     if ((await wc.status(WC)).length !== 0) fail('留空提交后本地仍有变更');
     console.log(`  留空时写入的历史：${autoLog[0].message}（r${auto.rev}）`);
 
-    step('空间治理：预估 → 清理 → GC');
+    step('空间治理：找出可清理目录');
     const quotaBefore = await client.getQuota(repo.repoId);
     if (quotaBefore.usedBytes <= 0) fail('对象池占用不该是 0');
     const candidates = await client.listPurgeCandidates(repo.repoId, 10);
@@ -409,13 +409,6 @@ async function main() {
     console.log(
       `  配额 ${quotaBefore.usedBytes} 字节（来源 ${quotaBefore.source}）；` +
         `202610 独占 ${october.uniqueBytes} / 逻辑 ${october.logicalBytes}`,
-    );
-
-    const estimate = await client.estimatePurge(repo.repoId, ['202610']);
-    if (estimate.reclaimableBytes <= 0) fail('预估可释放为 0，说明独占计算有问题');
-    if (estimate.affectedRevisions < 1) fail('影响版本数不该为 0');
-    console.log(
-      `  预估可释放 ${estimate.reclaimableBytes} 字节，影响 ${estimate.affectedRevisions} 个版本（dry-run 未改动数据）`,
     );
 
     step('彻底删除：一次跑完，内容字节当场回收');
@@ -431,7 +424,9 @@ async function main() {
     const tree = await client.getTree(repo.repoId, 0);
     if (tree.some((entry) => entry.path.startsWith('202610/'))) fail('清理后 HEAD 仍含 202610');
     const quotaAfter = await client.getQuota(repo.repoId);
-    if (quotaAfter.usedBytes > quotaBefore.usedBytes) fail('清理后占用反而变大了');
+    if (quotaAfter.usedBytes >= quotaBefore.usedBytes) {
+      fail(`彻底删除后用量没有下降：${quotaBefore.usedBytes} → ${quotaAfter.usedBytes}`);
+    }
     console.log(`  HEAD 已不含 202610；对象池占用 ${quotaBefore.usedBytes} → ${quotaAfter.usedBytes}`);
 
     step('配额设置：全局默认 → 单仓库覆盖 → 恢复继承');

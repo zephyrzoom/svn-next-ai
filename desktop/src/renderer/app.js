@@ -1546,9 +1546,7 @@ function cleanupPaths() {
 function renderCleanupSummary() {
   const count = cleanupPaths().length;
   el('cleanup-summary').textContent = count ? `已选 ${count} 项` : '';
-  const blocked = count === 0 || state.cleanup.busy;
-  el('cleanup-estimate').disabled = blocked;
-  el('cleanup-purge').disabled = blocked;
+  el('cleanup-purge').disabled = count === 0 || state.cleanup.busy;
   el('cleanup-purge').textContent = state.cleanup.busy ? '删除中…' : '彻底删除';
 }
 
@@ -1669,19 +1667,6 @@ function closeCleanupPicker() {
   el('cleanup-open').textContent = '选择目录或文件';
 }
 
-/** dry-run 预估：只回报能释放多少，不动任何数据。 */
-async function estimateCleanup() {
-  const repo = currentRepo();
-  const paths = cleanupPaths();
-  if (!repo || !paths.length) return;
-  const estimate = unwrap(await api.estimatePurge(repo.repoId, paths), '预估释放量');
-  const shared = estimate.sharedPaths.length
-    ? '；其中部分内容与其它路径或仓库共享，不会被回收'
-    : '';
-  el('cleanup-result').textContent =
-    `预计释放 ${humanBytes(estimate.reclaimableBytes)}，影响 ${estimate.affectedRevisions} 个历史版本${shared}。`;
-}
-
 /**
  * 彻底删除：二次确认后提交。成功后配额与目录树都要重读——
  * 删除会推进 HEAD，旧树里已经没有这些路径了。
@@ -1701,12 +1686,22 @@ async function purgeCleanup() {
   state.cleanup.busy = true;
   renderCleanupSummary();
   try {
+    // 删之前记一次用量：删完再读一次，差出来的就是这次真释放的容量。
+    // 没有「预估」这一步——用户要的是结果，不是猜。
+    const before = unwrap(await api.getQuota(repo.repoId), '加载容量');
     const outcome = unwrap(await api.purge(repo.repoId, paths, '桌面端彻底删除'), '彻底删除');
+    const after = unwrap(await api.getQuota(repo.repoId), '加载容量');
+    renderQuota(after);
+    const freed = Math.max(0, before.usedBytes - after.usedBytes);
+
     state.cleanup.checked = new Set();
     state.cleanup.paths = [];
-    el('cleanup-result').textContent = `已彻底删除 ${paths.length} 项，生成 r${outcome.newRev}，空间已回收。`;
-    banner('已彻底删除，空间已回收');
-    await guard('加载容量', loadQuota);
+    el('cleanup-result').textContent =
+      `已彻底删除 ${paths.length} 项，生成 r${outcome.newRev}，释放 ${humanBytes(freed)}。` +
+      (freed === 0
+        ? '（这份内容还被其它路径或别的仓库引用：本仓库的账已经扣掉了，物理副本要等最后一个引用消失才回收。）'
+        : '');
+    banner(`已彻底删除，释放 ${humanBytes(freed)}`);
     await guard('读取仓库目录', () => loadCleanupTree(true));
   } finally {
     state.cleanup.busy = false;
@@ -2371,7 +2366,6 @@ el('cleanup-open').addEventListener('click', () => {
   else openCleanupPicker();
 });
 el('cleanup-close').addEventListener('click', closeCleanupPicker);
-el('cleanup-estimate').addEventListener('click', () => void guard('预估释放量', estimateCleanup));
 el('cleanup-purge').addEventListener('click', () => void guard('彻底删除', purgeCleanup));
 el('delete-repo').addEventListener('click', () => void guard('注销仓库', deleteCurrentRepo));
 el('disconnect').addEventListener('click', () => void guard('退出登录', disconnect));

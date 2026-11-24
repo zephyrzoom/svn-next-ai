@@ -496,11 +496,6 @@ ipcMain.handle('vcs:getQuota', (_event, repoId: string) =>
 
 // ---------------- 主动清理（彻底删除） ----------------
 
-/** dry-run：只回报「删这些路径能释放多少」，不动任何数据。 */
-ipcMain.handle('vcs:estimatePurge', (_event, repoId: string, paths: string[]) =>
-  wrap(async () => requireClient().estimatePurge(repoId, paths)),
-);
-
 /** 彻底删除：删除提交 + 裁剪标记 + 立即 GC。没有宽限期，也没有撤销。 */
 ipcMain.handle('vcs:purge', (_event, repoId: string, paths: string[], reason = '') =>
   wrap(async () => requireClient().purge(repoId, paths, reason)),

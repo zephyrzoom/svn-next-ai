@@ -104,7 +104,7 @@ function verify({ app, BrowserWindow, ipcMain }) {
   const LIVE_DIR = '/tmp/wc-live';
   const checkoutCalls = [];
   // 清理空间的请求参数：断言「勾选被规范化后再提交」只能在这里看。
-  const cleanupCalls = { estimates: [], purges: [] };
+  const cleanupCalls = { purges: [] };
   // 多份工作副本的回归会真的走一遍「切换 / 移出」，那两条路径会扫描工作副本：
   // 给 status / diff 塞合法数据，免得断言被 null 数据带偏。status 的 repoId 跟着目录走，
   // 否则跨仓库绑定后 refreshStatus 会把上下文又切回去。
@@ -137,13 +137,6 @@ function verify({ app, BrowserWindow, ipcMain }) {
       }
       if (channel === 'vcs:getQuota') {
         return { ok: true, data: { usedBytes: 2048, limitBytes: 4096, source: 3 } };
-      }
-      if (channel === 'vcs:estimatePurge') {
-        cleanupCalls.estimates.push(args);
-        return {
-          ok: true,
-          data: { reclaimableBytes: 1024, affectedRevisions: 3, sharedPaths: ['docs/readme.md'] },
-        };
       }
       if (channel === 'vcs:purge') {
         cleanupCalls.purges.push(args);
@@ -854,9 +847,6 @@ function verify({ app, BrowserWindow, ipcMain }) {
             }
           });
           const summary = document.getElementById('cleanup-summary').textContent.trim();
-          document.getElementById('cleanup-estimate').click();
-          await new Promise((r) => setTimeout(r, 40));
-          const estimateText = document.getElementById('cleanup-result').textContent;
           const realConfirm = window.confirm;
           window.confirm = () => true;
           document.getElementById('cleanup-purge').click();
@@ -870,12 +860,11 @@ function verify({ app, BrowserWindow, ipcMain }) {
           state.user = saved.user;
           setTab(saved.tab || 'wc');
           shell.classList.add('hidden');
-          return { roots, summary, estimateText, resultText, summaryAfter };
+          return { roots, summary, resultText, summaryAfter };
         })()`);
       } catch (err) {
         problems.push(`清理空间求值失败：${err && err.message}`);
       }
-      cleanup.estimates = cleanupCalls.estimates.slice();
       cleanup.purges = cleanupCalls.purges.slice();
 
       // 检出目录被用户删掉：刷新只摘登记（清单里不留虚空路径），扫描只回报 missing，
@@ -1161,14 +1150,11 @@ function verify({ app, BrowserWindow, ipcMain }) {
         清理空间可勾选目录与文件并彻底删除:
           cleanup.roots?.join(',') === 'docs/,src/,README.md' &&
           cleanup.summary === '已选 2 项' &&
-          String(cleanup.estimateText || '').includes('预计释放') &&
-          String(cleanup.estimateText || '').includes('共享') &&
-          cleanup.estimates?.length === 1 &&
-          cleanup.estimates[0][1].join(',') === 'README.md,docs' &&
           cleanup.purges?.length === 1 &&
           cleanup.purges[0][1].join(',') === 'README.md,docs' &&
           String(cleanup.purges[0][2] || '').includes('彻底删除') &&
           String(cleanup.resultText || '').includes('已彻底删除 2 项') &&
+          String(cleanup.resultText || '').includes('释放') &&
           cleanup.summaryAfter === '',
         检出时把勾选的稀疏规则传给主进程:
           checkoutCalls.some(

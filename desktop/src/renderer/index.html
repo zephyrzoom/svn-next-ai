@@ -303,13 +303,12 @@
                   <button id="cleanup-open" class="ghost" type="button">选择目录或文件</button>
                 </div>
                 <p class="hint">
-                  勾中的路径会从服务器彻底删除：内容字节立即回收，不可撤销。
+                  勾中的路径会从服务器彻底删除，不可撤销；删除完会显示这次实际释放了多少容量。
                   只有读写及以上成员能执行；本地工作副本里的文件不会被删，下次更新时按服务端删除处理。
                 </p>
                 <div id="cleanup-picker" class="hidden">
                   <div id="cleanup-tree" class="sparse-tree"></div>
                   <div class="row">
-                    <button id="cleanup-estimate" class="ghost" type="button">预估释放</button>
                     <button id="cleanup-purge" class="danger" type="button" disabled>彻底删除</button>
                     <button id="cleanup-close" class="ghost" type="button">收起</button>
                   </div>

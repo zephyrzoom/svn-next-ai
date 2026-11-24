@@ -170,14 +170,6 @@ export interface QuotaDto {
   source: number;
 }
 
-/** 彻底删除的预估（dry-run）：删这些路径能真正回收多少、影响几个历史版本。 */
-export interface PurgeEstimateDto {
-  reclaimableBytes: number;
-  affectedRevisions: number;
-  /** 被其它路径或仓库共享、因此收不回来的路径示例。 */
-  sharedPaths: string[];
-}
-
 /** 彻底删除的结果：删除提交的版本号与当场跑完的 GC 任务。 */
 export interface PurgeResultDto {
   newRev: number;
@@ -293,7 +285,6 @@ export interface VcsApi {
   getQuota(repoId: string): Promise<Envelope<QuotaDto>>;
 
   // —— 主动清理（彻底删除，不可撤销） ——
-  estimatePurge(repoId: string, paths: string[]): Promise<Envelope<PurgeEstimateDto>>;
   purge(repoId: string, paths: string[], reason?: string): Promise<Envelope<PurgeResultDto>>;
 
   // —— 预留占位通道（桌面端不调用，实现仍为 notWired） ——
@@ -348,7 +339,6 @@ const api: VcsApi = {
   searchUsers: (query, limit) => ipcRenderer.invoke('vcs:searchUsers', query, limit),
 
   getQuota: (repoId) => ipcRenderer.invoke('vcs:getQuota', repoId),
-  estimatePurge: (repoId, paths) => ipcRenderer.invoke('vcs:estimatePurge', repoId, paths),
   purge: (repoId, paths, reason) => ipcRenderer.invoke('vcs:purge', repoId, paths, reason),
 
   getHead: (repoId) => ipcRenderer.invoke('vcs:getHead', repoId),

@@ -478,7 +478,7 @@ CAS 去重下，「目录有多大」与「删掉它能释放多少」是两回�
 ```
 创建 202701 → BeginCommit → QUOTA_EXCEEDED
    ↓ 响应携带候选：202610 可释放 12.4 GB
-设置 → 清理空间 → 勾 202610 → 预估（dry-run）
+设置 → 清理空间 → 勾 202610 → 彻底删除
    ↓
 彻底删除：删除提交 + 裁剪标记 + 当场 GC
    ↓ 容量立刻回落，本地工作副本下次更新时按服务端删除处理
@@ -2192,9 +2192,12 @@ deleted --(到期后台维护 / PurgeRepo: 仅 admin)--> 物理删除（行不�
 「设置」页新增「清理空间」卡片：
 
 1. 点「选择目录或文件」懒加载 HEAD 目录树（复用 `vcs:tree`），目录与文件都可勾；
-2. 勾完点「预估释放」→ `EstimatePurge` 回「预计释放 X，影响 Y 个历史版本」，被共享的部分会说明不会被回收；
-3. 「彻底删除」二次确认（列出前 6 项），确认后走 `vcs:purge`；
-4. 成功后清空选择、重读配额与目录树，并提示本地文件不会自动删除。
+2. 「彻底删除」二次确认（列出前 6 项），确认后走 `vcs:purge`；
+3. 删之前记一次用量、删完再读一次，差出来的就是**实际释放**的容量，直接写在结果里——
+   不做「预估」，用户要的是结果而不是猜；
+4. 若实际释放为 0，明确解释「这份内容还被其它路径或别的仓库引用」：本仓库的账已经扣掉，
+   物理副本要等最后一个引用消失。
+5. 成功后清空选择、重读目录树，并提示本地文件不会自动删除。
 
 权限：读写及以上成员可执行；只读成员点预估就会被服务端拒绝（`RepoMemberForbidden`），界面不做假按钮。
 
@@ -2202,5 +2205,7 @@ deleted --(到期后台维护 / PurgeRepo: 仅 admin)--> 物理删除（行不�
 
 - `lifecycle.rs::immediate_purge_reclaims_only_uniquely_owned_content`：删除后 HEAD 不含目标路径、独占内容物理消失、共享内容保留、记录即 `active`；
 - `lifecycle.rs::purged_content_reports_content_purged_instead_of_missing`：旧版本读被清理的路径回 `CONTENT_PURGED`；
+- `lifecycle.rs::purge_releases_usage_even_when_content_is_shared`：内容被别的仓库共享时，
+  对象仍在盘上，但本仓库的用量必须立刻回落（统计口径与 GC 标记口径一致）；
 - `smoke-single-user.cjs`：预估 → 彻底删除 → GC 完成 → 配额回落（不再有回收站与撤销段）；
-- `smoke-ui.cjs`：设置页勾选 `docs/` + `README.md` → 摘要「已选 2 项」→ 预估 → 提交的路径被规范化成 `README.md,docs` → 删除后摘要清空。
+- `smoke-ui.cjs`：设置页勾选 `docs/` + `README.md` → 摘要「已选 2 项」→ 直接删除 → 提交的路径被规范化成 `README.md,docs` → 结果里带实际释放量、摘要清空。

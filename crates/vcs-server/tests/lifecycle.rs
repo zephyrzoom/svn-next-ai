@@ -2120,3 +2120,104 @@ fn old_database_gains_recycle_bin_columns() {
     assert_eq!(deleted.status, RepoStatus::Deleted);
     assert_eq!(store.list_deleted_repos(&alice, 10).unwrap().len(), 1);
 }
+
+/// 彻底删除必须把「用量」一起降下来：用户删了几个 G 却只释放几字节，
+/// 说明统计口径还在把已回收的历史内容算进去。
+#[test]
+fn purge_releases_reported_usage_immediately() {
+    let sb = Sandbox::new("usage-release");
+    let store = sb.store();
+    let alice = admin(&store);
+    let repo = store.create_repo_direct(&alice, "bulk", 0).unwrap();
+    let src = sb.dir("bulk");
+    // 真随机（xorshift），避免 zstd 把规律字节压成几百字节、让断言失去意义。
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let data: Vec<u8> = (0..2 * 1024 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xFF) as u8
+        })
+        .collect();
+    write_file(&src, "big/one.bin", &data);
+    write_file(&src, "keep.txt", b"keep\n");
+    store
+        .import_dir(&alice, &repo.repo_id, &src, "bulk")
+        .unwrap();
+
+    let before = store.usage(&repo.repo_id).unwrap().used_bytes;
+    assert!(
+        before >= data.len() as u64,
+        "2 MiB 内容应体现在用量里：{before}"
+    );
+
+    store
+        .purge(&alice, &repo.repo_id, &[String::from("big")], "清理")
+        .unwrap();
+
+    let after = store.usage(&repo.repo_id).unwrap().used_bytes;
+    let freed = before.saturating_sub(after);
+    assert!(
+        freed >= data.len() as u64 / 2,
+        "删除 2 MiB 后应释放绝大部分：{before} → {after}（只释放 {freed} 字节）"
+    );
+}
+
+/// 共享 CAS 下同一个对象可能被别的仓库（或本仓库别的路径）引用：
+/// 物理回收要等最后一个引用消失，但**本仓库的用量必须立刻把已删除路径扣掉**。
+/// 否则用户删了几个 G 再回来看容量，会发现一字节都没少。
+#[test]
+fn purge_releases_usage_even_when_content_is_shared() {
+    let sb = Sandbox::new("usage-shared");
+    let store = sb.store();
+    let alice = admin(&store);
+
+    let mut state = 0x1234_5678_9ABC_DEF0u64;
+    let data: Vec<u8> = (0..1024 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xFF) as u8
+        })
+        .collect();
+    let blob_bytes = data.len() as u64;
+
+    let keep = store.create_repo_direct(&alice, "keep", 0).unwrap();
+    let drop_repo = store.create_repo_direct(&alice, "drop", 0).unwrap();
+    let keep_src = sb.dir("keep-src");
+    let drop_src = sb.dir("drop-src");
+    write_file(&keep_src, "shared.bin", &data);
+    write_file(&drop_src, "shared.bin", &data);
+    store
+        .import_dir(&alice, &keep.repo_id, &keep_src, "留一份")
+        .unwrap();
+    store
+        .import_dir(&alice, &drop_repo.repo_id, &drop_src, "再引一份")
+        .unwrap();
+
+    let before_drop = store.usage(&drop_repo.repo_id).unwrap().used_bytes;
+    assert!(before_drop >= blob_bytes);
+
+    store
+        .purge(
+            &alice,
+            &drop_repo.repo_id,
+            &[String::from("shared.bin")],
+            "清理",
+        )
+        .unwrap();
+
+    // 对象还在盘上（keep 仓库还引用着），但 drop 仓库的账上不该再有它。
+    let keep_after = store.usage(&keep.repo_id).unwrap().used_bytes;
+    let drop_after = store.usage(&drop_repo.repo_id).unwrap().used_bytes;
+    assert!(
+        keep_after >= blob_bytes,
+        "共享内容仍被 keep 引用，它的用量不能掉：{keep_after}"
+    );
+    assert!(
+        before_drop.saturating_sub(drop_after) >= blob_bytes / 2,
+        "drop 仓库删掉共享内容后用量必须回落：{before_drop} → {drop_after}"
+    );
+}
