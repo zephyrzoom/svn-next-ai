@@ -858,13 +858,7 @@ fn immediate_purge_reclaims_only_uniquely_owned_content() {
     let oct_bytes = store.objects().stored_size(&oct_only).unwrap();
 
     let outcome = store
-        .purge(
-            &alice,
-            &repo_id,
-            &[String::from("202610")],
-            true,
-            "磁盘不足",
-        )
+        .purge(&alice, &repo_id, &[String::from("202610")], "磁盘不足")
         .unwrap();
 
     assert_eq!(outcome.deleted, 2, "202610 下两个文件都该从 HEAD 移除");
@@ -887,6 +881,13 @@ fn immediate_purge_reclaims_only_uniquely_owned_content() {
     );
     // 释放量至少要覆盖那份独占内容（tree 对象按设计不回收，会带来少量新增）。
     assert!(status.reclaimed_bytes >= oct_bytes);
+
+    // 彻底删除是终态：记录直接是 active，没有宽限期、没有撤销。
+    let records = store.list_purged_paths(&alice, &repo_id).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].path, "202610");
+    assert_eq!(records[0].state, "active");
+    assert!(records[0].activated_at.is_some(), "写入即生效");
 }
 
 #[test]
@@ -895,7 +896,7 @@ fn purged_content_reports_content_purged_instead_of_missing() {
     let store = sb.store();
     let (alice, repo_id, oct_only, _) = seed_monthly_repo(&sb, &store);
     store
-        .purge(&alice, &repo_id, &[String::from("202610")], true, "清理")
+        .purge(&alice, &repo_id, &[String::from("202610")], "清理")
         .unwrap();
 
     // r1 的树里仍留着这个路径（元数据永久保留），但内容已经没了。
@@ -913,35 +914,6 @@ fn purged_content_reports_content_purged_instead_of_missing() {
 }
 
 #[test]
-fn grace_period_keeps_content_until_gc_promotes_the_purge() {
-    let sb = Sandbox::new("purge-grace");
-    let store = sb.store();
-    let (alice, repo_id, oct_only, _) = seed_monthly_repo(&sb, &store);
-
-    let outcome = store
-        .purge(
-            &alice,
-            &repo_id,
-            &[String::from("202610")],
-            false,
-            "误删保护",
-        )
-        .unwrap();
-    // 未立即释放：任务只是排队，内容一个字节都没动。
-    let queued = store
-        .gc_status(&alice, &repo_id, &outcome.gc_job_id)
-        .unwrap();
-    assert_eq!(queued.state, "queued");
-    assert!(store.objects().exists(&oct_only));
-
-    // 手动 GC 时宽限期未到，PENDING 不该被当成 ACTIVE。
-    let status = store.run_gc(&alice, &repo_id).unwrap();
-    assert_eq!(status.state, "done");
-    assert_eq!(status.reclaimed_bytes, 0);
-    assert!(store.objects().exists(&oct_only), "宽限期内不能回收");
-}
-
-#[test]
 fn gc_never_reclaims_content_used_by_another_repository() {
     let sb = Sandbox::new("gc-crossrepo");
     let store = sb.store();
@@ -956,7 +928,7 @@ fn gc_never_reclaims_content_used_by_another_repository() {
         .unwrap();
 
     store
-        .purge(&alice, &repo_id, &[String::from("202610")], true, "清理")
+        .purge(&alice, &repo_id, &[String::from("202610")], "清理")
         .unwrap();
     // 再跑一次全库 GC 也不能动别人的内容。
     store.run_gc(&alice, &other.repo_id).unwrap();
@@ -983,7 +955,7 @@ fn purge_requires_write_role() {
     let reader = store.authenticate(&token).unwrap();
 
     let err = store
-        .purge(&reader, &repo_id, &[String::from("202610")], true, "试试")
+        .purge(&reader, &repo_id, &[String::from("202610")], "试试")
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::RepoMemberForbidden);
 }
@@ -1610,88 +1582,6 @@ fn disabling_a_repo_blocks_writes_and_aborts_sessions() {
 // ---------------- 回收站：撤销清理 ----------------
 
 #[test]
-fn revert_purge_restores_content_that_still_exists() {
-    let sb = Sandbox::new("purge-revert");
-    let store = sb.store();
-    let (alice, repo_id, oct_only, _) = seed_monthly_repo(&sb, &store);
-
-    // 进入回收站（不走立即释放），内容还在盘上。
-    let outcome = store
-        .purge(
-            &alice,
-            &repo_id,
-            &[String::from("202610")],
-            false,
-            "先放回收站",
-        )
-        .unwrap();
-    let purged = store.list_purged_paths(&alice, &repo_id).unwrap();
-    assert_eq!(purged.len(), 1);
-    assert_eq!(purged[0].path, "202610");
-    assert_eq!(purged[0].state, "pending");
-    assert!(purged[0].grace_until.is_some());
-
-    let new_rev = store
-        .revert_purge(&alice, &repo_id, &purged[0].purge_id)
-        .unwrap();
-    assert!(new_rev > outcome.rev, "撤销本身也是一次提交");
-
-    // HEAD 里又有了，内容与当初一致。
-    let (_, _, files) = store.files_at(&alice, &repo_id, None).unwrap();
-    let restored = files
-        .iter()
-        .find(|entry| entry.path == "202610/only-oct.txt")
-        .expect("恢复后应回到 HEAD");
-    assert_eq!(restored.hash, oct_only);
-    let data = store
-        .read_file(&alice, &repo_id, None, "202610/only-oct.txt")
-        .unwrap();
-    assert_eq!(data, b"oct only\n");
-
-    // 标记变 reverted：GC 不再跳过这些路径，内容因此得以保留。
-    let after = store.list_purged_paths(&alice, &repo_id).unwrap();
-    assert_eq!(after[0].state, "reverted");
-    let gc = store.run_gc(&alice, &repo_id).unwrap();
-    assert_eq!(gc.reclaimed_bytes, 0);
-    assert!(store.objects().exists(&oct_only));
-
-    // 同一记录不能撤销两次。
-    let err = store
-        .revert_purge(&alice, &repo_id, &after[0].purge_id)
-        .unwrap_err();
-    assert_eq!(err.code, ErrorCode::InvalidArgument);
-}
-
-#[test]
-fn revert_purge_reports_content_purged_after_sweep() {
-    let sb = Sandbox::new("purge-revert-gone");
-    let store = sb.store();
-    let (alice, repo_id, oct_only, _) = seed_monthly_repo(&sb, &store);
-
-    // 立即释放：GC 已把独占内容物理删除。
-    store
-        .purge(
-            &alice,
-            &repo_id,
-            &[String::from("202610")],
-            true,
-            "立即释放",
-        )
-        .unwrap();
-    assert!(!store.objects().exists(&oct_only));
-    let purged = store.list_purged_paths(&alice, &repo_id).unwrap();
-
-    // 恢复必须诚实地失败，而不是造一个指向空内容的版本。
-    let err = store
-        .revert_purge(&alice, &repo_id, &purged[0].purge_id)
-        .unwrap_err();
-    assert_eq!(err.code, ErrorCode::ContentPurged);
-    // 标记没有被改成 reverted，用户还能看到这条记录。
-    let after = store.list_purged_paths(&alice, &repo_id).unwrap();
-    assert_eq!(after[0].state, "active");
-}
-
-#[test]
 fn purged_paths_are_member_only() {
     let sb = Sandbox::new("purge-list-gate");
     let store = sb.store();
@@ -1709,355 +1599,9 @@ fn purged_paths_are_member_only() {
 
 // ---------------- 保留策略 ----------------
 
-/// 造三个按月归档的目录，每个一份独有内容。
-fn seed_three_months(store: &ServerStore, sb: &Sandbox) -> (vcs_server::Session, String) {
-    let alice = admin(store);
-    let repo = store.create_repo_direct(&alice, "monthly", 0).unwrap();
-    let src = sb.dir("monthly-src");
-    for month in ["202609", "202610", "202611"] {
-        write_file(&src, &format!("{month}/report.txt"), month.as_bytes());
-    }
-    store.import_dir(&alice, &repo.repo_id, &src, "r1").unwrap();
-    (alice, repo.repo_id)
-}
-
-#[test]
-fn retention_policy_keeps_only_recent_months() {
-    let sb = Sandbox::new("retention");
-    let store = sb.store();
-    let (alice, repo_id) = seed_three_months(&store, &sb);
-
-    let policy = store
-        .upsert_retention_policy(
-            &alice,
-            &repo_id,
-            vcs_server::RetentionPolicyInput {
-                policy_id: None,
-                path_pattern: r"^20\d{4}$".into(),
-                keep_months: 2,
-                max_bytes: 0,
-                max_age_days: 0,
-                enabled: true,
-                dry_run: false,
-            },
-        )
-        .unwrap();
-    assert_eq!(policy.keep_months, 2);
-    assert_eq!(
-        store
-            .list_retention_policies(&alice, &repo_id)
-            .unwrap()
-            .len(),
-        1
-    );
-
-    // dry-run：报告候选但不产生提交。
-    let preview = store
-        .apply_retention(&alice, &repo_id, true, false)
-        .unwrap();
-    assert_eq!(preview.candidates, vec!["202609".to_string()]);
-    assert!(preview.reclaimable_bytes > 0);
-    assert_eq!(preview.new_rev, 0);
-    let (_, rev, _) = store.files_at(&alice, &repo_id, None).unwrap();
-    assert_eq!(rev, 1, "dry-run 不该改动任何数据");
-
-    // 真正执行：只剩最近两个月。
-    let applied = store
-        .apply_retention(&alice, &repo_id, false, true)
-        .unwrap();
-    assert_eq!(applied.candidates, vec!["202609".to_string()]);
-    assert!(applied.new_rev > 1);
-    let (_, _, files) = store.files_at(&alice, &repo_id, None).unwrap();
-    let dirs: std::collections::BTreeSet<&str> = files
-        .iter()
-        .map(|f| f.path.split('/').next().unwrap())
-        .collect();
-    assert_eq!(
-        dirs,
-        ["202610", "202611"]
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>()
-    );
-
-    // 再跑一次：已经满足策略，不再产生提交。
-    let again = store
-        .apply_retention(&alice, &repo_id, false, true)
-        .unwrap();
-    assert!(again.candidates.is_empty());
-    assert_eq!(again.new_rev, 0);
-}
-
-#[test]
-fn retention_policy_validates_pattern_and_requires_a_limit() {
-    let sb = Sandbox::new("retention-validate");
-    let store = sb.store();
-    let (alice, repo_id) = seed_three_months(&store, &sb);
-
-    let invalid_regex = store
-        .upsert_retention_policy(
-            &alice,
-            &repo_id,
-            vcs_server::RetentionPolicyInput {
-                policy_id: None,
-                path_pattern: "(unclosed".into(),
-                keep_months: 1,
-                max_bytes: 0,
-                max_age_days: 0,
-                enabled: true,
-                dry_run: true,
-            },
-        )
-        .unwrap_err();
-    assert_eq!(invalid_regex.code, ErrorCode::InvalidArgument);
-
-    let no_limit = store
-        .upsert_retention_policy(
-            &alice,
-            &repo_id,
-            vcs_server::RetentionPolicyInput {
-                policy_id: None,
-                path_pattern: "^20".into(),
-                keep_months: 0,
-                max_bytes: 0,
-                max_age_days: 0,
-                enabled: true,
-                dry_run: true,
-            },
-        )
-        .unwrap_err();
-    assert_eq!(no_limit.code, ErrorCode::InvalidArgument);
-
-    // 只有 owner / maintainer 能配策略。
-    store
-        .create_user(&alice, "carol2", "王佳", PASSWORD, Role::User)
-        .unwrap();
-    store
-        .add_member(&alice, &repo_id, "carol2", RepoMemberRole::Writer)
-        .unwrap();
-    let (token, _) = store.login("carol2", PASSWORD).unwrap();
-    let carol = store.authenticate(&token).unwrap();
-    let err = store
-        .upsert_retention_policy(
-            &carol,
-            &repo_id,
-            vcs_server::RetentionPolicyInput {
-                policy_id: None,
-                path_pattern: "^20".into(),
-                keep_months: 1,
-                max_bytes: 0,
-                max_age_days: 0,
-                enabled: true,
-                dry_run: true,
-            },
-        )
-        .unwrap_err();
-    assert_eq!(err.code, ErrorCode::RepoMemberForbidden);
-}
-
-#[test]
-fn retention_policy_dry_run_flag_blocks_execution() {
-    let sb = Sandbox::new("retention-dry");
-    let store = sb.store();
-    let (alice, repo_id) = seed_three_months(&store, &sb);
-
-    store
-        .upsert_retention_policy(
-            &alice,
-            &repo_id,
-            vcs_server::RetentionPolicyInput {
-                policy_id: None,
-                path_pattern: r"^20\d{4}$".into(),
-                keep_months: 1,
-                max_bytes: 0,
-                max_age_days: 0,
-                enabled: true,
-                dry_run: true,
-            },
-        )
-        .unwrap();
-
-    // 策略自己标了 dry_run：不带 --dry-run 的执行也必须被拒，不能悄悄删数据。
-    let err = store
-        .apply_retention(&alice, &repo_id, false, true)
-        .unwrap_err();
-    assert_eq!(err.code, ErrorCode::InvalidArgument);
-    // 显式 dry-run 仍可预览。
-    let preview = store
-        .apply_retention(&alice, &repo_id, true, false)
-        .unwrap();
-    assert_eq!(preview.candidates.len(), 2);
-    assert_eq!(preview.new_rev, 0);
-
-    // 删除策略后一切归零。
-    let policies = store.list_retention_policies(&alice, &repo_id).unwrap();
-    store
-        .delete_retention_policy(&alice, &repo_id, &policies[0].policy_id)
-        .unwrap();
-    assert!(store
-        .list_retention_policies(&alice, &repo_id)
-        .unwrap()
-        .is_empty());
-    let none = store
-        .apply_retention(&alice, &repo_id, false, true)
-        .unwrap();
-    assert!(none.candidates.is_empty());
-}
-
 // ---------------- 后台维护与宽限期 ----------------
 
-#[test]
-fn maintenance_promotes_expired_graces_and_reclaims() {
-    let sb = Sandbox::new("maintenance");
-    let store = sb.store();
-    let (alice, repo_id, oct_only, _) = seed_monthly_repo(&sb, &store);
-
-    // 宽限期设为 0：清理记录创建时就到期，下一次维护会把它转正并回收。
-    store.set_repo_grace_days(&alice, &repo_id, 0).unwrap();
-    store
-        .purge(
-            &alice,
-            &repo_id,
-            &[String::from("202610")],
-            false,
-            "宽限期为 0",
-        )
-        .unwrap();
-    let before = store.list_purged_paths(&alice, &repo_id).unwrap();
-    assert_eq!(before[0].state, "pending");
-    assert!(store.objects().exists(&oct_only));
-
-    let report = store.run_maintenance().unwrap();
-    assert_eq!(report.promoted_purges, 1);
-    assert!(report.swept_objects >= 1);
-    assert!(report.reclaimed_bytes > 0);
-    assert!(report.repo_count >= 1);
-
-    let after = store.list_purged_paths(&alice, &repo_id).unwrap();
-    assert_eq!(after[0].state, "active");
-    assert!(!store.objects().exists(&oct_only), "维护后应真正释放");
-}
-
-#[test]
-fn maintenance_does_not_touch_purges_still_in_grace() {
-    let sb = Sandbox::new("maintenance-grace");
-    let store = sb.store();
-    let (alice, repo_id, oct_only, _) = seed_monthly_repo(&sb, &store);
-
-    // 默认宽限期 7 天：维护不该把它转正，更不该回收内容。
-    store
-        .purge(
-            &alice,
-            &repo_id,
-            &[String::from("202610")],
-            false,
-            "还在宽限期",
-        )
-        .unwrap();
-    let report = store.run_maintenance().unwrap();
-    assert_eq!(report.promoted_purges, 0);
-    assert_eq!(report.reclaimed_bytes, 0);
-    let after = store.list_purged_paths(&alice, &repo_id).unwrap();
-    assert_eq!(after[0].state, "pending");
-    assert!(store.objects().exists(&oct_only));
-}
-
-#[test]
-fn grace_days_must_be_set_by_a_writer() {
-    let sb = Sandbox::new("grace-role");
-    let store = sb.store();
-    let (alice, repo_id, _, _) = seed_monthly_repo(&sb, &store);
-    store
-        .create_user(&alice, "reader2", "只读", PASSWORD, Role::User)
-        .unwrap();
-    store
-        .add_member(&alice, &repo_id, "reader2", RepoMemberRole::Reader)
-        .unwrap();
-    let (token, _) = store.login("reader2", PASSWORD).unwrap();
-    let reader = store.authenticate(&token).unwrap();
-
-    let err = store.set_repo_grace_days(&reader, &repo_id, 1).unwrap_err();
-    assert_eq!(err.code, ErrorCode::RepoMemberForbidden);
-    store.set_repo_grace_days(&alice, &repo_id, 3).unwrap();
-}
-
 // ---------------- 系统身份：保留策略的自动执行 ----------------
-
-#[test]
-fn maintenance_executes_non_dry_run_retention() {
-    let sb = Sandbox::new("maintenance-retention");
-    let store = sb.store();
-    let (alice, repo_id) = seed_three_months(&store, &sb);
-
-    // 宽限期设 0：本轮 purge 产生的记录立刻可转正，同一轮 GC 就能回收。
-    store.set_repo_grace_days(&alice, &repo_id, 0).unwrap();
-    store
-        .upsert_retention_policy(
-            &alice,
-            &repo_id,
-            vcs_server::RetentionPolicyInput {
-                policy_id: None,
-                path_pattern: r"^20\d{4}$".into(),
-                keep_months: 1,
-                max_bytes: 0,
-                max_age_days: 0,
-                enabled: true,
-                dry_run: false,
-            },
-        )
-        .unwrap();
-
-    let report = store.run_maintenance().unwrap();
-    assert_eq!(report.retention_repos, 1, "应有一个仓库被策略清理");
-    assert_eq!(report.retention_paths, 2, "保留最近 1 个，另外两个应被清理");
-    assert_eq!(report.promoted_purges, 2, "两条清理记录应在同一轮转正");
-    assert!(report.reclaimed_bytes > 0);
-
-    let (_, _, files) = store.files_at(&alice, &repo_id, None).unwrap();
-    let dirs: std::collections::BTreeSet<&str> = files
-        .iter()
-        .map(|f| f.path.split('/').next().unwrap())
-        .collect();
-    assert_eq!(
-        dirs,
-        ["202611"]
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>()
-    );
-
-    // 再跑一轮：策略已满足，不再产生提交。
-    let again = store.run_maintenance().unwrap();
-    assert_eq!(again.retention_paths, 0);
-}
-
-#[test]
-fn maintenance_ignores_dry_run_policies() {
-    let sb = Sandbox::new("maintenance-dry");
-    let store = sb.store();
-    let (alice, repo_id) = seed_three_months(&store, &sb);
-
-    store
-        .upsert_retention_policy(
-            &alice,
-            &repo_id,
-            vcs_server::RetentionPolicyInput {
-                policy_id: None,
-                path_pattern: r"^20\d{4}$".into(),
-                keep_months: 1,
-                max_bytes: 0,
-                max_age_days: 0,
-                enabled: true,
-                dry_run: true,
-            },
-        )
-        .unwrap();
-
-    let report = store.run_maintenance().unwrap();
-    assert_eq!(report.retention_paths, 0, "仅预览的策略不该在后台被执行");
-
-    let (_, rev, files) = store.files_at(&alice, &repo_id, None).unwrap();
-    assert_eq!(rev, 1, "不该产生删除提交");
-    assert_eq!(files.len(), 3);
-}
 
 #[test]
 fn system_session_cannot_be_authenticated() {
@@ -2554,7 +2098,7 @@ fn old_database_gains_recycle_bin_columns() {
                (repo_id, name, head_rev, status, owner_user_id, created_from_request,
                 quota_bytes, grace_days, created_at, updated_at)
              SELECT repo_id, name, head_rev, status, owner_user_id, created_from_request,
-                    quota_bytes, grace_days, created_at, updated_at
+                    quota_bytes, 7, created_at, updated_at
              FROM repos;
              DROP TABLE repos;
              ALTER TABLE repos_old RENAME TO repos;

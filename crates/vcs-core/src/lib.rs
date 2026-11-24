@@ -188,14 +188,6 @@ pub struct PurgeEstimate {
     pub shared_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PurgeRequest {
-    pub paths: Vec<String>,
-    /// 跳过回收站宽限期，立即触发 GC（配额不足场景默认开启）。
-    pub immediate: bool,
-    pub reason: Option<String>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GcState {
     Queued,

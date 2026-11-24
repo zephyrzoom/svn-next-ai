@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Json, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{get, post, put};
 use axum::Router;
 use serde_json::{json, Value};
 use vcs_core::{
@@ -24,9 +24,8 @@ use vcs_core::{
 use vcs_server::{
     authenticate_ldap, ActorKind, AdminOverview, AdminUser, GcJobStatus, LdapPublicConfig,
     LdapSettings, LdapTestOutcome, MemberInfo, PurgeCandidate, PurgeEstimate, PurgeOutcome,
-    PurgedPathInfo, RegistrationInfo, RepoInfo, RepoQuotaRequestInfo, RepoRequestInfo,
-    RetentionApplyOutcome, RetentionPolicyInfo, RetentionPolicyInput, ServerStore, Session,
-    StorageCapacity, TlsMode, UsageInfo, UserInfo,
+    PurgedPathInfo, RegistrationInfo, RepoInfo, RepoQuotaRequestInfo, RepoRequestInfo, ServerStore,
+    Session, StorageCapacity, TlsMode, UsageInfo, UserInfo,
 };
 
 use crate::Store;
@@ -98,10 +97,6 @@ pub fn app(store: Store) -> Router {
         .route("/api/repos/:id/estimate", post(estimate_purge))
         .route("/api/repos/:id/purge", post(purge))
         .route("/api/repos/:id/purged", get(purged))
-        .route("/api/repos/:id/purged/:purge_id/revert", post(revert_purge))
-        .route("/api/repos/:id/policies", get(policies).post(upsert_policy))
-        .route("/api/repos/:id/policies/:policy_id", delete(delete_policy))
-        .route("/api/repos/:id/retention", post(apply_retention))
         .route("/api/repos/:id/gc", post(run_gc))
         .route("/api/repos/:id/gc/:job_id", get(gc_status))
         .with_state(state)
@@ -457,24 +452,7 @@ fn purged_json(p: &PurgedPathInfo) -> Value {
     json!({
         "purge_id": p.purge_id, "path": p.path, "state": p.state,
         "reason": p.reason, "purged_by": p.purged_by,
-        "created_at": p.created_at, "grace_until": p.grace_until,
-        "activated_at": p.activated_at,
-    })
-}
-
-fn policy_json(p: &RetentionPolicyInfo) -> Value {
-    json!({
-        "policy_id": p.policy_id, "path_pattern": p.path_pattern,
-        "keep_months": p.keep_months, "max_bytes": p.max_bytes,
-        "max_age_days": p.max_age_days, "enabled": p.enabled,
-        "dry_run": p.dry_run, "created_at": p.created_at,
-    })
-}
-
-fn retention_apply_json(a: &RetentionApplyOutcome) -> Value {
-    json!({
-        "candidates": a.candidates, "reclaimable_bytes": a.reclaimable_bytes,
-        "new_rev": a.new_rev,
+        "created_at": p.created_at, "activated_at": p.activated_at,
     })
 }
 
@@ -1280,14 +1258,12 @@ async fn purge(
         Err(resp) => return resp,
     };
     let paths = strings(&body, "paths");
-    let immediate = b(&body, "immediate");
     let reason = s(&body, "reason");
     run(&state, move |store| {
         Ok(purge_outcome_json(&store.purge(
             &elevated(&session),
             &id,
             &paths,
-            immediate,
             &reason,
         )?))
     })
@@ -1306,111 +1282,6 @@ async fn purged(
     run(&state, move |store| {
         let items = store.list_purged_paths(&elevated(&session), &id)?;
         Ok(json!({ "items": items.iter().map(purged_json).collect::<Vec<_>>() }))
-    })
-    .await
-}
-
-async fn revert_purge(
-    State(state): State<AdminState>,
-    headers: HeaderMap,
-    Path((id, purge_id)): Path<(String, String)>,
-) -> Response {
-    let session = match admin_session(&state, &headers).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-    run(&state, move |store| {
-        let rev = store.revert_purge(&elevated(&session), &id, &purge_id)?;
-        Ok(json!({ "rev": rev }))
-    })
-    .await
-}
-
-async fn policies(
-    State(state): State<AdminState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Response {
-    let session = match admin_session(&state, &headers).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-    run(&state, move |store| {
-        let items = store.list_retention_policies(&elevated(&session), &id)?;
-        Ok(json!({ "items": items.iter().map(policy_json).collect::<Vec<_>>() }))
-    })
-    .await
-}
-
-async fn upsert_policy(
-    State(state): State<AdminState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(body): Json<Value>,
-) -> Response {
-    let session = match admin_session(&state, &headers).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-    let policy_id = s(&body, "policy_id");
-    let input = RetentionPolicyInput {
-        policy_id: if policy_id.is_empty() {
-            None
-        } else {
-            Some(policy_id)
-        },
-        path_pattern: s(&body, "path_pattern"),
-        keep_months: u(&body, "keep_months") as u32,
-        max_bytes: u(&body, "max_bytes"),
-        max_age_days: u(&body, "max_age_days") as u32,
-        enabled: b(&body, "enabled"),
-        dry_run: b(&body, "dry_run"),
-    };
-    run(&state, move |store| {
-        Ok(policy_json(&store.upsert_retention_policy(
-            &elevated(&session),
-            &id,
-            input,
-        )?))
-    })
-    .await
-}
-
-async fn delete_policy(
-    State(state): State<AdminState>,
-    headers: HeaderMap,
-    Path((id, policy_id)): Path<(String, String)>,
-) -> Response {
-    let session = match admin_session(&state, &headers).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-    run(&state, move |store| {
-        store.delete_retention_policy(&elevated(&session), &id, &policy_id)?;
-        Ok(json!({}))
-    })
-    .await
-}
-
-async fn apply_retention(
-    State(state): State<AdminState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(body): Json<Value>,
-) -> Response {
-    let session = match admin_session(&state, &headers).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-    let dry_run = b(&body, "dry_run");
-    let immediate = b(&body, "immediate");
-    run(&state, move |store| {
-        Ok(retention_apply_json(&store.apply_retention(
-            &elevated(&session),
-            &id,
-            dry_run,
-            immediate,
-        )?))
     })
     .await
 }

@@ -210,13 +210,10 @@ enum Cmd {
     },
     /// 预估清理这些目录能释放多少空间（dry-run，不改任何数据）
     Estimate { repo: String, paths: Vec<String> },
-    /// 清理目录：删除提交 + 路径裁剪 + GC
+    /// 彻底删除目录或文件：删除提交 + 裁剪标记 + 立即 GC，不可撤销
     Purge {
         repo: String,
         paths: Vec<String>,
-        /// 跳过回收站宽限期，立即释放（磁盘已满时用这个）
-        #[arg(long)]
-        immediate: bool,
         #[arg(long, default_value = "")]
         reason: String,
     },
@@ -224,51 +221,11 @@ enum Cmd {
     Gc { repo: String },
     /// 查询 GC 任务状态
     GcStatus { repo: String, job_id: String },
-    /// 执行一次后台维护（转正到期清理 + 全库 GC）
+    /// 执行一次后台维护（回收站到期仓库 + 全库 GC）
     Maintenance,
-    /// 列出保留策略
-    RetentionList { repo: String },
-    /// 新建 / 更新保留策略
-    RetentionSet {
-        repo: String,
-        /// 顶层目录名的正则，例如 ^20\d{4}$
-        #[arg(long)]
-        pattern: String,
-        /// 保留最近 N 个目录（按名称倒序）
-        #[arg(long, default_value_t = 0)]
-        keep_months: u32,
-        /// 最多保留多少字节
-        #[arg(long, default_value_t = 0)]
-        max_bytes: u64,
-        /// 超过 N 天未修改就清理
-        #[arg(long, default_value_t = 0)]
-        max_age_days: u32,
-        /// 更新已有策略
-        #[arg(long, default_value = "")]
-        id: String,
-        /// 停用该策略
-        #[arg(long)]
-        disabled: bool,
-        /// 策略默认只预览不执行；加这个开关才会真的删数据
-        #[arg(long)]
-        execute: bool,
-    },
-    /// 删除保留策略
-    RetentionRm { repo: String, policy_id: String },
-    /// 评估并执行保留策略
-    RetentionApply {
-        repo: String,
-        /// 只预览候选，不改动数据
-        #[arg(long)]
-        dry_run: bool,
-        /// 执行时跳过回收站宽限期
-        #[arg(long)]
-        immediate: bool,
-    },
-    /// 查看回收站（已执行的清理记录）
+    /// 查看彻底删除记录（审计用，内容已回收）
+    /// 查看彻底删除记录（审计用，内容已回收）
     Purged { repo: String },
-    /// 撤销一次清理，把内容恢复到最新版本
-    Unpurge { repo: String, purge_id: String },
     /// 列出可清理目录候选（按独占大小排序）
     Candidates {
         repo: String,
@@ -1028,7 +985,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             println!(
-                "这是 dry-run，没有改动任何数据。确认后执行：vcs purge {repo} {} --immediate",
+                "这是 dry-run，没有改动任何数据。确认后执行：vcs purge {repo} {}",
                 estimate.paths.join(" ")
             );
         }
@@ -1036,14 +993,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Purge {
             repo,
             paths,
-            immediate,
             reason,
         } => {
             let store = ServerStore::open(&store_root)?;
             let session = require_session(&store, &store_root)?;
-            let outcome = store.purge(&session, &repo, &paths, immediate, &reason)?;
+            let outcome = store.purge(&session, &repo, &paths, &reason)?;
             println!(
-                "已删除 {} 个路径并生成 r{}（清理标记 {}）",
+                "已彻底删除 {} 个路径并生成 r{}（清理标记 {}）",
                 outcome.deleted, outcome.rev, outcome.purge_id
             );
             println!(
@@ -1051,21 +1007,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 human_bytes_exact(outcome.estimate.reclaimable_bytes),
                 human_bytes_exact(outcome.estimate.shared_bytes)
             );
-            if immediate {
-                let status = store.gc_status(&session, &repo, &outcome.gc_job_id)?;
-                println!(
-                    "GC {}：{}，清扫 {} 个对象，实际释放 {}",
-                    status.job_id,
-                    status.state,
-                    status.swept_objects,
-                    human_bytes_exact(status.reclaimed_bytes)
-                );
-            } else {
-                println!(
-                    "已进入回收站，7 天后由 GC 释放；需要立刻腾空间请加 --immediate。任务：{}",
-                    outcome.gc_job_id
-                );
-            }
+            let status = store.gc_status(&session, &repo, &outcome.gc_job_id)?;
+            println!(
+                "GC {}：{}，清扫 {} 个对象，实际释放 {}",
+                status.job_id,
+                status.state,
+                status.swept_objects,
+                human_bytes_exact(status.reclaimed_bytes)
+            );
         }
 
         Cmd::Gc { repo } => {
@@ -1100,11 +1049,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let store = ServerStore::open(&store_root)?;
             let report = store.run_maintenance()?;
             println!(
-                "维护完成：保留策略清理 {} 个仓库（{} 个目录），转正 {} 条清理记录，\
-                 清扫 {} 个对象，释放 {}（共 {} 个仓库，回收站到期删除 {} 个）",
-                report.retention_repos,
-                report.retention_paths,
-                report.promoted_purges,
+                "维护完成：清扫 {} 个对象，释放 {}（共 {} 个仓库，回收站到期删除 {} 个）",
                 report.swept_objects,
                 human_bytes_exact(report.reclaimed_bytes),
                 report.repo_count,
@@ -1112,110 +1057,6 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
             // 维护任务是系统级的（不属于任何仓库），因此不进 gc-status 的仓库维度查询。
             println!("任务号：{}（系统级任务，不归属任何仓库）", report.gc_job_id);
-        }
-
-        Cmd::RetentionList { repo } => {
-            let store = ServerStore::open(&store_root)?;
-            let session = require_session(&store, &store_root)?;
-            let policies = store.list_retention_policies(&session, &repo)?;
-            if policies.is_empty() {
-                println!("没有配置保留策略");
-                return Ok(());
-            }
-            println!("策略号              模式                参数                          状态");
-            for policy in policies {
-                let mut rules = Vec::new();
-                if policy.keep_months > 0 {
-                    rules.push(format!("保留 {} 个", policy.keep_months));
-                }
-                if policy.max_bytes > 0 {
-                    rules.push(format!("上限 {}", human_bytes(policy.max_bytes)));
-                }
-                if policy.max_age_days > 0 {
-                    rules.push(format!("{} 天未改即清理", policy.max_age_days));
-                }
-                let state = match (policy.enabled, policy.dry_run) {
-                    (false, _) => "已停用",
-                    (true, true) => "仅预览",
-                    (true, false) => "已启用",
-                };
-                println!(
-                    "{:<18} {:<20} {:<28} {}",
-                    policy.policy_id,
-                    policy.path_pattern,
-                    rules.join("、"),
-                    state
-                );
-            }
-        }
-
-        Cmd::RetentionSet {
-            repo,
-            pattern,
-            keep_months,
-            max_bytes,
-            max_age_days,
-            id,
-            disabled,
-            execute,
-        } => {
-            let store = ServerStore::open(&store_root)?;
-            let session = require_session(&store, &store_root)?;
-            let policy = store.upsert_retention_policy(
-                &session,
-                &repo,
-                vcs_server::RetentionPolicyInput {
-                    policy_id: if id.is_empty() { None } else { Some(id) },
-                    path_pattern: pattern,
-                    keep_months,
-                    max_bytes,
-                    max_age_days,
-                    enabled: !disabled,
-                    // 默认 dry_run：删数据这件事必须显式要求。
-                    dry_run: !execute,
-                },
-            )?;
-            println!(
-                "已保存策略 {}（{}）{}",
-                policy.policy_id,
-                policy.path_pattern,
-                if policy.dry_run {
-                    "：仅预览，不会真的删除"
-                } else {
-                    "：已启用"
-                }
-            );
-        }
-
-        Cmd::RetentionRm { repo, policy_id } => {
-            let store = ServerStore::open(&store_root)?;
-            let session = require_session(&store, &store_root)?;
-            store.delete_retention_policy(&session, &repo, &policy_id)?;
-            println!("已删除策略 {policy_id}");
-        }
-
-        Cmd::RetentionApply {
-            repo,
-            dry_run,
-            immediate,
-        } => {
-            let store = ServerStore::open(&store_root)?;
-            let session = require_session(&store, &store_root)?;
-            let outcome = store.apply_retention(&session, &repo, dry_run, immediate)?;
-            if outcome.candidates.is_empty() {
-                println!("所有目录都满足保留策略，没有需要清理的内容");
-                return Ok(());
-            }
-            println!("候选目录：{}", outcome.candidates.join("、"));
-            println!("预计释放：{}", human_bytes_exact(outcome.reclaimable_bytes));
-            if dry_run {
-                println!("这是预览，没有改动任何数据。确认后执行：vcs retention-apply {repo} --immediate");
-            } else {
-                println!(
-                    "已生成删除提交 r{}（清理记录可在 vcs purged 查看）",
-                    outcome.new_rev
-                );
-            }
         }
 
         Cmd::Purged { repo } => {
@@ -1231,12 +1072,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "{:<16} {:<10} {:<20} {}",
                     entry.path,
-                    match entry.state.as_str() {
-                        "pending" => "宽限期",
-                        "active" => "已生效",
-                        "reverted" => "已撤销",
-                        other => other,
-                    },
+                    entry.state.as_str(),
                     format_time(entry.created_at),
                     entry.purged_by
                 );
@@ -1245,18 +1081,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         println!("      {reason}");
                     }
                 }
-                if entry.state != "reverted" {
-                    println!("      撤销：vcs unpurge {repo} {}", entry.purge_id);
-                }
             }
-        }
-
-        Cmd::Unpurge { repo, purge_id } => {
-            let store = ServerStore::open(&store_root)?;
-            let session = require_session(&store, &store_root)?;
-            let rev = store.revert_purge(&session, &repo, &purge_id)?;
-            println!("已撤销清理，内容恢复到 r{rev}");
-            println!("GC 不再跳过这些路径；如果内容此前已被回收，命令会在执行前就失败。");
         }
 
         Cmd::Candidates { repo, limit } => {

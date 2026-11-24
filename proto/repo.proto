@@ -386,10 +386,12 @@ message EstimatePurgeResponse {
   repeated string shared_paths = 4; // 与其它目录共享、不会被回收的部分
 }
 
+// 彻底删除：删 HEAD 中的这些路径，写裁剪标记并立即触发 GC。
+// 没有宽限期、没有回收站、不可撤销——用户选中的内容和它的历史字节会一并被回收。
 message PurgeRequest {
   string repo_id = 1;
   repeated string paths = 2;
-  bool immediate = 3; // 跳过回收站宽限期，立即触发 GC
+  reserved 3;         // 原 immediate：现在永远是立即执行
   string reason = 4;
 }
 
@@ -400,15 +402,15 @@ message PurgeResponse {
   string gc_job_id = 4;
 }
 
-// 已执行的清理记录（回收站）。撤销后 state 变 REVERTED，GC 不再跳过这些路径。
+// 已执行的彻底删除记录，只作审计与「哪些路径被清理过」的查询用。
 message PurgedPathInfo {
   string purge_id = 1;
   string path = 2;
-  string state = 3;              // pending / active / reverted
+  string state = 3;              // 恒为 active：GC 标记时会跳过这些路径
   string reason = 4;
   string purged_by = 5;
   int64 created_at = 6;
-  int64 grace_until = 7;         // 0 表示已激活（无宽限期）
+  reserved 7;                    // 原 grace_until：宽限期已下线
   int64 activated_at = 8;
 }
 
@@ -421,80 +423,10 @@ message ListPurgedPathsResponse {
   repeated PurgedPathInfo entries = 2;
 }
 
-// 撤销清理：把路径恢复到 HEAD，并把裁剪标记置为 reverted。
-// 内容若已被 GC 物理回收则无法恢复，返回 ERROR_CODE_CONTENT_PURGED。
-message RevertPurgeRequest {
-  string repo_id = 1;
-  string purge_id = 2;
-}
-
-message RevertPurgeResponse {
-  Status status = 1;
-  uint64 new_rev = 2;
-}
-
-// ---------------- 保留策略 ----------------
-
-// 按目录模式自动清理：keep_months / max_bytes / max_age_days 任一被违反即成为候选。
-// path_pattern 是正则，匹配仓库顶层目录名（例如 ^20\\d{4}$）。
-message RetentionPolicyInfo {
-  string policy_id = 1;
-  string path_pattern = 2;
-  uint32 keep_months = 3;     // 0 表示不限制
-  uint64 max_bytes = 4;       // 0 表示不限制
-  uint32 max_age_days = 5;    // 0 表示不限制
-  bool enabled = 6;
-  bool dry_run = 7;           // true 表示只报告、不执行
-  int64 created_at = 8;
-}
-
-message ListRetentionPoliciesRequest {
-  string repo_id = 1;
-}
-
-message ListRetentionPoliciesResponse {
-  Status status = 1;
-  repeated RetentionPolicyInfo policies = 2;
-}
-
-message UpsertRetentionPolicyRequest {
-  string repo_id = 1;
-  string policy_id = 2;       // 空表示新建
-  string path_pattern = 3;
-  uint32 keep_months = 4;
-  uint64 max_bytes = 5;
-  uint32 max_age_days = 6;
-  bool enabled = 7;
-  bool dry_run = 8;
-}
-
-message UpsertRetentionPolicyResponse {
-  Status status = 1;
-  RetentionPolicyInfo policy = 2;
-}
-
-message DeleteRetentionPolicyRequest {
-  string repo_id = 1;
-  string policy_id = 2;
-}
-
-message DeleteRetentionPolicyResponse {
-  Status status = 1;
-}
-
-// 执行一次策略评估。dry_run=true 时只返回候选，不改动任何数据。
-message ApplyRetentionRequest {
-  string repo_id = 1;
-  bool dry_run = 2;
-  bool immediate = 3;         // 执行时是否跳过回收站宽限期
-}
-
-message ApplyRetentionResponse {
-  Status status = 1;
-  repeated string candidates = 2;
-  uint64 reclaimable_bytes = 3;
-  uint64 new_rev = 4;         // 0 表示没有产生提交（dry-run 或没有候选）
-}
+// 撤销清理（已下线）：彻底删除是终态，内容字节会被 GC 回收，没有恢复入口。
+// 保留策略（已下线）：2026-11-24 起按目录 / 文件的自动清理整套移除，
+// 改由用户在桌面端设置页主动选择后彻底删除。相关消息与 RPC 一并删除，
+// 老客户端调用会得到 UNIMPLEMENTED。
 
 message GetGcStatusRequest {
   string repo_id = 1;
@@ -1240,11 +1172,8 @@ service RepoService {
   rpc Purge(PurgeRequest) returns (PurgeResponse);
   rpc GetGcStatus(GetGcStatusRequest) returns (GetGcStatusResponse);
   rpc ListPurgedPaths(ListPurgedPathsRequest) returns (ListPurgedPathsResponse);
-  rpc RevertPurge(RevertPurgeRequest) returns (RevertPurgeResponse);
-  rpc ListRetentionPolicies(ListRetentionPoliciesRequest) returns (ListRetentionPoliciesResponse);
-  rpc UpsertRetentionPolicy(UpsertRetentionPolicyRequest) returns (UpsertRetentionPolicyResponse);
-  rpc DeleteRetentionPolicy(DeleteRetentionPolicyRequest) returns (DeleteRetentionPolicyResponse);
-  rpc ApplyRetention(ApplyRetentionRequest) returns (ApplyRetentionResponse);
+  // RevertPurge / ListRetentionPolicies / UpsertRetentionPolicy /
+  // DeleteRetentionPolicy / ApplyRetention 已下线（2026-11-24）。
 }
 
 // 用户体系：Register / Login 免认证，其余按角色鉴权。

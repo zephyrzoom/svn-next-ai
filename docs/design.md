@@ -40,7 +40,7 @@
 | 读取 | `checkout`（支持 depth / 稀疏路径）、`log`、`status`、`diff` |
 | 写入 | `add`、`delete`、`rename`、`commit`、`update`、`revert` |
 | 冲突 | 文本三方合并、冲突元数据、客户端三栏解决 |
-| 容量 | 空间面板、释放量预估、一键清理、配额预检、保留策略；admin 配置全局默认与单仓库配额 |
+| 容量 | 空间面板、释放量预估、用户主动彻底删除、配额预检；admin 配置全局默认与单仓库配额 |
 | 用户体系 | LDAP / 本地登录、自助注册、管理员审批、PAT 管理 |
 
 ## 2. 总体架构
@@ -129,7 +129,7 @@ count                 u32 LE
 | `objects` / `trees` | CAS 对象索引、大小、`first_seen_rev`，支撑可达性计算 |
 | `purged_paths` | 路径级裁剪标记，GC 可达性遍历时跳过 |
 | `gc_jobs` | 异步 GC 任务状态与进度 |
-| `quota_usage` / `retention_policies` | 容量占用缓存与保留策略 |
+| `quota_usage` | 容量占用缓存（§43 之后按仓库实时计量，这张表已不再写入） |
 | `system_settings` | 全局默认配额等服务端级配置（KV，`default_quota_*`） |
 | `upload_sessions` | 两阶段提交会话与断点续传 |
 | `users` / `registration_requests` / `pat_tokens` | 用户、注册审批、个人访问令牌 |
@@ -441,13 +441,22 @@ CAS 去重下，「目录有多大」与「删掉它能释放多少」是两回�
 
 好处是避免「写到一半磁盘满、留下一堆孤儿对象」的脏状态。
 
-### 9.7 保留策略自动化
+### 9.7 自动清理已下线（2026-11-24）
 
-`retention_policies` 支持按目录模式（如 `^20\d{4}$`）配置：保留最近 N 个月 / 最多 N GB / 超过 X 天。到期自动执行「逻辑删除 → 路径裁剪 → 异步 GC」，支持 `dry_run` 与通知，避免用户忘记手动清理。
+`retention_policies` 整套移除：没有定时执行、没有按正则的批量裁剪、也没有任何「空间不够就自动删」的路径。
 
-### 9.8 回收站与立即释放
+容量回收只剩两个入口，都必须有人明确发起：
 
-删除默认进入 `PENDING` 宽限期（7 天）以防误删，宽限期内不物理回收。但磁盘已满的场景下必须提供 `immediate=true` 的「立即释放」选项，否则用户删完仍写不进去。UI 在配额不足错误中默认勾选立即释放。
+- 用户在桌面端「设置 → 清理空间」里勾目录 / 文件，彻底删除（见 §45）；
+- 仓库注销到期后，后台维护物理删除整个仓库（§44，这是仓库级生命周期，不是路径清理）。
+
+理由：按目录正则自动删数据，规则写错一次就是不可逆的内容丢失；而真实的清理需求是偶发的、点名的。
+
+### 9.8 没有宽限期，也没有撤销
+
+`Purge` 只有一个语义：删除提交 + 写 `active` 裁剪标记 + 当场跑 GC。删完内容字节就没了，没有 7 天回收站，也没有 `RevertPurge`。
+
+`purged_paths` 仍然保留，作用变成审计与标记：GC 标记阶段靠它跳过已裁剪的路径，`ListPurgedPaths` 让人能查到「谁在什么时候删了什么」。老库里 `pending` / `reverted` 的历史行按原样留着（迁移只把 `pending` 收口成 `active`，否则这些路径会永远被 GC 跳过）。
 
 ### 9.9 存储布局：统一共享 CAS
 
@@ -469,14 +478,14 @@ CAS 去重下，「目录有多大」与「删掉它能释放多少」是两回�
 ```
 创建 202701 → BeginCommit → QUOTA_EXCEEDED
    ↓ 响应携带候选：202610 可释放 12.4 GB
-空间面板 / 一键清理 → EstimatePurge(dry-run) → 确认（默认立即释放）
+设置 → 清理空间 → 勾 202610 → 预估（dry-run）
    ↓
-删除提交 + 路径裁剪 + 异步 GC → GetGcStatus 显示进度
-   ↓
+彻底删除：删除提交 + 裁剪标记 + 当场 GC
+   ↓ 容量立刻回落，本地工作副本下次更新时按服务端删除处理
 重试提交 202701 → 成功
 ```
 
-全程不需要用户理解 revision、CAS、GC，也不需要登录服务端敲命令。
+全程不需要用户理解 revision、CAS、GC，也不需要登录服务端敲命令。区别只在于：**按下删除键的人必须知道自己在删什么**。
 
 ### 9.11 权限与审计
 
@@ -491,7 +500,7 @@ CAS 去重下，「目录有多大」与「删掉它能释放多少」是两回�
 | 层次 | 行为 |
 | --- | --- |
 | 逻辑删除（默认） | 新增 revision，旧版本仍可检出；不释放空间 |
-| 容量清理（第 9 章） | 路径级裁剪 + GC，释放内容字节，元数据保留 |
+| 容量清理（第 9 章） | 用户选定的路径：删除提交 + 裁剪 + 当场 GC，释放内容字节，元数据保留；不可撤销 |
 | 历史重写 `purge --path` | 离线重放生成新仓库，跳过目标路径，版本号与工作副本全部失效 |
 | 加密擦除 | 每个敏感对象独立 DEK 加密，删除密钥即不可读；不动版本号，备份中密文自动失效 |
 | 删除整个仓库 | 连同 `metadata.db`、`objects/`、全部备份一起销毁 |
@@ -595,9 +604,7 @@ vcs --store /srv/vcs import reports ./src -m "初始导入"  # 本地直连的�
 | `vcs estimate` | `EstimatePurge` | **M2**：dry-run，给出可释放 / 共享 / 影响版本数 |
 | `vcs purge` | `Purge` | **M2**：删除提交 + 路径裁剪标记 + GC（`--immediate` 立即释放） |
 | `vcs gc` / `gc-status` | `GetGcStatus` | **M2**：手动全库回收 / 查任务进度 |
-| `vcs purged` / `unpurge` | `ListPurgedPaths` / `RevertPurge` | **M4**：回收站列表与撤销清理（内容已回收则明确失败） |
-| `vcs retention-list` / `retention-set` / `retention-rm` | `List/Upsert/DeleteRetentionPolicy` | **M4**：按目录正则配置保留策略（默认仅预览） |
-| `vcs retention-apply` | `ApplyRetention` | **M4**：评估并清理；`--dry-run` 只报告 |
+| `vcs purged` | `ListPurgedPaths` | **M4**：彻底删除记录（审计用，内容已回收） |
 | `vcs maintenance` | 无（系统任务，无 RPC） | **M4**：手工触发「转正到期清理 + 全库 GC」，与 `vcs serve` 定时任务同一入口 |
 | `vcs candidates` | `ListPurgeCandidates` | **M2**：按独占大小排序的可清理目录 |
 | `vcs register` | `Register` | **M3**：免登录自助注册（用户名/姓名/密码/理由，密码留空则交互输入）；**空库首个账号自动批准为 admin，注册完即可登录** |
@@ -2142,3 +2149,58 @@ deleted --(到期后台维护 / PurgeRepo: 仅 admin)--> 物理删除（行不�
   再注销 → 彻底删除 → `GetRepo` 回 `REPO_NOT_FOUND`。
 - `desktop/scripts/smoke-admin.cjs`：注销 → 回收站可见（带理由与保留天数）→「全部仓库」不含它 →
   状态接口不能绕过恢复 → 恢复回停用 → 彻底删除后回收站清空。
+
+## 45. 下线自动清理，改为用户主动彻底删除（2026-11-24）
+
+### 45.1 诉求
+
+「保留策略按正则到期删数据」这套没人真敢开：规则写错一次就是不可逆的内容丢失，而实际清理需求是偶发的、点名的。
+要的是相反的东西——**用户在设置页自己勾目录或文件，点一次就彻底删除**，别有任何后台替人做决定。
+
+### 45.2 什么是「彻底删除」
+
+| 步骤 | 行为 |
+| --- | --- |
+| 删除提交 | 在 HEAD 里移除选中路径（前缀匹配，选目录即整棵子树） |
+| 裁剪标记 | `purged_paths` 直接写 `active`，GC 标记时跳过这些路径 |
+| 当场 GC | 同步跑完一轮，只回收这些路径独占的 blob；被别处共享的照旧保留 |
+| 记录 | `ListPurgedPaths` 可查，但**没有撤销入口**——内容字节已经没了 |
+
+本地工作副本不受影响：删除只发生在服务端，用户在本地仍看得到文件，下次「更新」时按服务端删除处理（本地改过的走 delete/modify 冲突）。
+
+### 45.3 去掉了什么
+
+- `retention_policies` 表、4 个 RPC（`List/Upsert/DeleteRetentionPolicy`、`ApplyRetention`）、CLI `retention-*`、管理端「保留策略」卡片与「预览/执行策略」按钮；
+- `PurgeRequest.immediate`（字段 `reserved 3`）：不再有「先进回收站」这条路；
+- `RevertPurge` RPC、CLI `unpurge`、管理端「撤销」按钮；
+- `repos.grace_days` 与 `SetRepoGraceDays`：宽限期这个概念不存在了；
+- `promote_pending_purges`：没有 PENDING，就不需要转正；
+- `run_maintenance` 里的保留策略执行：维护只做「回收站到期仓库 + 全库 GC」。
+
+**保留**：仓库注销 / 回收站 / 到期物理删除（§44）是仓库级生命周期，与路径清理无关，原样不动。
+
+### 45.4 老库迁移
+
+`migrate_purge_immediate()`：
+
+- `state='pending'` 的历史行收口成 `active`。转正逻辑已删，不收口的话这些路径会被 GC 永远跳过；
+- `state='reverted'` 保持原样——它表示内容已恢复，GC 本来就该尊重这个标记；
+- `DROP TABLE IF EXISTS retention_policies`。
+
+### 45.5 桌面端入口
+
+「设置」页新增「清理空间」卡片：
+
+1. 点「选择目录或文件」懒加载 HEAD 目录树（复用 `vcs:tree`），目录与文件都可勾；
+2. 勾完点「预估释放」→ `EstimatePurge` 回「预计释放 X，影响 Y 个历史版本」，被共享的部分会说明不会被回收；
+3. 「彻底删除」二次确认（列出前 6 项），确认后走 `vcs:purge`；
+4. 成功后清空选择、重读配额与目录树，并提示本地文件不会自动删除。
+
+权限：读写及以上成员可执行；只读成员点预估就会被服务端拒绝（`RepoMemberForbidden`），界面不做假按钮。
+
+### 45.6 验收
+
+- `lifecycle.rs::immediate_purge_reclaims_only_uniquely_owned_content`：删除后 HEAD 不含目标路径、独占内容物理消失、共享内容保留、记录即 `active`；
+- `lifecycle.rs::purged_content_reports_content_purged_instead_of_missing`：旧版本读被清理的路径回 `CONTENT_PURGED`；
+- `smoke-single-user.cjs`：预估 → 彻底删除 → GC 完成 → 配额回落（不再有回收站与撤销段）；
+- `smoke-ui.cjs`：设置页勾选 `docs/` + `README.md` → 摘要「已选 2 项」→ 预估 → 提交的路径被规范化成 `README.md,docs` → 删除后摘要清空。

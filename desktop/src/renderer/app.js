@@ -11,7 +11,7 @@
  * 主进程用系统加密存储保存凭证（默认 30 天免登录，界面无开关），启动时 tryResume 直接恢复会话。
  *
  * 主界面只有一条主线：**仓库**。左侧是仓库列表，选中哪一个，右侧整个工作区就属于它
- * （工作副本 / 提交历史 / 设置三个 tab；容量与注销都在设置页）。顶部固定一条上下文条，写着当前仓库名、
+ * （工作副本 / 提交历史 / 设置三个 tab；容量、主动清理与注销都在设置页）。顶部固定一条上下文条，写着当前仓库名、
  * HEAD 版本与本地工作副本目录——工作副本本质上就是这个仓库在本地的一份拷贝，
  * 把它和仓库并列成两个菜单会让人在两个视图之间丢失「我在哪个仓库」的坐标。
  * 目录与仓库对不上时（拷贝过来的工作副本、换了账号），以目录里 wc.db 记录的 repoId
@@ -118,6 +118,19 @@ const state = {
     repoId: null,
     loading: false,
   },
+  /**
+   * 设置页的「清理空间」：勾目录 / 文件 → 彻底删除。
+   * 与稀疏检出各自独立（两个面板可以同时开着，选择互不影响）。
+   */
+  cleanup: {
+    open: false,
+    paths: [],
+    checked: new Set(),
+    expanded: new Set(),
+    repoId: null,
+    loading: false,
+    busy: false,
+  },
 };
 
 const el = (id) => document.getElementById(id);
@@ -223,7 +236,7 @@ function setView(name) {
   }
 }
 
-/** 仓库工作区里的 tab：工作副本 / 提交历史 / 设置（容量 + 注销）/ 成员（owner 专属）。 */
+/** 仓库工作区里的 tab：工作副本 / 提交历史 / 设置（容量 + 清理空间 + 注销）/ 成员（owner 专属）。 */
 function setTab(name) {
   // 成员页只属于 owner：即使有人手动触发，非 owner 也退回工作副本。
   const next = name === 'members' && !isRepoOwner(currentRepo()) ? 'wc' : name;
@@ -237,7 +250,11 @@ function setTab(name) {
     pane.classList.toggle('hidden', pane.dataset.tab !== next);
   }
   if (next === 'history') void guard('加载历史', loadLog);
-  if (next === 'settings') void guard('加载容量', loadQuota);
+  if (next === 'settings') {
+    void guard('加载容量', loadQuota);
+    renderCleanupSummary();
+    if (state.cleanup.open) void guard('读取仓库目录', () => loadCleanupTree());
+  }
   if (next === 'members') void guard('加载成员', loadMembers);
   // 回到工作副本页顺手对一次盘：人可能刚在编辑器里改完文件。
   if (next === 'wc') autoScan();
@@ -543,6 +560,17 @@ async function selectRepo(repoId) {
   state.sparse.expanded = new Set();
   state.sparse.rules = [];
   state.sparse.open = false;
+  // 清理选择也是按仓库的：换仓库必须清空，绝不把上一个仓库的勾选带过去。
+  state.cleanup.open = false;
+  state.cleanup.paths = [];
+  state.cleanup.checked = new Set();
+  state.cleanup.expanded = new Set();
+  state.cleanup.repoId = null;
+  state.cleanup.busy = false;
+  el('cleanup-picker').classList.add('hidden');
+  el('cleanup-open').textContent = '选择目录或文件';
+  el('cleanup-result').textContent = '';
+  renderCleanupSummary();
   // 每个仓库记住一串目录，第一个是上次用的那份；没检出过就回到检出引导。
   state.wcDir = dirsFor(repoId)[0] || '';
   state.checkoutOpen = !state.wcDir;
@@ -830,7 +858,7 @@ function currentSparseRules() {
 }
 
 /** 仓库 HEAD 的扁平相对路径 → 目录树，文件也作为可勾选的叶子。 */
-function buildSparseTree(paths) {
+function buildEntryTree(paths) {
   const root = { path: '', name: '', children: new Map(), file: false };
   for (const raw of paths) {
     const value = String(raw).replace(/\\/g, '/').replace(/^\/+/, '');
@@ -936,7 +964,7 @@ function renderSparseTree() {
       '<div class="sparse-empty">点「刷新目录」读取仓库结构；空仓库直接全库检出即可。</div>';
     return;
   }
-  const root = buildSparseTree(state.sparse.paths);
+  const root = buildEntryTree(state.sparse.paths);
   for (const node of [...root.children.values()].sort(sparseSort)) {
     box.appendChild(sparseNodeElement(node));
   }
@@ -1501,6 +1529,189 @@ function renderQuota(quota) {
   el('quota-text').textContent =
     `已用 ${humanBytes(quota.usedBytes)} / 配额上限 ${humanBytes(quota.limitBytes)}` +
     `（来源：${quotaSourceLabel(quota.source)}）`;
+}
+
+// ---------------- 清理空间：用户主动彻底删除 ----------------
+
+/**
+ * 勾选 → 提交给服务端的路径前缀。
+ *
+ * 服务端按前缀匹配（`path_under_any`），所以勾了 `202610` 就不必再勾它下面的文件；
+ * `normalizeSparsePaths` 正好把「已被父路径覆盖的子路径」去掉，两个面板共用一套语义。
+ */
+function cleanupPaths() {
+  return normalizeSparsePaths([...state.cleanup.checked]);
+}
+
+function renderCleanupSummary() {
+  const count = cleanupPaths().length;
+  el('cleanup-summary').textContent = count ? `已选 ${count} 项` : '';
+  const blocked = count === 0 || state.cleanup.busy;
+  el('cleanup-estimate').disabled = blocked;
+  el('cleanup-purge').disabled = blocked;
+  el('cleanup-purge').textContent = state.cleanup.busy ? '删除中…' : '彻底删除';
+}
+
+/** 父目录已勾中时子节点跟着显示为选中，并禁止单独取消（要先取消父目录）。 */
+function cleanupCheckboxState(path) {
+  const checked = [...state.cleanup.checked].some((p) => sparseUnder(p, path));
+  return { checked, inherited: checked && !state.cleanup.checked.has(path) };
+}
+
+function cleanupTogglePath(node, checked) {
+  if (checked) {
+    const next = new Set(
+      [...state.cleanup.checked].filter((p) => !sparseUnder(node.path, p)),
+    );
+    next.add(node.path);
+    state.cleanup.checked = next;
+  } else {
+    state.cleanup.checked.delete(node.path);
+  }
+  // 选择变了，上一次的预估就作废：不能让旧数字给新选择背书。
+  el('cleanup-result').textContent = '';
+  renderCleanupTree();
+  renderCleanupSummary();
+}
+
+function cleanupNodeElement(node) {
+  const wrap = document.createElement('div');
+  wrap.className = 'sparse-node';
+  const row = document.createElement('div');
+  row.className = 'sparse-row';
+  const hasChildren = node.children.size > 0;
+
+  const caret = document.createElement('button');
+  caret.type = 'button';
+  caret.className = 'sparse-caret';
+  caret.textContent = hasChildren
+    ? state.cleanup.expanded.has(node.path)
+      ? '▾'
+      : '▸'
+    : '';
+  caret.disabled = !hasChildren;
+  caret.addEventListener('click', () => {
+    if (state.cleanup.expanded.has(node.path)) state.cleanup.expanded.delete(node.path);
+    else state.cleanup.expanded.add(node.path);
+    renderCleanupTree();
+  });
+  row.appendChild(caret);
+
+  const label = document.createElement('label');
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  const mark = cleanupCheckboxState(node.path);
+  input.checked = mark.checked;
+  input.disabled = mark.inherited;
+  input.addEventListener('change', () => cleanupTogglePath(node, input.checked));
+  const name = document.createElement('span');
+  name.className = `sparse-name${node.file ? ' file' : ''}`;
+  name.textContent = node.file ? node.name : `${node.name}/`;
+  name.title = node.path;
+  label.append(input, name);
+  row.appendChild(label);
+  wrap.appendChild(row);
+
+  if (hasChildren && state.cleanup.expanded.has(node.path)) {
+    const children = document.createElement('div');
+    children.className = 'sparse-children';
+    for (const child of [...node.children.values()].sort(sparseSort)) {
+      children.appendChild(cleanupNodeElement(child));
+    }
+    wrap.appendChild(children);
+  }
+  return wrap;
+}
+
+function renderCleanupTree() {
+  const box = el('cleanup-tree');
+  box.innerHTML = '';
+  if (state.cleanup.loading) {
+    box.innerHTML = '<div class="sparse-empty">正在读取仓库目录…</div>';
+    return;
+  }
+  if (!state.cleanup.paths.length) {
+    box.innerHTML = '<div class="sparse-empty">仓库里没有文件，不需要清理。</div>';
+    return;
+  }
+  const root = buildEntryTree(state.cleanup.paths);
+  for (const node of [...root.children.values()].sort(sparseSort)) {
+    box.appendChild(cleanupNodeElement(node));
+  }
+}
+
+/** 只在第一次打开面板时拉目录；之后切仓库会清空缓存，强制重读。 */
+async function loadCleanupTree(force = false) {
+  const repo = currentRepo();
+  if (!repo) return;
+  if (!force && state.cleanup.repoId === repo.repoId && state.cleanup.paths.length) return;
+  state.cleanup.loading = true;
+  state.cleanup.repoId = repo.repoId;
+  renderCleanupTree();
+  const paths = unwrap(await api.tree(repo.repoId), '读取仓库目录');
+  state.cleanup.paths = Array.isArray(paths) ? paths : [];
+  state.cleanup.loading = false;
+  renderCleanupTree();
+}
+
+function openCleanupPicker() {
+  state.cleanup.open = true;
+  el('cleanup-picker').classList.remove('hidden');
+  // 删除界面不能拿旧树做决定：每次摊开都重读一次 HEAD（提交 / 更新后目录可能已经变了）。
+  el('cleanup-open').textContent = '刷新目录';
+  renderCleanupSummary();
+  void guard('读取仓库目录', () => loadCleanupTree(true));
+}
+
+function closeCleanupPicker() {
+  state.cleanup.open = false;
+  el('cleanup-picker').classList.add('hidden');
+  el('cleanup-open').textContent = '选择目录或文件';
+}
+
+/** dry-run 预估：只回报能释放多少，不动任何数据。 */
+async function estimateCleanup() {
+  const repo = currentRepo();
+  const paths = cleanupPaths();
+  if (!repo || !paths.length) return;
+  const estimate = unwrap(await api.estimatePurge(repo.repoId, paths), '预估释放量');
+  const shared = estimate.sharedPaths.length
+    ? '；其中部分内容与其它路径或仓库共享，不会被回收'
+    : '';
+  el('cleanup-result').textContent =
+    `预计释放 ${humanBytes(estimate.reclaimableBytes)}，影响 ${estimate.affectedRevisions} 个历史版本${shared}。`;
+}
+
+/**
+ * 彻底删除：二次确认后提交。成功后配额与目录树都要重读——
+ * 删除会推进 HEAD，旧树里已经没有这些路径了。
+ */
+async function purgeCleanup() {
+  const repo = currentRepo();
+  const paths = cleanupPaths();
+  if (!repo || !paths.length || state.cleanup.busy) return;
+  const shown = paths.slice(0, 6).join('\n');
+  const more = paths.length > 6 ? `\n…等 ${paths.length} 项` : '';
+  const ok = window.confirm(
+    `彻底删除以下路径？\n\n${shown}${more}\n\n内容字节会被立即回收，无法撤销；` +
+      '本地工作副本里的文件不会被自动删除。',
+  );
+  if (!ok) return;
+
+  state.cleanup.busy = true;
+  renderCleanupSummary();
+  try {
+    const outcome = unwrap(await api.purge(repo.repoId, paths, '桌面端彻底删除'), '彻底删除');
+    state.cleanup.checked = new Set();
+    state.cleanup.paths = [];
+    el('cleanup-result').textContent = `已彻底删除 ${paths.length} 项，生成 r${outcome.newRev}，空间已回收。`;
+    banner('已彻底删除，空间已回收');
+    await guard('加载容量', loadQuota);
+    await guard('读取仓库目录', () => loadCleanupTree(true));
+  } finally {
+    state.cleanup.busy = false;
+    renderCleanupSummary();
+  }
 }
 
 // ---------------- 成员管理（仅仓库拥有者） ----------------
@@ -2155,6 +2366,13 @@ el('delete-file').addEventListener('click', () =>
 );
 el('do-request').addEventListener('click', () => void guard('提交建库申请', requestRepo));
 el('do-expand').addEventListener('click', () => void guard('提交扩容申请', requestExpansion));
+el('cleanup-open').addEventListener('click', () => {
+  if (state.cleanup.open) void guard('读取仓库目录', () => loadCleanupTree(true));
+  else openCleanupPicker();
+});
+el('cleanup-close').addEventListener('click', closeCleanupPicker);
+el('cleanup-estimate').addEventListener('click', () => void guard('预估释放量', estimateCleanup));
+el('cleanup-purge').addEventListener('click', () => void guard('彻底删除', purgeCleanup));
 el('delete-repo').addEventListener('click', () => void guard('注销仓库', deleteCurrentRepo));
 el('disconnect').addEventListener('click', () => void guard('退出登录', disconnect));
 el('pick-checkout-dir').addEventListener('click', () => void guard('选择目录', pickCheckoutDir));

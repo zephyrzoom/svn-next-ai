@@ -103,6 +103,8 @@ function verify({ app, BrowserWindow, ipcMain }) {
   const GONE_DIR = '/tmp/wc-gone';
   const LIVE_DIR = '/tmp/wc-live';
   const checkoutCalls = [];
+  // 清理空间的请求参数：断言「勾选被规范化后再提交」只能在这里看。
+  const cleanupCalls = { estimates: [], purges: [] };
   // 多份工作副本的回归会真的走一遍「切换 / 移出」，那两条路径会扫描工作副本：
   // 给 status / diff 塞合法数据，免得断言被 null 数据带偏。status 的 repoId 跟着目录走，
   // 否则跨仓库绑定后 refreshStatus 会把上下文又切回去。
@@ -132,6 +134,20 @@ function verify({ app, BrowserWindow, ipcMain }) {
           ok: true,
           data: ['src/main.rs', 'src/api/v1.rs', 'docs/readme.md', 'README.md'],
         };
+      }
+      if (channel === 'vcs:getQuota') {
+        return { ok: true, data: { usedBytes: 2048, limitBytes: 4096, source: 3 } };
+      }
+      if (channel === 'vcs:estimatePurge') {
+        cleanupCalls.estimates.push(args);
+        return {
+          ok: true,
+          data: { reclaimableBytes: 1024, affectedRevisions: 3, sharedPaths: ['docs/readme.md'] },
+        };
+      }
+      if (channel === 'vcs:purge') {
+        cleanupCalls.purges.push(args);
+        return { ok: true, data: { newRev: 9, gcJobId: 'gc_x' } };
       }
       if (channel === 'vcs:setSparseRules') {
         return {
@@ -810,6 +826,58 @@ function verify({ app, BrowserWindow, ipcMain }) {
         problems.push(`稀疏检出求值失败：${err && err.message}`);
       }
 
+      // 清理空间：用户自己勾目录 / 文件 → 彻底删除。自动清理已经下线，
+      // 这里验证设置页里的入口真的能读树、能预估、能带规范化后的路径去删。
+      let cleanup = {};
+      try {
+        cleanup = await win.webContents.executeJavaScript(`(async () => {
+          const shell = document.getElementById('view-repo');
+          shell.classList.remove('hidden');
+          const saved = {
+            repos: state.repos, selected: state.selectedRepoId, tab: state.tab, user: state.user,
+          };
+          state.repos = [{ repoId: 'r1', name: '仓库一', headRev: 3, ownerUserId: 'u1' }];
+          state.selectedRepoId = 'r1';
+
+          setTab('settings');
+          document.getElementById('cleanup-open').click();
+          await new Promise((r) => setTimeout(r, 40));
+          const roots = [...document.querySelectorAll('#cleanup-tree > .sparse-node > .sparse-row .sparse-name')]
+            .map((node) => node.textContent);
+          // 勾整个 docs/ 和单个文件 README.md：前者必须把子项的路径收掉。
+          const boxes = [...document.querySelectorAll('#cleanup-tree > .sparse-node > .sparse-row input[type="checkbox"]')];
+          boxes.forEach((box) => {
+            const label = box.parentElement.textContent.trim();
+            if (label.startsWith('docs') || label.includes('README.md')) {
+              box.checked = true;
+              box.dispatchEvent(new Event('change'));
+            }
+          });
+          const summary = document.getElementById('cleanup-summary').textContent.trim();
+          document.getElementById('cleanup-estimate').click();
+          await new Promise((r) => setTimeout(r, 40));
+          const estimateText = document.getElementById('cleanup-result').textContent;
+          const realConfirm = window.confirm;
+          window.confirm = () => true;
+          document.getElementById('cleanup-purge').click();
+          await new Promise((r) => setTimeout(r, 80));
+          window.confirm = realConfirm;
+          const resultText = document.getElementById('cleanup-result').textContent;
+          const summaryAfter = document.getElementById('cleanup-summary').textContent.trim();
+
+          state.repos = saved.repos;
+          state.selectedRepoId = saved.selected;
+          state.user = saved.user;
+          setTab(saved.tab || 'wc');
+          shell.classList.add('hidden');
+          return { roots, summary, estimateText, resultText, summaryAfter };
+        })()`);
+      } catch (err) {
+        problems.push(`清理空间求值失败：${err && err.message}`);
+      }
+      cleanup.estimates = cleanupCalls.estimates.slice();
+      cleanup.purges = cleanupCalls.purges.slice();
+
       // 检出目录被用户删掉：刷新只摘登记（清单里不留虚空路径），扫描只回报 missing，
       // 两条路径都不许重新检出——那会把删掉的目录连同 .vcs/wc.db 原样建回来。
       const staleCheckoutBaseline = checkoutCalls.length;
@@ -1090,6 +1158,18 @@ function verify({ app, BrowserWindow, ipcMain }) {
           String(sparse.applyBanner || '').includes('清理 2 个空目录') &&
           String(sparse.applyBanner || '').includes('docs') &&
           String(sparse.applyBanner || '').includes('未纳入版本控制'),
+        清理空间可勾选目录与文件并彻底删除:
+          cleanup.roots?.join(',') === 'docs/,src/,README.md' &&
+          cleanup.summary === '已选 2 项' &&
+          String(cleanup.estimateText || '').includes('预计释放') &&
+          String(cleanup.estimateText || '').includes('共享') &&
+          cleanup.estimates?.length === 1 &&
+          cleanup.estimates[0][1].join(',') === 'README.md,docs' &&
+          cleanup.purges?.length === 1 &&
+          cleanup.purges[0][1].join(',') === 'README.md,docs' &&
+          String(cleanup.purges[0][2] || '').includes('彻底删除') &&
+          String(cleanup.resultText || '').includes('已彻底删除 2 项') &&
+          cleanup.summaryAfter === '',
         检出时把勾选的稀疏规则传给主进程:
           checkoutCalls.some(
             (args) =>
@@ -1138,6 +1218,7 @@ function verify({ app, BrowserWindow, ipcMain }) {
         multiWc,
         adopt,
         sparse,
+        cleanup,
         stale,
         auto,
         checkoutCalls: checkoutCalls.length,

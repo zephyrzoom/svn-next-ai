@@ -494,6 +494,18 @@ ipcMain.handle('vcs:getQuota', (_event, repoId: string) =>
   wrap(async () => requireClient().getQuota(repoId)),
 );
 
+// ---------------- 主动清理（彻底删除） ----------------
+
+/** dry-run：只回报「删这些路径能释放多少」，不动任何数据。 */
+ipcMain.handle('vcs:estimatePurge', (_event, repoId: string, paths: string[]) =>
+  wrap(async () => requireClient().estimatePurge(repoId, paths)),
+);
+
+/** 彻底删除：删除提交 + 裁剪标记 + 立即 GC。没有宽限期，也没有撤销。 */
+ipcMain.handle('vcs:purge', (_event, repoId: string, paths: string[], reason = '') =>
+  wrap(async () => requireClient().purge(repoId, paths, reason)),
+);
+
 // ---------------- 预留占位通道 ----------------
 // 桌面端不调用；保留仅为维持既有 IPC 契约，实现仍是 notWired。
 ipcMain.handle('vcs:getHead', notWired);

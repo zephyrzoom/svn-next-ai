@@ -1957,13 +1957,11 @@ impl RepoService for RepoApi {
     ) -> Result<Response<pb::PurgeResponse>, Status> {
         let session = self.api.session(&request)?;
         let req = request.into_inner();
-        match self.api.store().purge(
-            &session,
-            &req.repo_id,
-            &req.paths,
-            req.immediate,
-            &req.reason,
-        ) {
+        match self
+            .api
+            .store()
+            .purge(&session, &req.repo_id, &req.paths, &req.reason)
+        {
             Ok(outcome) => Ok(Response::new(pb::PurgeResponse {
                 status: Some(status_ok()),
                 purge_id: 0,
@@ -1999,7 +1997,6 @@ impl RepoService for RepoApi {
                         reason: item.reason.clone().unwrap_or_default(),
                         purged_by: item.purged_by.clone(),
                         created_at: item.created_at,
-                        grace_until: item.grace_until.unwrap_or(0),
                         activated_at: item.activated_at.unwrap_or(0),
                     })
                     .collect(),
@@ -2007,129 +2004,6 @@ impl RepoService for RepoApi {
             Err(err) => Ok(Response::new(pb::ListPurgedPathsResponse {
                 status: Some(status_err(&err)),
                 entries: Vec::new(),
-            })),
-        }
-    }
-
-    async fn revert_purge(
-        &self,
-        request: Request<pb::RevertPurgeRequest>,
-    ) -> Result<Response<pb::RevertPurgeResponse>, Status> {
-        let session = self.api.session(&request)?;
-        let req = request.into_inner();
-        let result = {
-            let store = self.api.store();
-            store.revert_purge(&session, &req.repo_id, &req.purge_id)
-        };
-        match result {
-            Ok(rev) => Ok(Response::new(pb::RevertPurgeResponse {
-                status: Some(status_ok()),
-                new_rev: rev,
-            })),
-            Err(err) => Ok(Response::new(pb::RevertPurgeResponse {
-                status: Some(status_err(&err)),
-                new_rev: 0,
-            })),
-        }
-    }
-
-    async fn list_retention_policies(
-        &self,
-        request: Request<pb::ListRetentionPoliciesRequest>,
-    ) -> Result<Response<pb::ListRetentionPoliciesResponse>, Status> {
-        let session = self.api.session(&request)?;
-        let req = request.into_inner();
-        let result = {
-            let store = self.api.store();
-            store.list_retention_policies(&session, &req.repo_id)
-        };
-        match result {
-            Ok(list) => Ok(Response::new(pb::ListRetentionPoliciesResponse {
-                status: Some(status_ok()),
-                policies: list.iter().map(policy_to_pb).collect(),
-            })),
-            Err(err) => Ok(Response::new(pb::ListRetentionPoliciesResponse {
-                status: Some(status_err(&err)),
-                policies: Vec::new(),
-            })),
-        }
-    }
-
-    async fn upsert_retention_policy(
-        &self,
-        request: Request<pb::UpsertRetentionPolicyRequest>,
-    ) -> Result<Response<pb::UpsertRetentionPolicyResponse>, Status> {
-        let session = self.api.session(&request)?;
-        let req = request.into_inner();
-        let input = vcs_server::RetentionPolicyInput {
-            policy_id: if req.policy_id.is_empty() {
-                None
-            } else {
-                Some(req.policy_id)
-            },
-            path_pattern: req.path_pattern,
-            keep_months: req.keep_months,
-            max_bytes: req.max_bytes,
-            max_age_days: req.max_age_days,
-            enabled: req.enabled,
-            dry_run: req.dry_run,
-        };
-        let result = {
-            let store = self.api.store();
-            store.upsert_retention_policy(&session, &req.repo_id, input)
-        };
-        match result {
-            Ok(policy) => Ok(Response::new(pb::UpsertRetentionPolicyResponse {
-                status: Some(status_ok()),
-                policy: Some(policy_to_pb(&policy)),
-            })),
-            Err(err) => Ok(Response::new(pb::UpsertRetentionPolicyResponse {
-                status: Some(status_err(&err)),
-                policy: None,
-            })),
-        }
-    }
-
-    async fn delete_retention_policy(
-        &self,
-        request: Request<pb::DeleteRetentionPolicyRequest>,
-    ) -> Result<Response<pb::DeleteRetentionPolicyResponse>, Status> {
-        let session = self.api.session(&request)?;
-        let req = request.into_inner();
-        let result = {
-            let store = self.api.store();
-            store.delete_retention_policy(&session, &req.repo_id, &req.policy_id)
-        };
-        Ok(Response::new(pb::DeleteRetentionPolicyResponse {
-            status: Some(match result {
-                Ok(()) => status_ok(),
-                Err(err) => status_err(&err),
-            }),
-        }))
-    }
-
-    async fn apply_retention(
-        &self,
-        request: Request<pb::ApplyRetentionRequest>,
-    ) -> Result<Response<pb::ApplyRetentionResponse>, Status> {
-        let session = self.api.session(&request)?;
-        let req = request.into_inner();
-        let result = {
-            let store = self.api.store();
-            store.apply_retention(&session, &req.repo_id, req.dry_run, req.immediate)
-        };
-        match result {
-            Ok(outcome) => Ok(Response::new(pb::ApplyRetentionResponse {
-                status: Some(status_ok()),
-                candidates: outcome.candidates,
-                reclaimable_bytes: outcome.reclaimable_bytes,
-                new_rev: outcome.new_rev,
-            })),
-            Err(err) => Ok(Response::new(pb::ApplyRetentionResponse {
-                status: Some(status_err(&err)),
-                candidates: Vec::new(),
-                reclaimable_bytes: 0,
-                new_rev: 0,
             })),
         }
     }
@@ -2159,19 +2033,6 @@ impl RepoService for RepoApi {
                 ..Default::default()
             })),
         }
-    }
-}
-
-fn policy_to_pb(policy: &vcs_server::RetentionPolicyInfo) -> pb::RetentionPolicyInfo {
-    pb::RetentionPolicyInfo {
-        policy_id: policy.policy_id.clone(),
-        path_pattern: policy.path_pattern.clone(),
-        keep_months: policy.keep_months,
-        max_bytes: policy.max_bytes,
-        max_age_days: policy.max_age_days,
-        enabled: policy.enabled,
-        dry_run: policy.dry_run,
-        created_at: policy.created_at,
     }
 }
 
@@ -3067,8 +2928,8 @@ pub async fn serve(config: ServeConfig) -> Result<(), Box<dyn std::error::Error>
 
 /// 后台维护循环。
 ///
-/// 三件事：把到期的回收站仓库彻底删除、把宽限期到点的清理记录转正，然后跑一次全库 GC。
-/// 保留策略的自动执行也在同一入口里（`apply_retention_all`，走系统身份）。
+/// 只做两件事：把到期的回收站仓库彻底删除，再跑一次全库 GC。
+/// 路径级清理不在这里——彻底删除由用户主动发起，删完当场回收。
 fn spawn_maintenance(store: Store, interval_secs: u64) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
@@ -3086,17 +2947,10 @@ fn spawn_maintenance(store: Store, interval_secs: u64) -> tokio::task::JoinHandl
             .await;
             match outcome {
                 Ok(Ok(report)) => {
-                    let touched = report.promoted_purges > 0
-                        || report.swept_objects > 0
-                        || report.retention_paths > 0;
-                    if touched {
+                    if report.purged_repos > 0 || report.swept_objects > 0 {
                         println!(
-                            "后台维护完成：保留策略清理 {} 个目录，转正 {} 条清理记录，\
-                             清扫 {} 个对象，释放 {} 字节",
-                            report.retention_paths,
-                            report.promoted_purges,
-                            report.swept_objects,
-                            report.reclaimed_bytes
+                            "后台维护完成：彻底删除 {} 个到期仓库，清扫 {} 个对象，释放 {} 字节",
+                            report.purged_repos, report.swept_objects, report.reclaimed_bytes
                         );
                     }
                 }

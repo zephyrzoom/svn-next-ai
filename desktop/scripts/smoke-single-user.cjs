@@ -418,31 +418,8 @@ async function main() {
       `  预估可释放 ${estimate.reclaimableBytes} 字节，影响 ${estimate.affectedRevisions} 个版本（dry-run 未改动数据）`,
     );
 
-    step('回收站：先放宽限期 → 撤销 → 内容恢复');
-    const staged = await client.purge(repo.repoId, ['202610'], false, '先放回收站');
-    const bin = await client.listPurgedPaths(repo.repoId);
-    const stagedRecord = bin.find((item) => item.purgeId && item.state === 'pending');
-    if (!stagedRecord) fail(`回收站里没有宽限期记录：${JSON.stringify(bin)}`);
-    const restoredRev = await client.revertPurge(repo.repoId, stagedRecord.purgeId);
-    if (restoredRev <= staged.newRev) fail('撤销应产生新的提交');
-    const restoredTree = await client.getTree(repo.repoId, 0);
-    if (!restoredTree.some((entry) => entry.path === '202610/summary.txt')) {
-      fail('撤销后 HEAD 里应重新出现 202610');
-    }
-    const restoredEntry = restoredTree.find((entry) => entry.path === '202610/summary.txt');
-    const restoredObjs = await client.downloadObjects(repo.repoId, 0);
-    const restoredData = restoredObjs.get(restoredEntry.hash);
-    if (!restoredData || restoredData.toString('utf8') !== '远端第二次\n') {
-      fail(`撤销后内容不对：${JSON.stringify(restoredData && restoredData.toString('utf8'))}`);
-    }
-    const afterRevertBin = await client.listPurgedPaths(repo.repoId);
-    if (!afterRevertBin.some((item) => item.state === 'reverted')) {
-      fail('撤销后记录状态应为 reverted');
-    }
-    console.log(`  宽限期清理 → 撤销成 r${restoredRev}，内容与当初一致，记录标为已撤销`);
-
-    step('立即释放后再撤销：必须诚实地失败');
-    const purged = await client.purge(repo.repoId, ['202610'], true, '冒烟清理');
+    step('彻底删除：一次跑完，内容字节当场回收');
+    const purged = await client.purge(repo.repoId, ['202610'], '冒烟清理');
     if (purged.newRev <= head.rev) fail('清理应产生新的删除提交');
     const gc = await client.getGcStatus(repo.repoId, purged.gcJobId);
     if (gc.state !== 4) fail(`GC 状态应为 DONE(4)，实际 ${gc.state}`);
@@ -456,19 +433,6 @@ async function main() {
     const quotaAfter = await client.getQuota(repo.repoId);
     if (quotaAfter.usedBytes > quotaBefore.usedBytes) fail('清理后占用反而变大了');
     console.log(`  HEAD 已不含 202610；对象池占用 ${quotaBefore.usedBytes} → ${quotaAfter.usedBytes}`);
-
-    const bin2 = await client.listPurgedPaths(repo.repoId);
-    const sweptRecord = bin2.find((item) => item.state === 'active');
-    if (!sweptRecord) fail('回收站里没有已生效的记录');
-    let contentGone = false;
-    try {
-      await client.revertPurge(repo.repoId, sweptRecord.purgeId);
-    } catch (err) {
-      contentGone = err.code === 7; // CONTENT_PURGED
-      if (!contentGone) fail(`撤销应报 CONTENT_PURGED(7)，实际 ${err.code}：${err.message}`);
-      console.log(`  已按预期失败：${err.message}`);
-    }
-    if (!contentGone) fail('内容已被回收却撤销成功，说明服务端在伪造内容');
 
     step('配额设置：全局默认 → 单仓库覆盖 → 恢复继承');
     // 包一层块作用域：main() 是个大函数，前面的段落已经用过 quotaBefore 之类的名字。
@@ -494,66 +458,8 @@ async function main() {
     );
     }
 
-    step('保留策略：配置 → 预览 → 执行');
-    const archive = await client.createRepo('archive');
-    const ARCH = path.join(WORK, 'archive-src');
-    for (const month of ['202609', '202610', '202611']) {
-      fs.mkdirSync(path.join(ARCH, month), { recursive: true });
-      fs.writeFileSync(path.join(ARCH, month, 'report.txt'), `${month} 的报告\n`);
-    }
-    cliCommit('三个月归档', 'archive', ARCH);
-
-    const saved = await client.upsertRetentionPolicy(archive.repoId, {
-      pathPattern: '^20\\d{4}$',
-      keepMonths: 2,
-      maxBytes: 0,
-      maxAgeDays: 0,
-      enabled: true,
-      dryRun: true,
-    });
-    if (!saved.policyId.startsWith('rt_')) fail('策略号格式不对');
-    const listed = await client.listRetentionPolicies(archive.repoId);
-    if (listed.length !== 1 || !listed[0].dryRun) fail('策略没有正确保存为仅预览');
-
-    const preview = await client.applyRetention(archive.repoId, true, false);
-    if (preview.candidates.join(',') !== '202609') {
-      fail(`候选不对：${JSON.stringify(preview.candidates)}`);
-    }
-    if (preview.newRev !== 0) fail('预览不该产生提交');
-    console.log(`  预览候选 ${preview.candidates.join('、')}，预计释放 ${preview.reclaimableBytes} 字节`);
-
-    // 策略本身是「仅预览」：即使请求执行也必须被拒。
-    let blockedByDryRun = false;
-    try {
-      await client.applyRetention(archive.repoId, false, false);
-    } catch (err) {
-      blockedByDryRun = err.code === 36; // INVALID_ARGUMENT
-      if (!blockedByDryRun) fail(`应以 INVALID_ARGUMENT 拒绝：${err.code} ${err.message}`);
-    }
-    if (!blockedByDryRun) fail('仅预览的策略竟然被执行了');
-
-    const enabled = await client.upsertRetentionPolicy(archive.repoId, {
-      policyId: saved.policyId,
-      pathPattern: '^20\\d{4}$',
-      keepMonths: 2,
-      maxBytes: 0,
-      maxAgeDays: 0,
-      enabled: true,
-      dryRun: false,
-    });
-    if (enabled.dryRun) fail('策略没有被切换为可执行');
-    const applied = await client.applyRetention(archive.repoId, false, true);
-    if (applied.newRev <= 1) fail('执行应该产生新的删除提交');
-    const archiveTree = await client.getTree(archive.repoId, 0);
-    if (archiveTree.some((entry) => entry.path.startsWith('202609/'))) {
-      fail('清理后 HEAD 里仍有 202609');
-    }
-    const again = await client.applyRetention(archive.repoId, false, true);
-    if (again.candidates.length !== 0) fail('重复执行不该再有候选');
-    console.log(`  已执行：生成 r${applied.newRev}，只剩最近两个月份；再次评估无候选`);
-
     console.log(
-      '\n✓ 提交/更新/冲突三栏/还原 + 注册审批 + 建库审批 + 成员管理 + 空间治理 + 回收站 + 保留策略 + 配额设置 冒烟通过',
+      '\n✓ 提交/更新/冲突三栏/还原 + 注册审批 + 建库审批 + 成员管理 + 空间治理 + 彻底删除 + 配额设置 冒烟通过',
     );
   } finally {
     client.close();

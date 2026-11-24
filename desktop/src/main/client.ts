@@ -242,36 +242,6 @@ export interface RepoQuotaRow {
   source: number;
 }
 
-export interface RetentionPolicyRow {
-  policyId: string;
-  pathPattern: string;
-  keepMonths: number;
-  maxBytes: number;
-  maxAgeDays: number;
-  enabled: boolean;
-  dryRun: boolean;
-  createdAt: number;
-}
-
-export interface RetentionApplyRow {
-  candidates: string[];
-  reclaimableBytes: number;
-  /** 0 表示没有产生提交（预览或没有候选）。 */
-  newRev: number;
-}
-
-export interface PurgedPathRow {
-  purgeId: string;
-  path: string;
-  /** pending（宽限期）/ active（已生效）/ reverted（已撤销） */
-  state: string;
-  reason: string;
-  purgedBy: string;
-  createdAt: number;
-  graceUntil: number;
-  activatedAt: number;
-}
-
 export interface GcStatusRow {
   state: number;
   progressPercent: number;
@@ -730,52 +700,14 @@ export class VcsClient {
   }
 
   /**
-   * 清理：删除提交 + 路径裁剪 + GC。
+   * 彻底删除：删除提交 + 裁剪标记 + 立即 GC。
    *
-   * `immediate` 跳过 7 天宽限期——磁盘已满时这是唯一有用的选项。
+   * 没有宽限期、没有撤销——内容字节当场回收。
    */
-  async purge(
-    repoId: string,
-    paths: string[],
-    immediate: boolean,
-    reason: string,
-  ): Promise<PurgeResultRow> {
-    const resp = await this.invoke<any>(this.repo, 'purge', {
-      repoId,
-      paths,
-      immediate,
-      reason,
-    });
+  async purge(repoId: string, paths: string[], reason: string): Promise<PurgeResultRow> {
+    const resp = await this.invoke<any>(this.repo, 'purge', { repoId, paths, reason });
     assertOk(resp.status);
     return { newRev: resp.newRev as number, gcJobId: resp.gcJobId as string };
-  }
-
-  /** 回收站：已执行的清理记录。 */
-  async listPurgedPaths(repoId: string): Promise<PurgedPathRow[]> {
-    const resp = await this.invoke<any>(this.repo, 'listPurgedPaths', { repoId });
-    assertOk(resp.status);
-    return (resp.entries ?? []).map((row: any) => ({
-      purgeId: row.purgeId as string,
-      path: row.path as string,
-      state: row.state as string,
-      reason: row.reason as string,
-      purgedBy: row.purgedBy as string,
-      createdAt: row.createdAt as number,
-      graceUntil: row.graceUntil as number,
-      activatedAt: row.activatedAt as number,
-    }));
-  }
-
-  /**
-   * 撤销清理：把路径内容恢复到 HEAD，并让 GC 不再跳过它们。
-   *
-   * 内容若已被 GC 物理回收，服务端返回 `CONTENT_PURGED`——这是唯一诚实的答案，
-   * 不能伪造一个指向空内容的版本。
-   */
-  async revertPurge(repoId: string, purgeId: string): Promise<number> {
-    const resp = await this.invoke<any>(this.repo, 'revertPurge', { repoId, purgeId });
-    assertOk(resp.status);
-    return resp.newRev as number;
   }
 
   /** 全局默认配额（所有未单独设置覆盖的仓库继承它）。 */
@@ -826,80 +758,6 @@ export class VcsClient {
       repoBytes: inherit ? 0 : bytes,
       effectiveBytes: (effective.bytes ?? 0) as number,
       source: (effective.source ?? 0) as number,
-    };
-  }
-
-  async listRetentionPolicies(repoId: string): Promise<RetentionPolicyRow[]> {
-    const resp = await this.invoke<any>(this.repo, 'listRetentionPolicies', { repoId });
-    assertOk(resp.status);
-    return (resp.policies ?? []).map((row: any) => ({
-      policyId: row.policyId as string,
-      pathPattern: row.pathPattern as string,
-      keepMonths: row.keepMonths as number,
-      maxBytes: row.maxBytes as number,
-      maxAgeDays: row.maxAgeDays as number,
-      enabled: row.enabled as boolean,
-      dryRun: row.dryRun as boolean,
-      createdAt: row.createdAt as number,
-    }));
-  }
-
-  async upsertRetentionPolicy(
-    repoId: string,
-    policy: {
-      policyId?: string;
-      pathPattern: string;
-      keepMonths: number;
-      maxBytes: number;
-      maxAgeDays: number;
-      enabled: boolean;
-      dryRun: boolean;
-    },
-  ): Promise<RetentionPolicyRow> {
-    const resp = await this.invoke<any>(this.repo, 'upsertRetentionPolicy', {
-      repoId,
-      policyId: policy.policyId ?? '',
-      pathPattern: policy.pathPattern,
-      keepMonths: policy.keepMonths,
-      maxBytes: policy.maxBytes,
-      maxAgeDays: policy.maxAgeDays,
-      enabled: policy.enabled,
-      dryRun: policy.dryRun,
-    });
-    assertOk(resp.status);
-    const row = resp.policy ?? {};
-    return {
-      policyId: row.policyId as string,
-      pathPattern: row.pathPattern as string,
-      keepMonths: row.keepMonths as number,
-      maxBytes: row.maxBytes as number,
-      maxAgeDays: row.maxAgeDays as number,
-      enabled: row.enabled as boolean,
-      dryRun: row.dryRun as boolean,
-      createdAt: row.createdAt as number,
-    };
-  }
-
-  async deleteRetentionPolicy(repoId: string, policyId: string): Promise<void> {
-    const resp = await this.invoke<any>(this.repo, 'deleteRetentionPolicy', {
-      repoId,
-      policyId,
-    });
-    assertOk(resp.status);
-  }
-
-  /** 评估保留策略；`dryRun=false` 时真正执行清理（会生成删除提交）。 */
-  async applyRetention(repoId: string, dryRun: boolean, immediate: boolean): Promise<RetentionApplyRow> {
-    const resp = await this.invoke<any>(this.repo, 'applyRetention', {
-      repoId,
-      dryRun,
-      immediate,
-    });
-    assertOk(resp.status);
-    return {
-      candidates: (resp.candidates ?? []) as string[],
-      reclaimableBytes: resp.reclaimableBytes as number,
-      newRev: resp.newRev as number,
     };
   }
 

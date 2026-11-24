@@ -331,8 +331,6 @@ pub struct PurgeOutcome {
 /// 一次后台维护的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaintenanceReport {
-    /// 本次从宽限期转正的清理记录数。
-    pub promoted_purges: usize,
     /// 本次因回收站到期而彻底删除的仓库数。
     pub purged_repos: usize,
     pub gc_job_id: String,
@@ -340,58 +338,19 @@ pub struct MaintenanceReport {
     pub reclaimed_bytes: u64,
     /// 参与本轮 GC 的仓库数（共享 CAS 下 GC 是全局的，这里只是信息）。
     pub repo_count: usize,
-    /// 本轮因保留策略执行了清理的仓库数。
-    pub retention_repos: usize,
-    /// 本轮被保留策略清理掉的目录数。
-    pub retention_paths: usize,
 }
 
-/// 一条保留策略。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetentionPolicyInfo {
-    pub policy_id: String,
-    pub path_pattern: String,
-    pub keep_months: u32,
-    pub max_bytes: u64,
-    pub max_age_days: u32,
-    pub enabled: bool,
-    pub dry_run: bool,
-    pub created_at: i64,
-}
-
-/// 新建 / 更新保留策略的入参。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetentionPolicyInput {
-    /// 空表示新建。
-    pub policy_id: Option<String>,
-    pub path_pattern: String,
-    pub keep_months: u32,
-    pub max_bytes: u64,
-    pub max_age_days: u32,
-    pub enabled: bool,
-    pub dry_run: bool,
-}
-
-/// 一次保留策略评估的结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetentionApplyOutcome {
-    pub candidates: Vec<String>,
-    pub reclaimable_bytes: u64,
-    /// 0 表示没有产生提交（dry-run，或本来就没有候选）。
-    pub new_rev: u64,
-}
-
-/// 一条清理记录（回收站条目）。
+/// 一条彻底删除记录，只用于审计与查询「哪些路径被清理过」。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PurgedPathInfo {
     pub purge_id: String,
     pub path: String,
-    /// `pending`（宽限期内）/ `active`（GC 会跳过它）/ `reverted`（已撤销）
+    /// 恒为 `active`：GC 标记时跳过这些路径。
+    /// 老库里可能还有 `pending`（宽限期）与 `reverted`（已撤销）的历史行。
     pub state: String,
     pub reason: Option<String>,
     pub purged_by: String,
     pub created_at: i64,
-    pub grace_until: Option<i64>,
     pub activated_at: Option<i64>,
 }
 
@@ -1620,7 +1579,6 @@ impl ServerStore {
             "DELETE FROM revisions WHERE repo_id = ?1",
             "DELETE FROM repo_members WHERE repo_id = ?1",
             "DELETE FROM purged_paths WHERE repo_id = ?1",
-            "DELETE FROM retention_policies WHERE repo_id = ?1",
             "DELETE FROM quota_usage WHERE repo_id = ?1",
             "DELETE FROM upload_sessions WHERE repo_id = ?1",
             "DELETE FROM locks WHERE repo_id = ?1",
@@ -4895,17 +4853,16 @@ impl ServerStore {
         })
     }
 
-    /// 清理：删除提交 + 路径裁剪标记 + 排一个 GC 任务。
+    /// 彻底删除：删除提交 + 路径裁剪标记 + 当场跑完 GC。
     ///
     /// 三步缺一不可——只删路径不写 `purged_paths`，旧版本仍引用内容，GC 一字节都回收不了；
-    /// 只写标记不删 HEAD，用户看到的目录还在。`immediate=true` 时立刻跑一次 GC，
-    /// 这是「磁盘已满」场景唯一的出路（默认的 7 天宽限期在此毫无意义）。
+    /// 只写标记不删 HEAD，用户看到的目录还在。
+    /// 没有宽限期、也没有撤销：内容字节删掉就是删掉了。
     pub fn purge(
         &self,
         session: &Session,
         name_or_id: &str,
         paths: &[String],
-        immediate: bool,
         reason: &str,
     ) -> Result<PurgeOutcome> {
         // estimate 内部已做成员与写权限校验。
@@ -4926,36 +4883,13 @@ impl ServerStore {
             ));
         }
 
-        let message = format!(
-            "清理 {}（{}）",
-            estimate.paths.join(", "),
-            if immediate {
-                "立即释放"
-            } else {
-                "进入回收站，7 天后释放"
-            }
-        );
+        let message = format!("彻底删除 {}", estimate.paths.join(", "));
         let commit =
             self.begin_commit(session, &repo.repo_id, repo.head_rev, &deletes, &message, 0)?;
         let outcome = self.finalize_commit(session, &commit.session_id)?;
 
+        // 没有宽限期：删完就写 active，GC 当场回收。彻底删除是终态，没有撤销入口。
         let now = now_secs();
-        // 宽限期取仓库自己的配置（schema 里一直有 repos.grace_days，早先被硬编码成 7 天而忽略了）。
-        let grace_days: i64 = self
-            .conn
-            .query_row(
-                "SELECT grace_days FROM repos WHERE repo_id = ?1",
-                params![repo.repo_id],
-                |r| r.get(0),
-            )
-            .map_err(db("查询宽限期失败"))?;
-        let state = if immediate { "active" } else { "pending" };
-        let grace_until = if immediate {
-            None
-        } else {
-            Some(now + grace_days.max(0) * 86_400)
-        };
-        let activated_at = if immediate { Some(now) } else { None };
         let mut purge_id = String::new();
         for path in &estimate.paths {
             let id = new_id("pg");
@@ -4965,18 +4899,16 @@ impl ServerStore {
             self.conn
                 .execute(
                     "INSERT INTO purged_paths
-                       (purge_id, repo_id, path_pattern, state, reason, purged_by, created_at, grace_until, activated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                       (purge_id, repo_id, path_pattern, state, reason, purged_by, created_at, activated_at)
+                     VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7)",
                     params![
                         id,
                         repo.repo_id,
                         path,
-                        state,
                         reason,
                         session.user_id,
                         now,
-                        grace_until,
-                        activated_at
+                        now
                     ],
                 )
                 .map_err(db("写入清理标记失败"))?;
@@ -4991,11 +4923,8 @@ impl ServerStore {
             )
             .map_err(db("创建 GC 任务失败"))?;
 
-        if immediate {
-            // M2 没有独立后台 worker：直接跑完再返回，任务行与异步 worker 完全同构，
-            // M3 换成队列时这里只是把同步调用挪进 worker。
-            self.run_gc_job(&gc_job_id)?;
-        }
+        // 没有独立后台 worker：直接跑完再返回，任务行与异步 worker 完全同构。
+        self.run_gc_job(&gc_job_id)?;
 
         self.audit(
             &repo.repo_id,
@@ -5003,8 +4932,8 @@ impl ServerStore {
             "purge.execute",
             &estimate.paths.join(","),
             Some(&format!(
-                "{{\"reclaimable\":{},\"shared\":{},\"immediate\":{},\"rev\":{}}}",
-                estimate.reclaimable_bytes, estimate.shared_bytes, immediate, outcome.rev
+                "{{\"reclaimable\":{},\"shared\":{},\"rev\":{}}}",
+                estimate.reclaimable_bytes, estimate.shared_bytes, outcome.rev
             )),
         )?;
 
@@ -5017,59 +4946,20 @@ impl ServerStore {
         })
     }
 
-    /// 调整仓库的回收站宽限期（天）。0 表示清理立即生效。
-    ///
-    /// 这个值决定「用户删了目录之后还有多久能反悔」，因此按写权限校验而不是管理员专属：
-    /// owner 在自己的仓库里本来就掌握空间治理的全部动作。
-    pub fn set_repo_grace_days(
-        &self,
-        session: &Session,
-        name_or_id: &str,
-        days: u32,
-    ) -> Result<()> {
-        let repo = self.require_repo(session, name_or_id)?;
-        // 系统身份按 owner 处理：它没有成员记录，也不该被成员门挡住。
-        let role = if session.is_system() {
-            RepoMemberRole::Owner
-        } else {
-            self.member_role(&repo.repo_id, &session.user_id)?
-        };
-        if !role.can_write() {
-            return Err(Error::new(
-                ErrorCode::RepoMemberForbidden,
-                "当前成员角色为只读，不能调整宽限期",
-            ));
-        }
-        self.conn
-            .execute(
-                "UPDATE repos SET grace_days = ?2, updated_at = ?3 WHERE repo_id = ?1",
-                params![repo.repo_id, days as i64, now_secs()],
-            )
-            .map_err(db("更新宽限期失败"))?;
-        self.audit(
-            &repo.repo_id,
-            &session.user_id,
-            "repo.grace_days.set",
-            &repo.name,
-            Some(&format!("{{\"days\":{days}}}")),
-        )?;
-        Ok(())
-    }
-
-    /// 已执行的清理记录（回收站）。成员可见，写权限才能撤销。
+    /// 已执行的彻底删除记录。成员可见，只作审计与查询用。
     pub fn list_purged_paths(
         &self,
         session: &Session,
         name_or_id: &str,
     ) -> Result<Vec<PurgedPathInfo>> {
         let repo = self.find_repo(name_or_id)?;
-        // 成员门：非成员不该知道这个仓库清理过什么。
+        // 成员门：非成员不该知道这个仓库删除过什么。
         self.member_role(&repo.repo_id, &session.user_id)?;
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT purge_id, path_pattern, state, reason, purged_by,
-                        created_at, grace_until, activated_at
+                        created_at, activated_at
                  FROM purged_paths WHERE repo_id = ?1 ORDER BY created_at DESC",
             )
             .map_err(db("查询清理记录失败"))?;
@@ -5082,8 +4972,7 @@ impl ServerStore {
                     reason: r.get(3)?,
                     purged_by: r.get(4)?,
                     created_at: r.get(5)?,
-                    grace_until: r.get(6)?,
-                    activated_at: r.get(7)?,
+                    activated_at: r.get(6)?,
                 })
             })
             .map_err(db("查询清理记录失败"))?;
@@ -5091,547 +4980,14 @@ impl ServerStore {
             .map_err(db("读取清理记录失败"))
     }
 
-    /// 撤销一次清理：把路径内容恢复到 HEAD，并把裁剪标记置为 `reverted`。
-    ///
-    /// 两个前提必须先讲清：
-    ///   1. 内容必须还在对象池里。GC 已经把 blob 物理删掉的，**没有任何办法恢复**——
-    ///      此时返回 `CONTENT_PURGED` 而不是伪造一个指向空内容的版本。
-    ///   2. 恢复是「新提交」而不是回滚历史：revision 只增不改，撤销本身也是一次修订。
-    pub fn revert_purge(&self, session: &Session, name_or_id: &str, purge_id: &str) -> Result<u64> {
-        session.require(SCOPE_WRITE, "撤销清理")?;
-        let repo = self.require_repo(session, name_or_id)?;
-        // 系统身份按 owner 处理：它没有成员记录，也不该被成员门挡住。
-        let role = if session.is_system() {
-            RepoMemberRole::Owner
-        } else {
-            self.member_role(&repo.repo_id, &session.user_id)?
-        };
-        if !role.can_write() {
-            return Err(Error::new(
-                ErrorCode::RepoMemberForbidden,
-                "当前成员角色为只读，不能撤销清理",
-            ));
-        }
-
-        let record: Option<(String, String)> = self
-            .conn
-            .query_row(
-                "SELECT path_pattern, state FROM purged_paths
-                 WHERE purge_id = ?1 AND repo_id = ?2",
-                params![purge_id, repo.repo_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .map_err(db("查询清理记录失败"))?;
-        let (pattern, state) = record.ok_or_else(|| {
-            Error::new(ErrorCode::PathConflict, "清理记录不存在（或不属于该仓库）")
-        })?;
-        if state == "reverted" {
-            return Err(Error::new(
-                ErrorCode::InvalidArgument,
-                "这次清理已经撤销过了",
-            ));
-        }
-
-        let head_root = self.revision_root_tree(&repo.repo_id, repo.head_rev)?;
-        let head_flat = tree::flatten_tree(self.objects(), &head_root)?;
-        let head_map: BTreeMap<&str, Hash> = head_flat
-            .iter()
-            .map(|entry| (entry.path.as_str(), entry.hash))
-            .collect();
-        let prefixes = vec![pattern.clone()];
-
-        // 找到最近一个「还包含该路径」的版本，它就是恢复的内容来源。
-        let revisions: Vec<i64> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT rev FROM revisions WHERE repo_id = ?1 ORDER BY rev DESC")
-                .map_err(db("查询版本失败"))?;
-            let rows = stmt
-                .query_map(params![repo.repo_id], |r| r.get::<_, i64>(0))
-                .map_err(db("查询版本失败"))?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(db("读取版本失败"))?
-        };
-        let mut source: Option<Vec<FlatEntry>> = None;
-        for rev in revisions {
-            if rev as u64 >= repo.head_rev {
-                continue;
-            }
-            let root = self.revision_root_tree(&repo.repo_id, rev as u64)?;
-            let flat = tree::flatten_tree(self.objects(), &root)?;
-            if flat
-                .iter()
-                .any(|entry| path_under_any(&entry.path, &prefixes))
-            {
-                source = Some(flat);
-                break;
-            }
-        }
-        let source = source.ok_or_else(|| {
-            Error::new(
-                ErrorCode::ContentPurged,
-                format!("历史版本里也找不到 {pattern} 的内容，无法恢复"),
-            )
-        })?;
-
-        let mut changes: Vec<PendingChange> = Vec::new();
-        for entry in source
-            .iter()
-            .filter(|entry| path_under_any(&entry.path, &prefixes))
-        {
-            match head_map.get(entry.path.as_str()) {
-                Some(hash) if *hash == entry.hash => continue,
-                Some(_) => changes.push(PendingChange::file(
-                    entry.path.clone(),
-                    ChangeKind::Modify,
-                    Some(entry.hash),
-                    entry.size,
-                )),
-                None => changes.push(PendingChange::file(
-                    entry.path.clone(),
-                    ChangeKind::Add,
-                    Some(entry.hash),
-                    entry.size,
-                )),
-            }
-        }
-
-        // 先确认内容还在：缺一个字节都不该往下走。
-        let missing = changes
-            .iter()
-            .filter(|change| change.hash.is_some_and(|hash| !self.objects.exists(&hash)))
-            .count();
-        if missing > 0 {
-            return Err(Error::new(
-                ErrorCode::ContentPurged,
-                format!(
-                    "{pattern} 有 {missing} 个对象已被 GC 物理回收，无法恢复（可从旧版本的导出副本手工补回）"
-                ),
-            ));
-        }
-
-        let new_rev = if changes.is_empty() {
-            repo.head_rev
-        } else {
-            let message = format!("撤销清理：{pattern}");
-            let commit =
-                self.begin_commit(session, &repo.repo_id, repo.head_rev, &changes, &message, 0)?;
-            self.finalize_commit(session, &commit.session_id)?.rev
-        };
-
-        self.conn
-            .execute(
-                "UPDATE purged_paths SET state = 'reverted' WHERE purge_id = ?1",
-                params![purge_id],
-            )
-            .map_err(db("更新清理记录失败"))?;
-        self.audit(
-            &repo.repo_id,
-            &session.user_id,
-            "purge.revert",
-            &pattern,
-            Some(&format!(
-                "{{\"purge_id\":\"{purge_id}\",\"new_rev\":{new_rev},\"restored\":{}}}",
-                changes.len()
-            )),
-        )?;
-        Ok(new_rev)
-    }
-
-    // ---------------- 保留策略（设计 9.7） ----------------
-
-    pub fn list_retention_policies(
-        &self,
-        session: &Session,
-        name_or_id: &str,
-    ) -> Result<Vec<RetentionPolicyInfo>> {
-        let repo = self.find_repo(name_or_id)?;
-        self.member_role(&repo.repo_id, &session.user_id)?;
-        self.load_retention_policies(&repo.repo_id)
-    }
-
-    fn load_retention_policies(&self, repo_id: &str) -> Result<Vec<RetentionPolicyInfo>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT policy_id, path_pattern, keep_months, max_bytes, max_age_days,
-                        enabled, dry_run, created_at
-                 FROM retention_policies WHERE repo_id = ?1 ORDER BY created_at",
-            )
-            .map_err(db("查询保留策略失败"))?;
-        let rows = stmt
-            .query_map(params![repo_id], |r| {
-                Ok(RetentionPolicyInfo {
-                    policy_id: r.get(0)?,
-                    path_pattern: r.get(1)?,
-                    keep_months: r.get::<_, i64>(2)?.max(0) as u32,
-                    max_bytes: r.get::<_, i64>(3)?.max(0) as u64,
-                    max_age_days: r.get::<_, i64>(4)?.max(0) as u32,
-                    enabled: r.get::<_, i64>(5)? != 0,
-                    dry_run: r.get::<_, i64>(6)? != 0,
-                    created_at: r.get(7)?,
-                })
-            })
-            .map_err(db("查询保留策略失败"))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(db("读取保留策略失败"))
-    }
-
-    /// 新建或更新策略。策略会自动删除数据，因此要求 owner / maintainer。
-    pub fn upsert_retention_policy(
-        &self,
-        session: &Session,
-        name_or_id: &str,
-        input: RetentionPolicyInput,
-    ) -> Result<RetentionPolicyInfo> {
-        let repo = self.require_repo(session, name_or_id)?;
-        // 系统身份按 owner 处理：它没有成员记录，也不该被成员门挡住。
-        let role = if session.is_system() {
-            RepoMemberRole::Owner
-        } else {
-            self.member_role(&repo.repo_id, &session.user_id)?
-        };
-        if !role.can_manage_members() {
-            return Err(Error::new(
-                ErrorCode::RepoMemberForbidden,
-                "只有 owner / maintainer 可以配置保留策略",
-            ));
-        }
-        let pattern = input.path_pattern.trim();
-        if pattern.is_empty() {
-            return Err(Error::new(ErrorCode::InvalidArgument, "路径模式不能为空"));
-        }
-        // 正则语法在建策略时就要校验：等到执行时才报错，用户已经以为配置好了。
-        regex::Regex::new(pattern).map_err(|e| {
-            Error::new(
-                ErrorCode::InvalidArgument,
-                format!("路径模式不是合法正则：{e}"),
-            )
-        })?;
-        if input.keep_months == 0 && input.max_bytes == 0 && input.max_age_days == 0 {
-            return Err(Error::new(
-                ErrorCode::InvalidArgument,
-                "keep_months / max_bytes / max_age_days 至少要设置一个，否则策略没有意义",
-            ));
-        }
-
-        let now = now_secs();
-        let policy_id = match &input.policy_id {
-            Some(id) if !id.is_empty() => {
-                let exists: Option<String> = self
-                    .conn
-                    .query_row(
-                        "SELECT policy_id FROM retention_policies
-                         WHERE policy_id = ?1 AND repo_id = ?2",
-                        params![id, repo.repo_id],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .map_err(db("查询保留策略失败"))?;
-                if exists.is_none() {
-                    return Err(Error::new(ErrorCode::PathConflict, "保留策略不存在"));
-                }
-                id.clone()
-            }
-            _ => new_id("rt"),
-        };
-
-        self.conn
-            .execute(
-                "INSERT INTO retention_policies
-                   (policy_id, repo_id, path_pattern, keep_months, max_bytes, max_age_days,
-                    enabled, dry_run, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(policy_id) DO UPDATE SET
-                   path_pattern = excluded.path_pattern,
-                   keep_months = excluded.keep_months,
-                   max_bytes = excluded.max_bytes,
-                   max_age_days = excluded.max_age_days,
-                   enabled = excluded.enabled,
-                   dry_run = excluded.dry_run",
-                params![
-                    policy_id,
-                    repo.repo_id,
-                    pattern,
-                    input.keep_months as i64,
-                    input.max_bytes as i64,
-                    input.max_age_days as i64,
-                    if input.enabled { 1 } else { 0 },
-                    if input.dry_run { 1 } else { 0 },
-                    now
-                ],
-            )
-            .map_err(db("写入保留策略失败"))?;
-        self.audit(
-            &repo.repo_id,
-            &session.user_id,
-            "retention.upsert",
-            pattern,
-            Some(&format!(
-                "{{\"policy_id\":\"{policy_id}\",\"keep_months\":{},\"max_bytes\":{},\"max_age_days\":{},\"dry_run\":{}}}",
-                input.keep_months, input.max_bytes, input.max_age_days, input.dry_run
-            )),
-        )?;
-        Ok(RetentionPolicyInfo {
-            policy_id,
-            path_pattern: pattern.to_string(),
-            keep_months: input.keep_months,
-            max_bytes: input.max_bytes,
-            max_age_days: input.max_age_days,
-            enabled: input.enabled,
-            dry_run: input.dry_run,
-            created_at: now,
-        })
-    }
-
-    pub fn delete_retention_policy(
-        &self,
-        session: &Session,
-        name_or_id: &str,
-        policy_id: &str,
-    ) -> Result<()> {
-        let repo = self.require_repo(session, name_or_id)?;
-        // 系统身份按 owner 处理：它没有成员记录，也不该被成员门挡住。
-        let role = if session.is_system() {
-            RepoMemberRole::Owner
-        } else {
-            self.member_role(&repo.repo_id, &session.user_id)?
-        };
-        if !role.can_manage_members() {
-            return Err(Error::new(
-                ErrorCode::RepoMemberForbidden,
-                "只有 owner / maintainer 可以配置保留策略",
-            ));
-        }
-        let affected = self
-            .conn
-            .execute(
-                "DELETE FROM retention_policies WHERE policy_id = ?1 AND repo_id = ?2",
-                params![policy_id, repo.repo_id],
-            )
-            .map_err(db("删除保留策略失败"))?;
-        if affected == 0 {
-            return Err(Error::new(ErrorCode::PathConflict, "保留策略不存在"));
-        }
-        self.audit(
-            &repo.repo_id,
-            &session.user_id,
-            "retention.delete",
-            policy_id,
-            None,
-        )?;
-        Ok(())
-    }
-
-    /// 评估并（可选）执行保留策略。
-    ///
-    /// 规则语义：`keep_months` / `max_bytes` / `max_age_days` 各自是一条**上限**，
-    /// 任何一条被违反，该目录就成为清理候选（并集）。目录按名称倒序当作"从新到旧"，
-    /// 这也是按月归档 `202610` 这类命名的自然顺序。
-    pub fn apply_retention(
-        &self,
-        session: &Session,
-        name_or_id: &str,
-        dry_run: bool,
-        immediate: bool,
-    ) -> Result<RetentionApplyOutcome> {
-        session.require(SCOPE_WRITE, "执行保留策略")?;
-        let repo = self.require_repo(session, name_or_id)?;
-        // 系统身份按 owner 处理：它没有成员记录，也不该被成员门挡住。
-        let role = if session.is_system() {
-            RepoMemberRole::Owner
-        } else {
-            self.member_role(&repo.repo_id, &session.user_id)?
-        };
-        if !role.can_write() {
-            return Err(Error::new(
-                ErrorCode::RepoMemberForbidden,
-                "当前成员角色为只读，不能执行保留策略",
-            ));
-        }
-
-        let policies: Vec<RetentionPolicyInfo> = self
-            .load_retention_policies(&repo.repo_id)?
-            .into_iter()
-            .filter(|policy| policy.enabled)
-            .collect();
-        if policies.is_empty() {
-            return Ok(RetentionApplyOutcome {
-                candidates: Vec::new(),
-                reclaimable_bytes: 0,
-                new_rev: 0,
-            });
-        }
-
-        let candidates = self.retention_candidates(&repo.repo_id, repo.head_rev, &policies)?;
-        if candidates.is_empty() {
-            return Ok(RetentionApplyOutcome {
-                candidates,
-                reclaimable_bytes: 0,
-                new_rev: 0,
-            });
-        }
-
-        let estimate = self.purge_estimate(&repo.repo_id, repo.head_rev, &candidates)?;
-        let all_dry_run = policies.iter().all(|policy| policy.dry_run);
-        if !dry_run && all_dry_run {
-            return Err(Error::new(
-                ErrorCode::InvalidArgument,
-                "所有生效的策略都处于 dry_run：请先在策略里关闭 dry_run 再执行",
-            ));
-        }
-        if dry_run || all_dry_run {
-            return Ok(RetentionApplyOutcome {
-                candidates,
-                reclaimable_bytes: estimate.reclaimable_bytes,
-                new_rev: 0,
-            });
-        }
-
-        let outcome = self.purge(
-            session,
-            &repo.repo_id,
-            &candidates,
-            immediate,
-            "保留策略自动清理",
-        )?;
-        Ok(RetentionApplyOutcome {
-            candidates,
-            reclaimable_bytes: estimate.reclaimable_bytes,
-            new_rev: outcome.rev,
-        })
-    }
-
-    /// 按策略挑出应当清理的顶层目录。
-    fn retention_candidates(
-        &self,
-        repo_id: &str,
-        head_rev: u64,
-        policies: &[RetentionPolicyInfo],
-    ) -> Result<Vec<String>> {
-        let head_root = self.revision_root_tree(repo_id, head_rev)?;
-        let head_flat = tree::flatten_tree(self.objects(), &head_root)?;
-        let mut sizes: BTreeMap<String, u64> = BTreeMap::new();
-        for entry in &head_flat {
-            let top = top_level(&entry.path);
-            if top.is_empty() {
-                continue; // 根目录下的散文件不参与按月归档的清理
-            }
-            *sizes.entry(top).or_default() += entry.size;
-        }
-        if sizes.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // 每个目录最近一次被修改的版本 → 提交时间，供 max_age_days 使用。
-        let mut last_rev: BTreeMap<String, i64> = BTreeMap::new();
-        {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT rev, path FROM revision_changes WHERE repo_id = ?1")
-                .map_err(db("读取变更记录失败"))?;
-            let rows = stmt
-                .query_map(params![repo_id], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-                })
-                .map_err(db("读取变更记录失败"))?;
-            for row in rows {
-                let (rev, path) = row.map_err(db("读取变更记录失败"))?;
-                let top = top_level(&path);
-                if top.is_empty() {
-                    continue;
-                }
-                let slot = last_rev.entry(top).or_insert(rev);
-                if rev > *slot {
-                    *slot = rev;
-                }
-            }
-        }
-        let mut committed: BTreeMap<i64, i64> = BTreeMap::new();
-        {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT rev, committed_at FROM revisions WHERE repo_id = ?1")
-                .map_err(db("查询版本失败"))?;
-            let rows = stmt
-                .query_map(params![repo_id], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-                })
-                .map_err(db("查询版本失败"))?;
-            for row in rows {
-                let (rev, at) = row.map_err(db("查询版本失败"))?;
-                committed.insert(rev, at);
-            }
-        }
-
-        let now = now_secs();
-        let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for policy in policies {
-            let Ok(pattern) = regex::Regex::new(&policy.path_pattern) else {
-                // 建策略时已校验过；这里保守跳过而不是让整个评估失败。
-                continue;
-            };
-            // 名字倒序 = 从新到旧（按月归档的 202610 这类命名天然可比）。
-            let mut matched: Vec<(&String, &u64)> = sizes
-                .iter()
-                .filter(|(name, _)| pattern.is_match(name))
-                .collect();
-            matched.sort_by(|a, b| b.0.cmp(a.0));
-
-            if policy.keep_months > 0 {
-                for (name, _) in matched.iter().skip(policy.keep_months as usize) {
-                    out.insert((*name).clone());
-                }
-            }
-            if policy.max_bytes > 0 {
-                let mut accumulated = 0u64;
-                for (name, bytes) in &matched {
-                    if accumulated + **bytes > policy.max_bytes {
-                        out.insert((*name).clone());
-                    }
-                    accumulated += **bytes;
-                }
-            }
-            if policy.max_age_days > 0 {
-                let limit = policy.max_age_days as i64 * 86_400;
-                for (name, _) in &matched {
-                    let ts = last_rev
-                        .get(*name)
-                        .and_then(|rev| committed.get(rev))
-                        .copied()
-                        .unwrap_or(0);
-                    if ts > 0 && now - ts > limit {
-                        out.insert((*name).clone());
-                    }
-                }
-            }
-        }
-        Ok(out.into_iter().collect())
-    }
-
-    /// 把宽限期到点的清理记录转正（PENDING → ACTIVE），返回条数。
-    fn promote_pending_purges(&self) -> Result<usize> {
-        let now = now_secs();
-        self.conn
-            .execute(
-                "UPDATE purged_paths SET state = 'active', activated_at = ?1
-                 WHERE state = 'pending' AND (grace_until IS NULL OR grace_until <= ?1)",
-                params![now],
-            )
-            .map_err(db("激活清理标记失败"))
-    }
-
-    /// 后台维护：转正到期的清理标记，然后跑一次全库 GC。
+    /// 后台维护：回收站到期的仓库彻底删除，然后跑一次全库 GC。
     ///
     /// 这是 `vcs serve` 的定时任务调用的入口——不需要 session，因为它没有调用者。
     /// GC 是全局的（共享 CAS），所以只需一轮；`repo_count` 仅用于日志。
+    /// 路径级清理不在这里：彻底删除由用户在桌面端设置页主动发起，删完当场回收。
     pub fn run_maintenance(&self) -> Result<MaintenanceReport> {
-        // 先回收站到期清理：元数据删掉之后，同一轮 GC 才能把对象当成孤儿回收。
+        // 回收站到期清理：元数据删掉之后，同一轮 GC 才能把对象当成孤儿回收。
         let purged_repos = self.purge_expired_repos()?;
-        // 再执行保留策略：它会产生删除提交，随后同一轮的转正 + GC 就能接上。
-        let (retention_repos, retention_paths) = self.apply_retention_all()?;
-        let promoted = self.promote_pending_purges()?;
         let repo_count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM repos", [], |r| r.get(0))
@@ -5650,101 +5006,14 @@ impl ServerStore {
         // 它的历史目录树不会再有版本引用，留着只是垃圾。
         let status = self.run_gc_job_with(&job_id, true)?;
         Ok(MaintenanceReport {
-            promoted_purges: promoted,
             purged_repos,
             gc_job_id: job_id,
             swept_objects: status.swept_objects,
             reclaimed_bytes: status.reclaimed_bytes,
             repo_count: repo_count.max(0) as usize,
-            retention_repos,
-            retention_paths,
         })
     }
 
-    /// 对所有仓库执行「非 dry_run」的保留策略。
-    ///
-    /// 系统身份：没有成员可言，只跳过成员与角色这两道门；仓库状态、配额、out-of-date
-    /// 全部照常校验。单个仓库失败不影响其它仓库——定时任务最忌讳「一个坏仓库卡住全库」。
-    fn apply_retention_all(&self) -> Result<(usize, usize)> {
-        let repo_ids: Vec<String> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT repo_id FROM repos WHERE status = 'active'")
-                .map_err(db("查询仓库失败"))?;
-            let rows = stmt
-                .query_map([], |r| r.get::<_, String>(0))
-                .map_err(db("查询仓库失败"))?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(db("读取仓库失败"))?
-        };
-
-        let system = Session::system();
-        let mut repos = 0usize;
-        let mut paths = 0usize;
-        for repo_id in repo_ids {
-            match self.apply_retention_auto(&system, &repo_id) {
-                Ok(outcome) => {
-                    if outcome.new_rev > 0 {
-                        repos += 1;
-                        paths += outcome.candidates.len();
-                    }
-                }
-                Err(err) => {
-                    // 一个仓库失败不该中断整轮维护，逐条记下来即可。
-                    eprintln!(
-                        "保留策略在仓库 {repo_id} 上失败：{:?}: {}",
-                        err.code, err.message
-                    );
-                }
-            }
-        }
-        Ok((repos, paths))
-    }
-
-    /// 自动执行：只考虑「启用且非 dry_run」的策略，不会因为别的策略是 dry_run 而拒绝执行。
-    fn apply_retention_auto(
-        &self,
-        system: &Session,
-        repo_id: &str,
-    ) -> Result<RetentionApplyOutcome> {
-        let policies: Vec<RetentionPolicyInfo> = self
-            .load_retention_policies(repo_id)?
-            .into_iter()
-            .filter(|policy| policy.enabled && !policy.dry_run)
-            .collect();
-        if policies.is_empty() {
-            return Ok(RetentionApplyOutcome {
-                candidates: Vec::new(),
-                reclaimable_bytes: 0,
-                new_rev: 0,
-            });
-        }
-        let repo = self.require_repo(system, repo_id)?;
-        let candidates = self.retention_candidates(&repo.repo_id, repo.head_rev, &policies)?;
-        if candidates.is_empty() {
-            return Ok(RetentionApplyOutcome {
-                candidates,
-                reclaimable_bytes: 0,
-                new_rev: 0,
-            });
-        }
-        let estimate = self.purge_estimate(&repo.repo_id, repo.head_rev, &candidates)?;
-        // 自动执行走回收站默认宽限期：无人值守的删除更需要「能反悔」。
-        let outcome = self.purge(
-            system,
-            &repo.repo_id,
-            &candidates,
-            false,
-            "保留策略自动清理",
-        )?;
-        Ok(RetentionApplyOutcome {
-            candidates,
-            reclaimable_bytes: estimate.reclaimable_bytes,
-            new_rev: outcome.rev,
-        })
-    }
-
-    /// 手动触发一次整库 GC（共享 CAS 下 GC 天然是全局的）。
     pub fn run_gc(&self, session: &Session, name_or_id: &str) -> Result<GcJobStatus> {
         session.require(SCOPE_WRITE, "执行空间回收")?;
         let repo = self.require_repo(session, name_or_id)?;
@@ -5799,9 +5068,6 @@ impl ServerStore {
                 params![job_id, now],
             )
             .map_err(db("更新 GC 任务失败"))?;
-
-        // 宽限期到点的清理在这里转正：GC 是唯一会推进 PENDING → ACTIVE 的地方。
-        self.promote_pending_purges()?;
 
         let mut purges: BTreeMap<String, Vec<String>> = BTreeMap::new();
         {
@@ -6392,6 +5658,7 @@ fn apply_schema_and_migrations(conn: &Connection, schema: &str) -> Result<()> {
             migrate_single_quota(conn)?;
             migrate_user_roles(conn)?;
             migrate_repo_recycle_bin(conn)?;
+            migrate_purge_immediate(conn)?;
             conn.execute_batch(schema).map_err(|e| schema_error(&e))?;
         }
         Err(err) => return Err(schema_error(&err)),
@@ -6400,6 +5667,7 @@ fn apply_schema_and_migrations(conn: &Connection, schema: &str) -> Result<()> {
     migrate_single_quota(conn)?;
     migrate_user_roles(conn)?;
     migrate_repo_recycle_bin(conn)?;
+    migrate_purge_immediate(conn)?;
     Ok(())
 }
 
@@ -6484,7 +5752,6 @@ fn migrate_repo_recycle_bin(conn: &Connection) -> Result<()> {
            owner_user_id         TEXT NOT NULL,
            created_from_request  TEXT,
            quota_bytes           BIGINT NOT NULL DEFAULT 0,
-           grace_days            INTEGER NOT NULL DEFAULT 7,
            deleted_at            BIGINT,
            deleted_by            TEXT,
            delete_reason         TEXT,
@@ -6495,9 +5762,9 @@ fn migrate_repo_recycle_bin(conn: &Connection) -> Result<()> {
          );
          INSERT INTO repos_upgrade
            (repo_id, name, head_rev, status, owner_user_id, created_from_request,
-            quota_bytes, grace_days, created_at, updated_at)
+            quota_bytes, created_at, updated_at)
          SELECT repo_id, name, head_rev, status, owner_user_id, created_from_request,
-                quota_bytes, grace_days, created_at, updated_at
+                quota_bytes, created_at, updated_at
          FROM repos;
          DROP TABLE repos;
          ALTER TABLE repos_upgrade RENAME TO repos;
@@ -6510,6 +5777,28 @@ fn migrate_repo_recycle_bin(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(|e| Error::new(ErrorCode::IoError, format!("恢复外键失败：{e}")))?;
     outcome.map_err(|e| Error::new(ErrorCode::IoError, format!("升级仓库回收站字段失败：{e}")))?;
+    Ok(())
+}
+
+/// 老库升级：路径级清理只剩「彻底删除」这一种语义（2026-11-24）。
+///
+/// 宽限期与撤销都下线了，所以：
+///   - `pending`（还在宽限期里）直接转成 `active`。转正逻辑已经删掉，不转的话这些
+///     路径会被 GC 永远跳过，空间再也收不回来；
+///   - `reverted`（已撤销）保持原样——它表示内容已经恢复，GC 本来就该尊重这个标记；
+///   - `retention_policies` 随自动清理一起删表，留着只会变成死表。
+fn migrate_purge_immediate(conn: &Connection) -> Result<()> {
+    if table_exists(conn, "purged_paths")? {
+        conn.execute(
+            "UPDATE purged_paths
+                SET state = 'active', activated_at = COALESCE(activated_at, created_at)
+              WHERE state = 'pending'",
+            [],
+        )
+        .map_err(|e| Error::new(ErrorCode::IoError, format!("收口历史清理标记失败：{e}")))?;
+    }
+    conn.execute_batch("DROP TABLE IF EXISTS retention_policies;")
+        .map_err(|e| Error::new(ErrorCode::IoError, format!("删除保留策略表失败：{e}")))?;
     Ok(())
 }
 
@@ -6656,8 +5945,8 @@ fn normalize_prefixes(paths: &[String]) -> Result<Vec<String>> {
 
 /// `path` 是否落在任一前缀之下（含与某一前缀完全相等）。
 ///
-/// 只做字面前缀匹配，不做通配：M2 的清理入口是用户在目录树上点选，
-/// 通配 / 正则留给 `retention_policies`（设计 9.7）。这里刻意不分配字符串，
+/// 只做字面前缀匹配，不做通配：清理入口是用户在目录树上点选，
+/// 选中什么就删什么，没有「按模式批量匹配」这条路。这里刻意不分配字符串，
 /// 因为它在可达性判定里会被调用到「对象数 × 引用数」量级。
 fn path_under_any(path: &str, prefixes: &[String]) -> bool {
     prefixes.iter().any(|p| {
@@ -7079,5 +6368,64 @@ mod schema_upgrade_tests {
             })
             .unwrap();
         assert_eq!(name, "legacy", "迁移不能丢数据");
+    }
+
+    /// 宽限期与保留策略下线后，老库里的状态必须被收口：
+    /// `pending` 没有转正入口了（再留着会被 GC 永远跳过），`reverted` 要尊重（内容已恢复）。
+    #[test]
+    fn legacy_purge_states_are_collapsed_and_policy_table_dropped() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_REPOS).unwrap();
+        conn.execute(
+            "INSERT INTO repos (repo_id, name, owner_user_id, created_at, updated_at)
+             VALUES ('r1', 'legacy', 'u1', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE purged_paths (
+               purge_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, path_pattern TEXT NOT NULL,
+               state TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (state IN ('pending','active','reverted')),
+               reason TEXT, purged_by TEXT NOT NULL, created_at BIGINT NOT NULL,
+               grace_until BIGINT, activated_at BIGINT);
+             CREATE TABLE retention_policies (
+               policy_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, path_pattern TEXT NOT NULL,
+               keep_months INTEGER, max_bytes BIGINT, max_age_days INTEGER,
+               enabled INTEGER NOT NULL DEFAULT 1, dry_run INTEGER NOT NULL DEFAULT 1,
+               created_at BIGINT NOT NULL);
+             INSERT INTO purged_paths VALUES
+               ('pg_pending', 'r1', '202609', 'pending', NULL, 'u1', 100, 9999999999, NULL),
+               ('pg_active',  'r1', '202608', 'active',  NULL, 'u1', 0, NULL, 1),
+               ('pg_reverted','r1', '202607', 'reverted',NULL, 'u1', 0, NULL, 2);
+             INSERT INTO retention_policies VALUES ('rt1', 'r1', '^20\\d{4}$', 2, 0, 0, 1, 0, 0);",
+        )
+        .unwrap();
+
+        apply_schema_and_migrations(&conn, SERVER_SCHEMA).unwrap();
+
+        let state = |id: &str| -> String {
+            conn.query_row(
+                "SELECT state FROM purged_paths WHERE purge_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(state("pg_pending"), "active", "宽限期不复存在，必须收口");
+        assert_eq!(state("pg_active"), "active");
+        assert_eq!(state("pg_reverted"), "reverted", "已撤销的记录要原样保留");
+        let activated: i64 = conn
+            .query_row(
+                "SELECT activated_at FROM purged_paths WHERE purge_id = 'pg_pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(activated > 0, "收口时补上生效时间");
+        assert!(
+            !table_exists(&conn, "retention_policies").unwrap(),
+            "保留策略表应随功能一起删掉"
+        );
     }
 }

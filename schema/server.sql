@@ -18,7 +18,6 @@ CREATE TABLE IF NOT EXISTS repos (
   owner_user_id         TEXT NOT NULL,  -- 审批通过的申请人，或直通创建的管理员
   created_from_request  TEXT,           -- 关联的 repo_creation_requests.request_id
   quota_bytes           BIGINT NOT NULL DEFAULT 0,  -- 配额上限（唯一一条线）；0 表示继承全局默认配额
-  grace_days            INTEGER NOT NULL DEFAULT 7, -- 回收站宽限期（路径级清理）
   -- 仓库注销（回收站）：status='deleted' 时下面四列才有值。
   -- purge_after 在注销那一刻按当时的全局保留天数固化，之后改全局设置不影响已注销的仓库。
   deleted_at            BIGINT,
@@ -186,18 +185,17 @@ CREATE VIEW IF NOT EXISTS v_cas_usage AS
 
 -- ---------------- 容量治理 ----------------
 
--- 路径级裁剪标记：GC 可达性遍历时跳过 ACTIVE 的路径，
--- 不砍版本号、不影响其它目录的历史版本。
+-- 路径级裁剪标记：GC 可达性遍历时跳过这些路径，不砍版本号、不影响其它目录的历史版本。
+-- 2026-11-24 起只有「彻底删除」一种来源：写入即 active，没有宽限期与撤销。
 CREATE TABLE IF NOT EXISTS purged_paths (
   purge_id      TEXT PRIMARY KEY,
   repo_id       TEXT NOT NULL,
   path_pattern  TEXT NOT NULL,
-  state         TEXT NOT NULL DEFAULT 'pending'
+  state         TEXT NOT NULL DEFAULT 'active'
                 CHECK (state IN ('pending', 'active', 'reverted')),
   reason        TEXT,
   purged_by     TEXT NOT NULL,
   created_at    BIGINT NOT NULL,
-  grace_until   BIGINT,             -- NULL 表示立即生效（immediate=true）
   activated_at  BIGINT,
   FOREIGN KEY (repo_id) REFERENCES repos (repo_id)
 );
@@ -234,17 +232,8 @@ CREATE TABLE IF NOT EXISTS quota_usage (
   PRIMARY KEY (repo_id, path)
 );
 
-CREATE TABLE IF NOT EXISTS retention_policies (
-  policy_id     TEXT PRIMARY KEY,
-  repo_id       TEXT NOT NULL,
-  path_pattern  TEXT NOT NULL,      -- 例如 ^20\d{4}$
-  keep_months   INTEGER,
-  max_bytes     BIGINT,
-  max_age_days  INTEGER,
-  enabled       INTEGER NOT NULL DEFAULT 1,
-  dry_run       INTEGER NOT NULL DEFAULT 1,
-  created_at    BIGINT NOT NULL
-);
+-- 保留策略表已随「自动清理」下线（2026-11-24）；老库由迁移删除，
+-- 现在只剩用户在桌面端主动发起的彻底删除（purged_paths + GC）。
 
 -- ---------------- 提交、权限、审计 ----------------
 

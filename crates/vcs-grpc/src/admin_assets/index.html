@@ -240,32 +240,15 @@
               <div id="candidate-list" class="list compact"></div>
               <div class="row">
                 <button id="estimate-purge" class="ghost">预估可释放</button>
-                <button id="purge-selected" class="primary">清理所选</button>
-                <label class="check"><input id="purge-immediate" type="checkbox" /> 立即 GC</label>
+                <button id="purge-selected" class="primary">彻底删除所选</button>
                 <button id="run-gc" class="ghost">手动 GC</button>
               </div>
               <pre id="space-result" class="result"></pre>
             </div>
             <div class="card">
-              <h3>回收站</h3>
+              <h3>已彻底删除</h3>
+              <p class="hint">只作审计：内容字节已被回收，没有恢复入口。</p>
               <div id="purged-list" class="list compact"></div>
-            </div>
-            <div class="card">
-              <h3>保留策略</h3>
-              <div id="policy-list" class="list compact"></div>
-              <form id="policy-form" class="form-grid">
-                <label>路径前缀<input name="path_pattern" placeholder="202609/" required /></label>
-                <label>保留月数<input name="keep_months" type="number" min="0" value="0" /></label>
-                <label>最大字节<input name="max_bytes" type="number" min="0" value="0" /></label>
-                <label>最大天数<input name="max_age_days" type="number" min="0" value="0" /></label>
-                <label>启用<select name="enabled"><option value="1">启用</option><option value="0">停用</option></select></label>
-                <label>试运行<select name="dry_run"><option value="1">试运行</option><option value="0">可执行</option></select></label>
-                <button class="primary" type="submit">保存策略</button>
-              </form>
-              <div class="row">
-                <button id="preview-retention" class="ghost">预览执行</button>
-                <button id="apply-retention" class="primary">执行策略</button>
-              </div>
             </div>
           </section>
         </main>

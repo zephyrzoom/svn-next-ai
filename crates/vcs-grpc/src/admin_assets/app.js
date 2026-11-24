@@ -828,8 +828,8 @@ async function loadSpace() {
   }
   selectedRepo = select.value;
   const id = encodeURIComponent(selectedRepo);
-  const [candidates, purged, policies] = await Promise.all([
-    get(`/repos/${id}/candidates`), get(`/repos/${id}/purged`), get(`/repos/${id}/policies`),
+  const [candidates, purged] = await Promise.all([
+    get(`/repos/${id}/candidates`), get(`/repos/${id}/purged`),
   ]);
   $('candidate-list').innerHTML = candidates.items.length ? candidates.items.map((c) => `
     <div class="list-item">
@@ -840,18 +840,8 @@ async function loadSpace() {
     <div class="list-item" data-id="${esc(p.purge_id)}">
       <div><span class="title">${esc(p.path)}</span> <span class="badge ${p.state === 'pending' ? 'warn' : ''}">${esc(p.state)}</span>
         <div class="meta">${esc(p.reason || '—')} · ${esc(fmtTime(p.created_at))}</div></div>
-      <div class="actions"><button class="mini" data-action="revert">撤销</button></div>
+      <div class="actions"></div>
     </div>`).join('') : empty('回收站为空');
-  $('policy-list').innerHTML = policies.items.length ? policies.items.map((p) => `
-    <div class="list-item" data-id="${esc(p.policy_id)}">
-      <div><span class="title">${esc(p.path_pattern)}</span>
-        <span class="badge ${p.dry_run ? 'warn' : 'ok'}">${p.dry_run ? '试运行' : '可执行'}</span>
-        <div class="meta">保留 ${esc(p.keep_months)} 月 / ${esc(humanBytes(p.max_bytes))} / ${esc(p.max_age_days)} 天 · ${p.enabled ? '启用' : '停用'}</div></div>
-      <div class="actions">
-        <button class="mini" data-action="edit-policy">编辑</button>
-        <button class="mini danger" data-action="delete-policy">删除</button>
-      </div>
-    </div>`).join('') : empty('没有保留策略');
   $('space-result').textContent = '';
 }
 
@@ -873,9 +863,9 @@ $('purge-selected').addEventListener('click', () => {
   void act(async () => {
     const paths = selectedPaths();
     if (!paths.length) throw new Error('请先勾选要清理的目录');
-    if (!window.confirm(`确认清理 ${paths.length} 个目录？这会生成删除提交。`)) return;
+    if (!window.confirm(`确认彻底删除 ${paths.length} 个路径？内容字节会被立即回收，无法撤销。`)) return;
     const data = await post(`/repos/${encodeURIComponent(selectedRepo)}/purge`, {
-      paths, immediate: $('purge-immediate').checked, reason: '管理端清理',
+      paths, reason: '管理端彻底删除',
     });
     $('space-result').textContent = `已生成 r${data.rev}，预计释放 ${humanBytes(data.estimate.reclaimable_bytes)}，GC 任务 ${data.gc_job_id}`;
     await loadSpace();
@@ -889,74 +879,6 @@ $('run-gc').addEventListener('click', () => {
     await loadSpace();
   });
 });
-
-$('purged-list').addEventListener('click', (event) => {
-  const button = event.target.closest('[data-action="revert"]');
-  if (!button) return;
-  const id = button.closest('.list-item').dataset.id;
-  void act(async () => {
-    const data = await post(`/repos/${encodeURIComponent(selectedRepo)}/purged/${encodeURIComponent(id)}/revert`, {});
-    toast(`已撤销，生成 r${data.rev}`);
-    await loadSpace();
-  });
-});
-
-$('policy-list').addEventListener('click', (event) => {
-  const button = event.target.closest('[data-action]');
-  if (!button) return;
-  const id = button.closest('.list-item').dataset.id;
-  void act(async () => {
-    if (button.dataset.action === 'delete-policy') {
-      await del(`/repos/${encodeURIComponent(selectedRepo)}/policies/${encodeURIComponent(id)}`);
-      toast('策略已删除');
-      await loadSpace();
-    } else {
-      const policies = await get(`/repos/${encodeURIComponent(selectedRepo)}/policies`);
-      const policy = policies.items.find((p) => p.policy_id === id);
-      if (!policy) return;
-      const form = $('policy-form');
-      form.path_pattern.value = policy.path_pattern;
-      form.keep_months.value = policy.keep_months;
-      form.max_bytes.value = policy.max_bytes;
-      form.max_age_days.value = policy.max_age_days;
-      form.enabled.value = policy.enabled ? '1' : '0';
-      form.dry_run.value = policy.dry_run ? '1' : '0';
-      form.dataset.policy = policy.policy_id;
-      toast('已载入表单，修改后点「保存策略」');
-    }
-  });
-});
-
-$('policy-form').addEventListener('submit', (event) => {
-  event.preventDefault();
-  const form = event.target;
-  void act(async () => {
-    await post(`/repos/${encodeURIComponent(selectedRepo)}/policies`, {
-      policy_id: form.dataset.policy || '',
-      path_pattern: form.path_pattern.value.trim(),
-      keep_months: Number(form.keep_months.value) || 0,
-      max_bytes: Number(form.max_bytes.value) || 0,
-      max_age_days: Number(form.max_age_days.value) || 0,
-      enabled: form.enabled.value === '1',
-      dry_run: form.dry_run.value === '1',
-    });
-    delete form.dataset.policy;
-    form.reset();
-    toast('策略已保存');
-    await loadSpace();
-  });
-});
-
-async function retention(dryRun) {
-  const data = await post(`/repos/${encodeURIComponent(selectedRepo)}/retention`, {
-    dry_run: dryRun, immediate: true,
-  });
-  $('space-result').textContent = `${dryRun ? '预览' : '执行'}：候选 ${data.candidates.length} 个，可释放 ${humanBytes(data.reclaimable_bytes)}，新版本 ${data.new_rev || '无'}`;
-  if (!dryRun) await loadSpace();
-}
-
-$('preview-retention').addEventListener('click', () => void act(() => retention(true)));
-$('apply-retention').addEventListener('click', () => void act(() => retention(false)));
 
 /* ---------------- 启动 ---------------- */
 

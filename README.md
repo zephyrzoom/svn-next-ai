@@ -204,7 +204,7 @@ vcs ldap-show     # 回显配置，不显示密码
 | 仓库 | 全库仓库列表、直通新建、启停 / 归档、成员增删与角色、单仓库配额覆盖、状态管理、注销与回收站（保留期内恢复 / 立即彻底删除、调整保留天数） |
 | 配额 | 全局默认配额（新仓库继承值） |
 | 目录设置 | LDAP / AD 配置保存与连通性测试（bind 密码不回传） |
-| 空间治理 | 清理候选 / 预估 / 清理 / 立即 GC、回收站撤销、保留策略与试运行 |
+| 空间治理 | 清理候选 / 预估 / 彻底删除（用户勾选目录或文件）/ GC |
 
 管理端与 gRPC 共用同一个 `Arc<Mutex<ServerStore>>`，不复制数据、不额外进程。仓库级操作以服务端内部的 `Session::system()` 执行（管理员已先通过鉴权，审计记录仍是本人 user_id），因此管理员不必是每个仓库的成员也能治理；桌面端 / gRPC 客户端依旧受成员门约束。
 
@@ -267,7 +267,7 @@ vcs repo-expand-approve <request_id> --note "同意"
 | 只读容量 | 「仓库」视图显示当前仓库的已用 / 上限（只读，桌面端不能改配额）；不够用时点「申请扩容 +10 GiB」 |
 | 成员 / 配额 | Web 管理端「仓库」页：增删成员与调整角色（owner 受保护）、单仓库配额覆盖与恢复继承；「配额」页设全局默认 |
 | 注销仓库 | 「设置」页最下面的「危险操作」卡片（仅 owner 可见，不占页头）：二次确认后仓库进入服务端回收站，保留期内管理员可在管理端恢复，到期彻底删除并释放空间；本地工作副本不动 |
-| 空间治理 | Web 管理端「空间治理」页：预估可释放 → 清理所选 → 回收站撤销（内容已被 GC 回收则明确失败）；保留策略先预览、再切为可执行 |
+| 空间治理 | Web 管理端「空间治理」页：预估可释放 → 彻底删除所选（立即回收，不可撤销）→ 已删除记录审计 |
 
 ---
 
@@ -304,7 +304,7 @@ vcs info reports                                # 用量与生效配额
 | 仓库 | `repo-create`、`repo-request*`、`repo-approve` / `repo-reject`、`repo-expand` / `repo-expand-list`、`repo-expand-approve` / `repo-expand-reject`、`repo-list`、`repo-quota`、`repo-status`、`repo-delete` / `repo-restore` / `repo-purge` / `repo-deleted` / `repo-delete-policy` |
 | 成员 | `member-add` / `member-list` / `member-remove` / `member-set-role` |
 | 读写 | `import`、`checkout`（`-r` 指定历史版本）、`status`、`diff`、`commit`、`update`、`revert`、`log`、`cat` |
-| 容量治理 | `info`、`candidates`、`estimate`、`purge`（`--immediate`）、`gc` / `gc-status`、`purged` / `unpurge`、`retention-*`、`maintenance` |
+| 容量治理 | `info`、`candidates`、`estimate`、`purge`（彻底删除）、`gc` / `gc-status`、`purged`、`maintenance` |
 | 令牌 | `pat-create` / `pat-list` / `pat-revoke`；CI 用 `vcs login --pat <token>` |
 
 完整命令与对应 RPC 见 [`docs/design.md` §11.3](docs/design.md)，或 `vcs --help` / `vcs <子命令> --help`。
