@@ -226,6 +226,8 @@ enum Cmd {
     /// 查看彻底删除记录（审计用，内容已回收）
     /// 查看彻底删除记录（审计用，内容已回收）
     Purged { repo: String },
+    /// 列出历史里删掉、但仍占着空间的路径（HEAD 里已经看不到）
+    Deleted { repo: String },
     /// 列出可清理目录候选（按独占大小排序）
     Candidates {
         repo: String,
@@ -1023,6 +1025,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 status.swept_objects,
                 human_bytes_exact(status.reclaimed_bytes)
             );
+            if status.reclaimed_bytes == 0 && !outcome.estimate.kept_by.is_empty() {
+                println!("物理字节没有回收：这些内容仍被以下位置引用——");
+                for kept in &outcome.estimate.kept_by {
+                    println!("    {kept}");
+                }
+                println!(
+                    "去对应仓库清掉它们：vcs purge <仓库> <路径>，或先 vcs deleted <仓库> 看看还有哪些历史路径。"
+                );
+            }
         }
 
         Cmd::Gc { repo } => {
@@ -1090,6 +1101,24 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+        }
+
+        Cmd::Deleted { repo } => {
+            let store = ServerStore::open(&store_root)?;
+            let session = require_session(&store, &store_root)?;
+            let paths = store.list_deleted_paths(&session, &repo)?;
+            if paths.is_empty() {
+                println!("没有只存在于历史的路径：所有删掉的内容都已经彻底清理");
+                return Ok(());
+            }
+            println!("以下路径在 HEAD 里已经不存在，但历史版本仍引用着它们的内容：");
+            for path in &paths {
+                println!("    {path}");
+            }
+            println!(
+                "\n彻底删除它们（不会产生新提交，直接回收历史内容）：vcs purge {repo} {}",
+                paths.join(" ")
+            );
         }
 
         Cmd::Candidates { repo, limit } => {

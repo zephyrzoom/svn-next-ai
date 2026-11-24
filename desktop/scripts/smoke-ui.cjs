@@ -142,6 +142,9 @@ function verify({ app, BrowserWindow, ipcMain }) {
         cleanupCalls.purges.push(args);
         return { ok: true, data: { newRev: 9, gcJobId: 'gc_x' } };
       }
+      if (channel === 'vcs:deletedPaths') {
+        return { ok: true, data: ['old/big.bin'] };
+      }
       if (channel === 'vcs:setSparseRules') {
         return {
           ok: true,
@@ -855,12 +858,24 @@ function verify({ app, BrowserWindow, ipcMain }) {
           const resultText = document.getElementById('cleanup-result').textContent;
           const summaryAfter = document.getElementById('cleanup-summary').textContent.trim();
 
+          // 「含历史中已删除」：把 HEAD 里看不到、但仍占着盘的历史路径也列出来，
+          // 并用删除线标出来，用户才知道自己清的是什么。
+          const historyBox = document.getElementById('cleanup-history');
+          historyBox.checked = true;
+          historyBox.dispatchEvent(new Event('change'));
+          await new Promise((r) => setTimeout(r, 40));
+          const historyMarked = [...document.querySelectorAll('#cleanup-tree .sparse-name.history')]
+            .map((node) => node.textContent);
+          historyBox.checked = false;
+          historyBox.dispatchEvent(new Event('change'));
+          await new Promise((r) => setTimeout(r, 40));
+
           state.repos = saved.repos;
           state.selectedRepoId = saved.selected;
           state.user = saved.user;
           setTab(saved.tab || 'wc');
           shell.classList.add('hidden');
-          return { roots, summary, resultText, summaryAfter };
+          return { roots, summary, resultText, summaryAfter, historyMarked };
         })()`);
       } catch (err) {
         problems.push(`清理空间求值失败：${err && err.message}`);
@@ -1155,7 +1170,8 @@ function verify({ app, BrowserWindow, ipcMain }) {
           String(cleanup.purges[0][2] || '').includes('彻底删除') &&
           String(cleanup.resultText || '').includes('已彻底删除 2 项') &&
           String(cleanup.resultText || '').includes('释放') &&
-          cleanup.summaryAfter === '',
+          cleanup.summaryAfter === '' &&
+          cleanup.historyMarked?.join(',') === 'big.bin',
         检出时把勾选的稀疏规则传给主进程:
           checkoutCalls.some(
             (args) =>

@@ -496,6 +496,11 @@ ipcMain.handle('vcs:getQuota', (_event, repoId: string) =>
 
 // ---------------- 主动清理（彻底删除） ----------------
 
+/** 历史里删掉、HEAD 里已经看不到的路径（用于「从历史里彻底删除」）。 */
+ipcMain.handle('vcs:deletedPaths', (_event, repoId: string) =>
+  wrap(async () => requireClient().listDeletedPaths(repoId)),
+);
+
 /** 彻底删除：删除提交 + 裁剪标记 + 立即 GC。没有宽限期，也没有撤销。 */
 ipcMain.handle('vcs:purge', (_event, repoId: string, paths: string[], reason = '') =>
   wrap(async () => requireClient().purge(repoId, paths, reason)),

@@ -1212,6 +1212,13 @@ button.ghost:disabled:hover {
   color: var(--muted);
 }
 
+/* 只存在于历史的路径：HEAD 里已经没有了，删它等于清历史 */
+.sparse-name.history {
+  color: var(--delete);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
 .sparse-children {
   margin-left: 18px;
   border-left: 1px solid var(--line);

@@ -438,6 +438,7 @@ fn estimate_json(e: &PurgeEstimate) -> Value {
         "paths": e.paths, "logical_bytes": e.logical_bytes,
         "reclaimable_bytes": e.reclaimable_bytes, "shared_bytes": e.shared_bytes,
         "affected_revisions": e.affected_revisions, "shared_paths": e.shared_paths,
+        "kept_by": e.kept_by,
     })
 }
 

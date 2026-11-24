@@ -18,6 +18,7 @@
 
 const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const os = require('node:os');
 const path = require('node:path');
 
@@ -428,6 +429,41 @@ async function main() {
       fail(`彻底删除后用量没有下降：${quotaBefore.usedBytes} → ${quotaAfter.usedBytes}`);
     }
     console.log(`  HEAD 已不含 202610；对象池占用 ${quotaBefore.usedBytes} → ${quotaAfter.usedBytes}`);
+
+    step('普通删除不擦除；从历史里彻底删除才回收');
+    {
+      const histSrc = path.join(WORK, 'hist-src');
+      fs.mkdirSync(histSrc, { recursive: true });
+      const histFile = path.join(histSrc, 'big.bin');
+      fs.writeFileSync(histFile, crypto.randomBytes(3 * 1024 * 1024));
+
+      const beforeAdd = await client.getQuota(repo.repoId);
+      cliCommit('写入大文件', repo.name, histSrc);
+      const afterAdd = await client.getQuota(repo.repoId);
+      if (afterAdd.usedBytes <= beforeAdd.usedBytes) {
+        fail(`提交 3 MiB 后用量没涨：${beforeAdd.usedBytes} → ${afterAdd.usedBytes}`);
+      }
+
+      fs.unlinkSync(histFile);
+      cliCommit('普通删除大文件', repo.name, histSrc);
+      const afterDelete = await client.getQuota(repo.repoId);
+      if (afterDelete.usedBytes < afterAdd.usedBytes) {
+        fail('普通删除不该立刻释放：历史版本还引用着内容');
+      }
+      const deletedPaths = await client.listDeletedPaths(repo.repoId);
+      if (!deletedPaths.includes('big.bin')) {
+        fail(`历史删除路径里没有 big.bin：${JSON.stringify(deletedPaths)}`);
+      }
+
+      await client.purge(repo.repoId, ['big.bin'], '从历史里清掉');
+      const afterHistory = await client.getQuota(repo.repoId);
+      if (afterHistory.usedBytes >= afterDelete.usedBytes) {
+        fail(`清理历史后容量没降：${afterDelete.usedBytes} → ${afterHistory.usedBytes}`);
+      }
+      console.log(
+        `  普通删除保持 ${afterDelete.usedBytes} 字节；从历史彻底删除后降到 ${afterHistory.usedBytes} 字节`,
+      );
+    }
 
     step('配额设置：全局默认 → 单仓库覆盖 → 恢复继承');
     // 包一层块作用域：main() 是个大函数，前面的段落已经用过 quotaBefore 之类的名字。

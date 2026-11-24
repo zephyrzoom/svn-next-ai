@@ -204,7 +204,7 @@ vcs ldap-show     # 回显配置，不显示密码
 | 仓库 | 全库仓库列表、直通新建、启停 / 归档、成员增删与角色、单仓库配额覆盖、状态管理、注销与回收站（保留期内恢复 / 立即彻底删除、调整保留天数） |
 | 配额 | 全局默认配额（新仓库继承值） |
 | 目录设置 | LDAP / AD 配置保存与连通性测试（bind 密码不回传） |
-| 空间治理 | 清理候选 / 彻底删除（用户勾选目录或文件，删完显示实际释放量）/ GC |
+| 空间治理 | 清理候选 / 彻底删除（勾目录或文件，可选「含历史中已删除」，删完显示实际释放量）/ GC |
 
 管理端与 gRPC 共用同一个 `Arc<Mutex<ServerStore>>`，不复制数据、不额外进程。仓库级操作以服务端内部的 `Session::system()` 执行（管理员已先通过鉴权，审计记录仍是本人 user_id），因此管理员不必是每个仓库的成员也能治理；桌面端 / gRPC 客户端依旧受成员门约束。
 
@@ -304,7 +304,7 @@ vcs info reports                                # 用量与生效配额
 | 仓库 | `repo-create`、`repo-request*`、`repo-approve` / `repo-reject`、`repo-expand` / `repo-expand-list`、`repo-expand-approve` / `repo-expand-reject`、`repo-list`、`repo-quota`、`repo-status`、`repo-delete` / `repo-restore` / `repo-purge` / `repo-deleted` / `repo-delete-policy` |
 | 成员 | `member-add` / `member-list` / `member-remove` / `member-set-role` |
 | 读写 | `import`、`checkout`（`-r` 指定历史版本）、`status`、`diff`、`commit`、`update`、`revert`、`log`、`cat` |
-| 容量治理 | `info`、`candidates`、`estimate`、`purge`（彻底删除）、`gc` / `gc-status`、`purged`、`maintenance` |
+| 容量治理 | `info`、`candidates`、`estimate`、`purge`（彻底删除，可指向历史路径）、`gc` / `gc-status`、`purged`、`deleted`（历史里删掉但仍占盘的路径）、`maintenance` |
 | 令牌 | `pat-create` / `pat-list` / `pat-revoke`；CI 用 `vcs login --pat <token>` |
 
 完整命令与对应 RPC 见 [`docs/design.md` §11.3](docs/design.md)，或 `vcs --help` / `vcs <子命令> --help`。

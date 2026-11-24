@@ -124,7 +124,13 @@ const state = {
    */
   cleanup: {
     open: false,
+    /** 面板里展示的路径：HEAD 的树，勾了「含历史」再并上历史删除路径。 */
     paths: [],
+    /** 只在 HEAD 里存在的路径，用来判断一次删除是不是纯清理历史。 */
+    headPaths: [],
+    /** 历史里删掉、HEAD 里已经看不到的路径。 */
+    deleted: new Set(),
+    history: false,
     checked: new Set(),
     expanded: new Set(),
     repoId: null,
@@ -563,10 +569,14 @@ async function selectRepo(repoId) {
   // 清理选择也是按仓库的：换仓库必须清空，绝不把上一个仓库的勾选带过去。
   state.cleanup.open = false;
   state.cleanup.paths = [];
+  state.cleanup.headPaths = [];
+  state.cleanup.deleted = new Set();
+  state.cleanup.history = false;
   state.cleanup.checked = new Set();
   state.cleanup.expanded = new Set();
   state.cleanup.repoId = null;
   state.cleanup.busy = false;
+  el('cleanup-history').checked = false;
   el('cleanup-picker').classList.add('hidden');
   el('cleanup-open').textContent = '选择目录或文件';
   el('cleanup-result').textContent = '';
@@ -1603,9 +1613,10 @@ function cleanupNodeElement(node) {
   input.disabled = mark.inherited;
   input.addEventListener('change', () => cleanupTogglePath(node, input.checked));
   const name = document.createElement('span');
-  name.className = `sparse-name${node.file ? ' file' : ''}`;
+  const historyOnly = state.cleanup.deleted.has(node.path);
+  name.className = `sparse-name${node.file ? ' file' : ''}${historyOnly ? ' history' : ''}`;
   name.textContent = node.file ? node.name : `${node.name}/`;
-  name.title = node.path;
+  name.title = historyOnly ? `${node.path}（仅存在于历史版本）` : node.path;
   label.append(input, name);
   row.appendChild(label);
   wrap.appendChild(row);
@@ -1646,10 +1657,34 @@ async function loadCleanupTree(force = false) {
   state.cleanup.loading = true;
   state.cleanup.repoId = repo.repoId;
   renderCleanupTree();
-  const paths = unwrap(await api.tree(repo.repoId), '读取仓库目录');
-  state.cleanup.paths = Array.isArray(paths) ? paths : [];
+  const head = unwrap(await api.tree(repo.repoId), '读取仓库目录');
+  state.cleanup.headPaths = Array.isArray(head) ? head : [];
+  state.cleanup.deleted = new Set();
+  let shown = state.cleanup.headPaths;
+  if (state.cleanup.history) {
+    const deleted = unwrap(await api.deletedPaths(repo.repoId), '读取历史删除路径');
+    state.cleanup.deleted = new Set(Array.isArray(deleted) ? deleted : []);
+    shown = [...new Set([...state.cleanup.headPaths, ...state.cleanup.deleted])];
+    // 历史路径默认展开：它们本来就不在任何目录树里，不展开等于没显示。
+    for (const path of state.cleanup.deleted) {
+      const parts = String(path).split('/');
+      parts.pop();
+      let prefix = '';
+      for (const part of parts) {
+        prefix = prefix ? `${prefix}/${part}` : part;
+        state.cleanup.expanded.add(prefix);
+      }
+    }
+  }
+  state.cleanup.paths = shown;
   state.cleanup.loading = false;
+  // 面板里看不到的勾选必须一起丢掉：否则用户关掉「含历史」后，
+  // 上一次勾中的历史路径还会被悄悄提交上去。
+  const visible = (path) =>
+    state.cleanup.paths.some((item) => item === path || item.startsWith(`${path}/`));
+  state.cleanup.checked = new Set([...state.cleanup.checked].filter(visible));
   renderCleanupTree();
+  renderCleanupSummary();
 }
 
 function openCleanupPicker() {
@@ -1694,13 +1729,24 @@ async function purgeCleanup() {
     renderQuota(after);
     const freed = Math.max(0, before.usedBytes - after.usedBytes);
 
+    // 选中的路径全都不在 HEAD 里 = 这次只是把历史内容清掉，不会产生新版本。
+    const historyOnly = paths.every(
+      (path) =>
+        !state.cleanup.headPaths.some((item) => item === path || item.startsWith(`${path}/`)),
+    );
     state.cleanup.checked = new Set();
     state.cleanup.paths = [];
+    const keptBy = Array.isArray(outcome.keptBy) ? outcome.keptBy : [];
+    const keptNote = freed === 0
+      ? keptBy.length
+        ? `（物理字节没有回收：内容仍被 ${keptBy.slice(0, 3).join('、')}` +
+          `${keptBy.length > 3 ? ' 等' : ''} 引用，去那个仓库的「清理空间」勾上「含历史中已删除」再删一次。）`
+        : '（本仓库的账已经扣掉了，但物理副本要等最后一个引用消失才回收。）'
+      : '';
     el('cleanup-result').textContent =
-      `已彻底删除 ${paths.length} 项，生成 r${outcome.newRev}，释放 ${humanBytes(freed)}。` +
-      (freed === 0
-        ? '（这份内容还被其它路径或别的仓库引用：本仓库的账已经扣掉了，物理副本要等最后一个引用消失才回收。）'
-        : '');
+      `已彻底删除 ${paths.length} 项${historyOnly ? '历史内容' : ''}，` +
+      `${historyOnly ? '未产生新版本' : `生成 r${outcome.newRev}`}，释放 ${humanBytes(freed)}。` +
+      keptNote;
     banner(`已彻底删除，释放 ${humanBytes(freed)}`);
     await guard('读取仓库目录', () => loadCleanupTree(true));
   } finally {
@@ -2366,6 +2412,10 @@ el('cleanup-open').addEventListener('click', () => {
   else openCleanupPicker();
 });
 el('cleanup-close').addEventListener('click', closeCleanupPicker);
+el('cleanup-history').addEventListener('change', (event) => {
+  state.cleanup.history = event.target.checked;
+  void guard('读取仓库目录', () => loadCleanupTree(true));
+});
 el('cleanup-purge').addEventListener('click', () => void guard('彻底删除', purgeCleanup));
 el('delete-repo').addEventListener('click', () => void guard('注销仓库', deleteCurrentRepo));
 el('disconnect').addEventListener('click', () => void guard('退出登录', disconnect));

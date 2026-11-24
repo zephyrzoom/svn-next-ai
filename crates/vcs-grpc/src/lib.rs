@@ -1967,6 +1967,7 @@ impl RepoService for RepoApi {
                 purge_id: 0,
                 new_rev: outcome.rev,
                 gc_job_id: outcome.gc_job_id,
+                kept_by: outcome.estimate.kept_by.clone(),
             })),
             Err(err) => Ok(Response::new(pb::PurgeResponse {
                 status: Some(status_err(&err)),
@@ -2004,6 +2005,28 @@ impl RepoService for RepoApi {
             Err(err) => Ok(Response::new(pb::ListPurgedPathsResponse {
                 status: Some(status_err(&err)),
                 entries: Vec::new(),
+            })),
+        }
+    }
+
+    async fn list_deleted_paths(
+        &self,
+        request: Request<pb::ListDeletedPathsRequest>,
+    ) -> Result<Response<pb::ListDeletedPathsResponse>, Status> {
+        let session = self.api.session(&request)?;
+        let req = request.into_inner();
+        let result = {
+            let store = self.api.store();
+            store.list_deleted_paths(&session, &req.repo_id)
+        };
+        match result {
+            Ok(paths) => Ok(Response::new(pb::ListDeletedPathsResponse {
+                status: Some(status_ok()),
+                paths,
+            })),
+            Err(err) => Ok(Response::new(pb::ListDeletedPathsResponse {
+                status: Some(status_err(&err)),
+                paths: Vec::new(),
             })),
         }
     }

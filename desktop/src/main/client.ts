@@ -221,6 +221,8 @@ export interface CandidateRow {
 export interface PurgeResultRow {
   newRev: number;
   gcJobId: string;
+  /** 仍被这些「仓库:路径」引用，所以物理字节这次没有回收。 */
+  keptBy: string[];
 }
 
 export interface QuotaDefaultsRow {
@@ -690,7 +692,23 @@ export class VcsClient {
   async purge(repoId: string, paths: string[], reason: string): Promise<PurgeResultRow> {
     const resp = await this.invoke<any>(this.repo, 'purge', { repoId, paths, reason });
     assertOk(resp.status);
-    return { newRev: resp.newRev as number, gcJobId: resp.gcJobId as string };
+    return {
+      newRev: resp.newRev as number,
+      gcJobId: resp.gcJobId as string,
+      keptBy: (resp.keptBy ?? []) as string[],
+    };
+  }
+
+  /**
+   * 历史里删掉、但 HEAD 里已经没有的路径。
+   *
+   * 普通删除只是新增版本，内容还挂在旧版本上；这些路径在检出树里看不到，
+   * 必须单独列出来才能交给 `purge` 从历史里彻底删掉。
+   */
+  async listDeletedPaths(repoId: string): Promise<string[]> {
+    const resp = await this.invoke<any>(this.repo, 'listDeletedPaths', { repoId });
+    assertOk(resp.status);
+    return (resp.paths ?? []) as string[];
   }
 
   /** 全局默认配额（所有未单独设置覆盖的仓库继承它）。 */

@@ -174,6 +174,8 @@ export interface QuotaDto {
 export interface PurgeResultDto {
   newRev: number;
   gcJobId: string;
+  /** 仍引用这些内容的「仓库:路径」；非空说明物理字节这次没回收。 */
+  keptBy: string[];
 }
 
 /** 一个仓库在本机的使用权重：主进程已经按半衰期折算到「此刻」，界面直接比大小。 */
@@ -286,6 +288,8 @@ export interface VcsApi {
 
   // —— 主动清理（彻底删除，不可撤销） ——
   purge(repoId: string, paths: string[], reason?: string): Promise<Envelope<PurgeResultDto>>;
+  /** 历史里删掉、HEAD 里已经没有的路径。 */
+  deletedPaths(repoId: string): Promise<Envelope<string[]>>;
 
   // —— 预留占位通道（桌面端不调用，实现仍为 notWired） ——
   getHead(repoId: string): Promise<Envelope<unknown>>;
@@ -340,6 +344,7 @@ const api: VcsApi = {
 
   getQuota: (repoId) => ipcRenderer.invoke('vcs:getQuota', repoId),
   purge: (repoId, paths, reason) => ipcRenderer.invoke('vcs:purge', repoId, paths, reason),
+  deletedPaths: (repoId) => ipcRenderer.invoke('vcs:deletedPaths', repoId),
 
   getHead: (repoId) => ipcRenderer.invoke('vcs:getHead', repoId),
   getRegistration: (requestId) => ipcRenderer.invoke('vcs:getRegistration', requestId),

@@ -400,6 +400,9 @@ message PurgeResponse {
   uint64 purge_id = 2;
   uint64 new_rev = 3;
   string gc_job_id = 4;
+  // 这些内容仍被哪些路径引用（通常是别的仓库的历史版本）：共享 CAS 下
+  // 只要还有一个引用没被清理，物理字节就不会回收。空表示这次真的释放了。
+  repeated string kept_by = 5;
 }
 
 // 已执行的彻底删除记录，只作审计与「哪些路径被清理过」的查询用。
@@ -421,6 +424,18 @@ message ListPurgedPathsRequest {
 message ListPurgedPathsResponse {
   Status status = 1;
   repeated PurgedPathInfo entries = 2;
+}
+
+// 历史里出现过、但 HEAD 里已经没有的路径（普通删除留下的）。
+// 这些路径在检出树里看不到，却是「删了文件容量不降」的主要来源：
+// 把它们交给 Purge 就等于「从历史里彻底删除」，不需要再生成删除提交。
+message ListDeletedPathsRequest {
+  string repo_id = 1;
+}
+
+message ListDeletedPathsResponse {
+  Status status = 1;
+  repeated string paths = 2;
 }
 
 // 撤销清理（已下线）：彻底删除是终态，内容字节会被 GC 回收，没有恢复入口。
@@ -1172,6 +1187,7 @@ service RepoService {
   rpc Purge(PurgeRequest) returns (PurgeResponse);
   rpc GetGcStatus(GetGcStatusRequest) returns (GetGcStatusResponse);
   rpc ListPurgedPaths(ListPurgedPathsRequest) returns (ListPurgedPathsResponse);
+  rpc ListDeletedPaths(ListDeletedPathsRequest) returns (ListDeletedPathsResponse);
   // RevertPurge / ListRetentionPolicies / UpsertRetentionPolicy /
   // DeleteRetentionPolicy / ApplyRetention 已下线（2026-11-24）。
 }

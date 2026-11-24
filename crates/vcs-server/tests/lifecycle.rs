@@ -2200,7 +2200,7 @@ fn purge_releases_usage_even_when_content_is_shared() {
     let before_drop = store.usage(&drop_repo.repo_id).unwrap().used_bytes;
     assert!(before_drop >= blob_bytes);
 
-    store
+    let outcome = store
         .purge(
             &alice,
             &drop_repo.repo_id,
@@ -2208,6 +2208,16 @@ fn purge_releases_usage_even_when_content_is_shared() {
             "清理",
         )
         .unwrap();
+    // 物理回收不了的时候必须说清楚是谁还引用着，否则用户只能干瞪眼。
+    assert!(
+        outcome
+            .estimate
+            .kept_by
+            .iter()
+            .any(|item| item == "keep:shared.bin"),
+        "应点名仍引用它的仓库与路径：{:?}",
+        outcome.estimate.kept_by
+    );
 
     // 对象还在盘上（keep 仓库还引用着），但 drop 仓库的账上不该再有它。
     let keep_after = store.usage(&keep.repo_id).unwrap().used_bytes;
@@ -2220,4 +2230,72 @@ fn purge_releases_usage_even_when_content_is_shared() {
         before_drop.saturating_sub(drop_after) >= blob_bytes / 2,
         "drop 仓库删掉共享内容后用量必须回落：{before_drop} → {drop_after}"
     );
+}
+
+/// 普通删除不是擦除：内容仍被历史版本引用，GC 不回收、容量也还挂着。
+/// 这类路径在 HEAD 里已经看不到，必须能单独列出来并从历史里彻底删除。
+#[test]
+fn deleted_paths_are_listed_and_can_be_released_from_history() {
+    let sb = Sandbox::new("history-purge");
+    let store = sb.store();
+    let alice = admin(&store);
+    let repo = store.create_repo_direct(&alice, "archive", 0).unwrap();
+    let src = sb.dir("history-src");
+
+    let mut state = 0xDEAD_BEEF_1234_5678u64;
+    let data: Vec<u8> = (0..1024 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xFF) as u8
+        })
+        .collect();
+    let blob = vcs_core::hash_bytes(&data);
+
+    write_file(&src, "old/big.bin", &data);
+    write_file(&src, "keep.txt", b"keep\n");
+    store
+        .import_dir(&alice, &repo.repo_id, &src, "第一版")
+        .unwrap();
+    assert!(store.objects().exists(&blob));
+
+    // 普通删除：新版本里没有 old/，历史版本仍引用着。
+    fs::remove_dir_all(src.join("old")).unwrap();
+    store
+        .import_dir(&alice, &repo.repo_id, &src, "删掉大文件")
+        .unwrap();
+    store.run_gc(&alice, &repo.repo_id).unwrap();
+    assert!(
+        store.objects().exists(&blob),
+        "普通删除不该物理回收：旧版本还能检出它"
+    );
+    let before = store.usage(&repo.repo_id).unwrap().used_bytes;
+    assert!(before >= data.len() as u64, "历史内容仍计入容量：{before}");
+
+    let deleted = store.list_deleted_paths(&alice, &repo.repo_id).unwrap();
+    assert!(
+        deleted.iter().any(|p| p == "old"),
+        "整个 old/ 都不在 HEAD 里时应折叠成目录一条：{deleted:?}"
+    );
+
+    // 从历史里彻底删除：HEAD 没有这些路径，所以不产生删除提交。
+    let outcome = store
+        .purge(&alice, &repo.repo_id, &[String::from("old")], "清理历史")
+        .unwrap();
+    assert_eq!(outcome.deleted, 0, "HEAD 里没有它，不该有删除提交");
+    assert_eq!(outcome.rev, 2, "版本号保持不变");
+
+    assert!(!store.objects().exists(&blob), "历史引用消失了就该回收");
+    let after = store.usage(&repo.repo_id).unwrap().used_bytes;
+    assert!(
+        before.saturating_sub(after) >= data.len() as u64 / 2,
+        "清理历史后容量必须回落：{before} → {after}"
+    );
+
+    // HEAD 与历史里都不存在的路径：拒绝，避免写下永久跳过的黑洞前缀。
+    let err = store
+        .purge(&alice, &repo.repo_id, &[String::from("nope")], "误操作")
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::PathConflict);
 }

@@ -316,6 +316,8 @@ pub struct PurgeEstimate {
     pub affected_revisions: u64,
     /// 共享引用落到了哪些路径上，供客户端解释「为什么释放不了那么多」。
     pub shared_paths: Vec<String>,
+    /// 同上，但带上仓库名（`仓库:路径`），这样用户知道该去哪个仓库继续清。
+    pub kept_by: Vec<String>,
 }
 
 /// 一次清理的结果：既产生了删除提交，也排上了 GC。
@@ -2843,20 +2845,7 @@ impl ServerStore {
             }
         }
 
-        let roots: Vec<String> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT DISTINCT root_tree FROM revisions WHERE repo_id = ?1")
-                .map_err(db("读取版本失败"))?;
-            let rows = stmt
-                .query_map(params![repo_id], |r| r.get::<_, String>(0))
-                .map_err(db("读取版本失败"))?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.map_err(db("读取版本失败"))?);
-            }
-            out
-        };
+        let roots = self.distinct_root_trees(repo_id)?;
 
         // 已经彻底删除的路径不该再计入本仓库的账：共享 CAS 下对象可能还留在盘上
         // （别的仓库 / 本仓库别的路径还引用着），GC 不会删它，但用户已经把这份内容删了。
@@ -2885,6 +2874,59 @@ impl ServerStore {
             cache.insert(repo_id.to_string(), (head_rev, used_bytes, object_count));
         }
         Ok((used_bytes, object_count))
+    }
+
+    /// 该仓库历史上出现过的所有根树（去重）。用量统计与「历史里删了哪些路径」共用。
+    fn distinct_root_trees(&self, repo_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT root_tree FROM revisions WHERE repo_id = ?1")
+            .map_err(db("读取版本失败"))?;
+        let rows = stmt
+            .query_map(params![repo_id], |r| r.get::<_, String>(0))
+            .map_err(db("读取版本失败"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(db("读取版本失败"))?);
+        }
+        Ok(out)
+    }
+
+    /// 历史里出现过、但 HEAD 里已经没有的文件路径（已按顶层目录折叠）。
+    ///
+    /// 普通删除只是新增一个不含该路径的版本，内容还在旧版本里；这些路径在检出/
+    /// 清理面板里都看不到，却是「删了文件容量不降」最常见的来源。
+    pub fn list_deleted_paths(&self, session: &Session, name_or_id: &str) -> Result<Vec<String>> {
+        let repo = self.find_repo(name_or_id)?;
+        self.member_role(&repo.repo_id, &session.user_id)?;
+        let head = self.flatten_paths(&repo.repo_id, repo.head_rev)?;
+        let history = self.historical_paths(&repo.repo_id)?;
+        let deleted: BTreeSet<String> = history.difference(&head).cloned().collect();
+        Ok(collapse_deleted_paths(&deleted, &head))
+    }
+
+    /// 该仓库所有版本里出现过的文件路径（去重）。
+    fn historical_paths(&self, repo_id: &str) -> Result<BTreeSet<String>> {
+        let mut history: BTreeSet<String> = BTreeSet::new();
+        for root in self.distinct_root_trees(repo_id)? {
+            let hash = vcs_core::from_hex(&root)?;
+            match tree::flatten_tree(self.objects(), &hash) {
+                Ok(entries) => history.extend(entries.into_iter().map(|e| e.path)),
+                // 树对象被手工删掉 / 清理过：跳过这一支，不为了一棵树让整页报错。
+                Err(err) if err.code == ErrorCode::ObjectMissing => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(history)
+    }
+
+    /// 某个版本的文件路径集合。
+    fn flatten_paths(&self, repo_id: &str, rev: u64) -> Result<BTreeSet<String>> {
+        let root = self.revision_root_tree(repo_id, rev)?;
+        Ok(tree::flatten_tree(self.objects(), &root)?
+            .into_iter()
+            .map(|e| e.path)
+            .collect())
     }
 
     /// 本仓库里已经生效的清理前缀。老库可能留着 `pending` / `reverted` 的历史行：
@@ -4888,6 +4930,8 @@ impl ServerStore {
         let mut shared = 0u64;
         let mut shared_paths: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
+        let mut kept_by: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut names: BTreeMap<String, String> = BTreeMap::new();
 
         for (hash, refs) in &owners {
             let mine = refs
@@ -4906,6 +4950,26 @@ impl ServerStore {
                 if shared_paths.len() < 20 {
                     shared_paths.insert(p.clone());
                 }
+                if kept_by.len() < 20 {
+                    let name = match names.get(r) {
+                        Some(name) => name.clone(),
+                        None => {
+                            let name: String = self
+                                .conn
+                                .query_row(
+                                    "SELECT name FROM repos WHERE repo_id = ?1",
+                                    params![r],
+                                    |row| row.get(0),
+                                )
+                                .optional()
+                                .map_err(db("查询仓库名失败"))?
+                                .unwrap_or_else(|| r.clone());
+                            names.insert(r.clone(), name.clone());
+                            name
+                        }
+                    };
+                    kept_by.insert(format!("{name}:{p}"));
+                }
             }
             if outside {
                 shared += bytes;
@@ -4921,6 +4985,7 @@ impl ServerStore {
             shared_bytes: shared,
             affected_revisions: self.count_revisions_touching(repo_id, prefixes)?,
             shared_paths: shared_paths.into_iter().collect(),
+            kept_by: kept_by.into_iter().collect(),
         })
     }
 
@@ -4947,17 +5012,33 @@ impl ServerStore {
             .filter(|e| path_under_any(&e.path, &estimate.paths))
             .map(|e| PendingChange::file(e.path.clone(), ChangeKind::Delete, None, 0))
             .collect();
-        if deletes.is_empty() {
-            return Err(Error::new(
-                ErrorCode::PathConflict,
-                "HEAD 中不存在这些路径，无需清理",
-            ));
+        // HEAD 里已经没有这些路径：这是「清理历史」而不是「删除文件」，不该也不需要
+        // 再生成一个删除提交。但必须确认它们在历史里真的出现过，否则写下的标记会变成
+        // 一个永久跳过的黑洞前缀——以后同名的内容会被 GC 和容量统计一起忽略。
+        let head_unchanged = deletes.is_empty();
+        if head_unchanged {
+            let history = self.historical_paths(&repo.repo_id)?;
+            let all_known = estimate.paths.iter().all(|prefix| {
+                history
+                    .iter()
+                    .any(|path| path_under_any(path, std::slice::from_ref(prefix)))
+            });
+            if !all_known {
+                return Err(Error::new(
+                    ErrorCode::PathConflict,
+                    "这些路径在 HEAD 和历史版本里都不存在，无需清理",
+                ));
+            }
         }
 
-        let message = format!("彻底删除 {}", estimate.paths.join(", "));
-        let commit =
-            self.begin_commit(session, &repo.repo_id, repo.head_rev, &deletes, &message, 0)?;
-        let outcome = self.finalize_commit(session, &commit.session_id)?;
+        let rev = if head_unchanged {
+            repo.head_rev
+        } else {
+            let message = format!("彻底删除 {}", estimate.paths.join(", "));
+            let commit =
+                self.begin_commit(session, &repo.repo_id, repo.head_rev, &deletes, &message, 0)?;
+            self.finalize_commit(session, &commit.session_id)?.rev
+        };
 
         // 没有宽限期：删完就写 active，GC 当场回收。彻底删除是终态，没有撤销入口。
         let now = now_secs();
@@ -5003,14 +5084,14 @@ impl ServerStore {
             "purge.execute",
             &estimate.paths.join(","),
             Some(&format!(
-                "{{\"reclaimable\":{},\"shared\":{},\"rev\":{}}}",
-                estimate.reclaimable_bytes, estimate.shared_bytes, outcome.rev
+                "{{\"reclaimable\":{},\"shared\":{},\"rev\":{},\"history_only\":{}}}",
+                estimate.reclaimable_bytes, estimate.shared_bytes, rev, head_unchanged
             )),
         )?;
 
         Ok(PurgeOutcome {
             purge_id,
-            rev: outcome.rev,
+            rev,
             gc_job_id,
             deleted: deletes.len(),
             estimate,
@@ -5993,6 +6074,32 @@ fn load_or_create_secret(root: &Path) -> Result<Vec<u8>> {
 }
 
 /// 规范化清理前缀：走与提交一致的路径校验，空路径直接拒掉。
+/// 把「历史里删掉的路径」折叠成尽量少的前缀：
+/// 整个顶层目录都不在 HEAD 里时收成目录一条，否则保留精确文件路径。
+///
+/// 只折叠顶层是为了保守：再深的目录可能与 HEAD 里仍存在的同级文件混在一起，
+/// 折叠成前缀会把还在用的内容一起标记成「已删除」。
+fn collapse_deleted_paths(deleted: &BTreeSet<String>, head: &BTreeSet<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut emitted: BTreeSet<String> = BTreeSet::new();
+    for path in deleted {
+        let top = path.split('/').next().unwrap_or(path.as_str());
+        let live_under_top = head
+            .iter()
+            .any(|live| live == top || live.starts_with(&format!("{top}/")));
+        let candidate = if live_under_top {
+            path.clone()
+        } else {
+            top.to_string()
+        };
+        if emitted.insert(candidate.clone()) {
+            out.push(candidate);
+        }
+    }
+    out.sort();
+    out
+}
+
 fn normalize_prefixes(paths: &[String]) -> Result<Vec<String>> {
     if paths.is_empty() {
         return Err(Error::new(
