@@ -20,3 +20,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rpassword = "7"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
+
+# 只用于把 SIGPIPE 恢复成系统默认：Rust 运行时默认忽略它，
+# 于是 `vcs log | head` 这类管道会在 println! 处 panic。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

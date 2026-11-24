@@ -80,6 +80,41 @@ jobs:
           DEMO="$RUNNER_TEMP/demo"
           mkdir -p "$HOME" "$DEMO/src/202610"
 
+          # 断言一律「先把输出收进变量再匹配」，不用 `vcs ... | grep -q`：
+          # grep 命中即关管道，vcs 还在继续 println 就会拿到 EPIPE（panic / exit 101），
+          # pipefail 下整步静默失败，日志里连是哪条断言挂了都看不出来。
+          must() { # must <正则> <命令...>
+            local pattern="$1" out
+            shift
+            if ! out=$("$@" 2>&1); then
+              printf '命令失败：%s\n%s\n' "$*" "$out"
+              return 1
+            fi
+            printf '%s\n' "$out"
+            if ! printf '%s\n' "$out" | grep -qE -- "$pattern"; then
+              printf '输出不含 /%s/：%s\n' "$pattern" "$*"
+              return 1
+            fi
+          }
+          must_fail() { # must_fail <正则> <命令...>：命令必须失败，且错误里带着这个正则
+            local pattern="$1" out
+            shift
+            if out=$("$@" 2>&1); then
+              printf '本该失败却成功了：%s\n%s\n' "$*" "$out"
+              return 1
+            fi
+            printf '%s\n' "$out"
+            if ! printf '%s\n' "$out" | grep -qE -- "$pattern"; then
+              printf '错误信息不含 /%s/：%s\n' "$pattern" "$*"
+              return 1
+            fi
+          }
+          # 全库对象池计数：用量按仓库独立计量后，孤儿对象只能在存储维度看到
+          object_count() {
+            "$BIN/vcs" server info --store "$DEMO/store" |
+              sed -n 's/^objects *: *\([0-9][0-9]*\) .*/\1/p'
+          }
+
           echo "月度汇总" > "$DEMO/src/202610/summary.txt"
 
           "$BIN/vcs" init-admin --store "$DEMO/store" --username alice --name "张爱丽" --password 'Abcdef1!'
@@ -89,31 +124,26 @@ jobs:
           "$BIN/vcs" checkout --store "$DEMO/store" reports "$DEMO/wc"
 
           cd "$DEMO/wc"
-          out=$("$BIN/vcs" status); echo "$out"
-          echo "$out" | grep -q "工作副本干净"
+          must "工作副本干净" "$BIN/vcs" status
 
           echo "月度汇总（修订）" > 202610/summary.txt
-          out=$("$BIN/vcs" status); echo "$out"
-          echo "$out" | grep -qE '^M +202610/summary\.txt'
+          must '^M +202610/summary\.txt' "$BIN/vcs" status
+          must '^\+月度汇总（修订）' "$BIN/vcs" diff
 
-          "$BIN/vcs" diff | grep -q '^+月度汇总（修订）'
           "$BIN/vcs" import --store "$DEMO/store" reports "$PWD" -m "修订"
-          "$BIN/vcs" log --store "$DEMO/store" reports | grep -q "r2"
+          must "r2" "$BIN/vcs" log --store "$DEMO/store" reports
 
           # 重复提交相同内容不应产生新版本
-          "$BIN/vcs" import --store "$DEMO/store" reports "$PWD" -m "空提交" | grep -q "没有变更"
+          must "没有变更" "$BIN/vcs" import --store "$DEMO/store" reports "$PWD" -m "空提交"
 
           # 配额：1 KiB 仓库导入 50 KB 必须被拒，且不得在对象池留下孤儿对象
           "$BIN/vcs" repo-create --store "$DEMO/store" tiny --quota 1024
           mkdir -p "$DEMO/big" && head -c 50000 /dev/urandom > "$DEMO/big/random.bin"
-          # 用量按仓库独立计量（只算可达对象），孤儿对象不会反映在 info 里，
-          # 所以这里直接盯全库对象池的 count。
-          before=$("$BIN/vcs" server info --store "$DEMO/store" | grep '^objects')
-          if "$BIN/vcs" import --store "$DEMO/store" tiny "$DEMO/big" -m "超大"; then
-            echo "配额未生效"; exit 1
-          fi
-          after=$("$BIN/vcs" server info --store "$DEMO/store" | grep '^objects')
-          echo "拒绝前: $before"; echo "拒绝后: $after"
+          before=$(object_count)
+          must_fail "QuotaExceeded" "$BIN/vcs" import --store "$DEMO/store" tiny "$DEMO/big" -m "超大"
+          after=$(object_count)
+          echo "对象池：拒绝前 ${before:-<未解析>}，拒绝后 ${after:-<未解析>}"
+          [ -n "$before" ] && [ -n "$after" ] || { echo "server info 没解析出对象数"; exit 1; }
           [ "$before" = "$after" ] || { echo "被拒绝的提交写了孤儿对象"; exit 1; }
 
           # ---------------- 稀疏检出（独立仓库，不影响上面的版本断言） ----------------
@@ -124,18 +154,17 @@ jobs:
           echo root > "$SPARSE/src/README.md"
           "$BIN/vcs" repo-create --store "$DEMO/store" sparse-repo >/dev/null
           "$BIN/vcs" import --store "$DEMO/store" sparse-repo "$SPARSE/src" -m "初始导入" >/dev/null
-          "$BIN/vcs" checkout --store "$DEMO/store" sparse-repo "$SPARSE/wc" --paths 202610 | grep -q "稀疏路径：202610"
+          must "稀疏路径：202610" "$BIN/vcs" checkout --store "$DEMO/store" sparse-repo "$SPARSE/wc" --paths 202610
           { [ -f "$SPARSE/wc/202610/a.txt" ] && [ ! -e "$SPARSE/wc/202611" ] && [ ! -e "$SPARSE/wc/README.md" ]; } || { echo "稀疏检出铺多了文件"; exit 1; }
-          "$BIN/vcs" sparse show "$SPARSE/wc" | grep -q "202610"
-          "$BIN/vcs" sparse set --store "$DEMO/store" "$SPARSE/wc" --paths 202610,202611 | grep -q "新增 1 个文件"
+          must "202610" "$BIN/vcs" sparse show "$SPARSE/wc"
+          must "新增 1 个文件" "$BIN/vcs" sparse set --store "$DEMO/store" "$SPARSE/wc" --paths 202610,202611
           { [ -f "$SPARSE/wc/202611/b.txt" ] && [ ! -e "$SPARSE/wc/README.md" ]; } || { echo "规则扩大未增量补拉"; exit 1; }
-          "$BIN/vcs" sparse set --store "$DEMO/store" "$SPARSE/wc" | grep -q "当前为全库检出"
+          must "当前为全库检出" "$BIN/vcs" sparse set --store "$DEMO/store" "$SPARSE/wc"
           [ -f "$SPARSE/wc/README.md" ] || { echo "恢复全库未补根目录文件"; exit 1; }
-          "$BIN/vcs" sparse set --store "$DEMO/store" "$SPARSE/wc" --paths 202610 | grep -q "移除 2 个文件"
+          must "移除 2 个文件" "$BIN/vcs" sparse set --store "$DEMO/store" "$SPARSE/wc" --paths 202610
           { [ ! -e "$SPARSE/wc/README.md" ] && [ ! -e "$SPARSE/wc/202611" ]; } || { echo "规则收窄未移除干净条目"; exit 1; }
           echo edited > "$SPARSE/wc/202610/a.txt"
-          sparse_out=$("$BIN/vcs" sparse set --store "$DEMO/store" "$SPARSE/wc" --paths 202611 2>&1) || true
-          echo "$sparse_out" | grep -q "未提交的本地改动" || { echo "脏条目未被拦下"; exit 1; }
+          must_fail "未提交的本地改动" "$BIN/vcs" sparse set --store "$DEMO/store" "$SPARSE/wc" --paths 202611
           [ -f "$SPARSE/wc/202610/a.txt" ] || { echo "本地改动被误删"; exit 1; }
           echo "稀疏检出闭环通过"
 
@@ -146,166 +175,139 @@ jobs:
           cd "$DEMO/wc1"
           echo "wc1 版本" > 202610/summary.txt
           echo "wc1 新增" > 202610/extra.txt
-          out=$("$BIN/vcs" commit -m "wc1 改两处" --store "$DEMO/store"); echo "$out"
-          echo "$out" | grep -q "已提交 r3"
-          out=$("$BIN/vcs" status); echo "$out"
-          echo "$out" | grep -q "工作副本干净"
+          must "已提交 r3" "$BIN/vcs" commit -m "wc1 改两处" --store "$DEMO/store"
+          must "工作副本干净" "$BIN/vcs" status
 
           cd "$DEMO/wc2"
-          out=$("$BIN/vcs" update --store "$DEMO/store"); echo "$out"
-          echo "$out" | grep -q "已更新到 r3"
+          must "已更新到 r3" "$BIN/vcs" update --store "$DEMO/store"
           grep -q "wc1 新增" 202610/extra.txt
 
           # wc1 再提交一次，把 wc2 顶成过期工作副本
           cd "$DEMO/wc1"
           echo "wc1 又改一次" > 202610/summary.txt
-          "$BIN/vcs" commit -m "wc1 再改" --store "$DEMO/store" | grep -q "已提交 r4"
+          must "已提交 r4" "$BIN/vcs" commit -m "wc1 再改" --store "$DEMO/store"
 
           # wc2 仍停在 r3：直接提交必须被严格拒绝（不做服务端自动合并）
           cd "$DEMO/wc2"
           echo "wc2 版本" > 202610/summary.txt
-          if "$BIN/vcs" commit -m "过期的提交" --store "$DEMO/store"; then
-            echo "out-of-date 未生效"; exit 1
-          fi
+          must_fail "OutOfDate" "$BIN/vcs" commit -m "过期的提交" --store "$DEMO/store"
 
           # 更新产生内容冲突：本地内容保留、status 显示 C、带冲突提交被拦
-          "$BIN/vcs" update --store "$DEMO/store" | grep -q "内容冲突"
-          out=$("$BIN/vcs" status); echo "$out"
-          echo "$out" | grep -qE '^C +202610/summary\.txt'
-          if "$BIN/vcs" commit -m "带冲突" --store "$DEMO/store"; then
-            echo "冲突未阻止提交"; exit 1
-          fi
-          "$BIN/vcs" revert -d . | grep -q "已回退"
-          "$BIN/vcs" status | grep -q "工作副本干净"
+          must "内容冲突" "$BIN/vcs" update --store "$DEMO/store"
+          must '^C +202610/summary\.txt' "$BIN/vcs" status
+          must_fail "未解决的冲突" "$BIN/vcs" commit -m "带冲突" --store "$DEMO/store"
+          must "已回退" "$BIN/vcs" revert -d .
+          must "工作副本干净" "$BIN/vcs" status
 
           # ---------------- M2：容量闭环 ----------------
           cd "$DEMO"
-          "$BIN/vcs" candidates --store "$DEMO/store" reports | grep -q "202610"
-          "$BIN/vcs" estimate --store "$DEMO/store" reports 202610 | grep -q "dry-run"
-          out=$("$BIN/vcs" purge --store "$DEMO/store" reports 202610 --reason "CI 清理"); echo "$out"
-          echo "$out" | grep -q "实际释放"
-          "$BIN/vcs" gc-status --store "$DEMO/store" reports "$(echo "$out" | sed -n 's/.*GC \(gc_[A-Za-z0-9]*\)：.*/\1/p')" | grep -q "done"
+          must "202610" "$BIN/vcs" candidates --store "$DEMO/store" reports
+          must "dry-run" "$BIN/vcs" estimate --store "$DEMO/store" reports 202610
+          purge_out=$("$BIN/vcs" purge --store "$DEMO/store" reports 202610 --reason "CI 清理")
+          printf '%s\n' "$purge_out"
+          printf '%s\n' "$purge_out" | grep -q "实际释放" || { echo "清理结果没有实际释放量"; exit 1; }
+          gc_id=$(printf '%s\n' "$purge_out" | sed -n 's/.*GC \(gc_[A-Za-z0-9]*\)：.*/\1/p')
+          [ -n "$gc_id" ] || { echo "清理输出里没有 GC 任务号"; exit 1; }
+          must "done" "$BIN/vcs" gc-status --store "$DEMO/store" reports "$gc_id"
           # 内容已裁剪：读旧版本必须明确报 ContentPurged，而不是仓库损坏
-          if "$BIN/vcs" cat --store "$DEMO/store" reports 202610/summary.txt -r 1 >/dev/null 2>"$DEMO/err"; then
-            echo "已裁剪内容仍可读取"; exit 1
-          fi
-          grep -q "ContentPurged" "$DEMO/err"
-
+          must_fail "ContentPurged" "$BIN/vcs" cat --store "$DEMO/store" reports 202610/summary.txt -r 1
           # 清理记录只做审计：标记当场生效（active），没有宽限期也不可撤销
-          "$BIN/vcs" purged --store "$DEMO/store" reports | grep -q "active"
+          must "active" "$BIN/vcs" purged --store "$DEMO/store" reports
 
           # ---------------- M3：用户体系闭环 ----------------
           cd "$DEMO"
           # 弱密码在注册这一步就被拒：服务端是安全边界
-          if "$BIN/vcs" register --store "$DEMO/store" --username bob --name "李波" \
-              --password weak --reason "归档月度报表"; then
-            echo "弱密码未被拒绝"; exit 1
-          fi
+          must_fail "PasswordPolicyViolation" "$BIN/vcs" register --store "$DEMO/store" \
+            --username bob --name "李波" --password weak --reason "归档月度报表"
           # 自助注册：注册时自己设置密码，未审批不能登录
           "$BIN/vcs" register --store "$DEMO/store" --username bob --name "李波" \
             --password 'Bobpass1!' --reason "归档月度报表"
-          if "$BIN/vcs" login --store "$DEMO/store" --username bob --password 'Bobpass1!'; then
-            echo "未审批账号竟然能登录"; exit 1
-          fi
-          "$BIN/vcs" register-list --store "$DEMO/store" --state pending | grep -q bob
+          must_fail "AccountPending" "$BIN/vcs" login --store "$DEMO/store" --username bob --password 'Bobpass1!'
+          must "bob" "$BIN/vcs" register-list --store "$DEMO/store" --state pending
           # 审批只放行、不选类型：通过后是普通用户，仓库权限只在成员里授予
-          approve=$("$BIN/vcs" register-approve --store "$DEMO/store" "$("$BIN/vcs" register-list --store "$DEMO/store" --state pending | awk '/bob/{print $1}')")
-          echo "$approve"
+          approve=$("$BIN/vcs" register-approve --store "$DEMO/store" \
+            "$("$BIN/vcs" register-list --store "$DEMO/store" --state pending | awk '/bob/{print $1}')")
+          printf '%s\n' "$approve"
           # 审批只放行：申请人用注册时设的密码登录，服务端不再下发任何凭证
-          if echo "$approve" | grep -q 'vcs_setup_'; then
+          if printf '%s\n' "$approve" | grep -q 'vcs_setup_'; then
             echo "审批仍在发放一次性 token"; exit 1
           fi
           "$BIN/vcs" login --store "$DEMO/store" --username bob --password 'Bobpass1!'
 
           # 仓库申请 → 审批前不可用 → 审批后 owner 可用
           "$BIN/vcs" repo-request --store "$DEMO/store" bob-repo --reason "个人归档"
-          if "$BIN/vcs" import --store "$DEMO/store" bob-repo "$DEMO/src" -m "抢跑"; then
-            echo "未审批仓库竟然可用"; exit 1
-          fi
+          must_fail "RepoNotFound" "$BIN/vcs" import --store "$DEMO/store" bob-repo "$DEMO/src" -m "抢跑"
           req=$("$BIN/vcs" repo-request-list --store "$DEMO/store" --state pending | awk '/bob-repo/{print $1}')
+          [ -n "$req" ] || { echo "没找到 bob-repo 的建库申请号"; exit 1; }
           "$BIN/vcs" login --store "$DEMO/store" --username alice --password 'Abcdef1!'
           approved=$("$BIN/vcs" repo-approve --store "$DEMO/store" "$req" --note "同意")
-          echo "$approved"
+          printf '%s\n' "$approved"
           # 容量不由审批人填写：建库固定 10 GiB
-          if ! echo "$approved" | grep -q "10.0 GiB"; then
-            echo "建库容量不是固定 10 GiB：$approved"; exit 1
-          fi
+          printf '%s\n' "$approved" | grep -q "10.0 GiB" || { echo "建库容量不是固定 10 GiB：$approved"; exit 1; }
           # 管理员使用他人仓库仍需成员资格
-          if "$BIN/vcs" info --store "$DEMO/store" bob-repo; then
-            echo "非成员竟然能读取仓库"; exit 1
-          fi
+          must_fail "RepoNotMember" "$BIN/vcs" info --store "$DEMO/store" bob-repo
 
           cd "$HOME"
           "$BIN/vcs" login --store "$DEMO/store" --username bob --password 'Bobpass1!'
-          "$BIN/vcs" import --store "$DEMO/store" bob-repo "$DEMO/src" -m "owner 首次导入" | grep -q "已提交 r1"
+          must "已提交 r1" "$BIN/vcs" import --store "$DEMO/store" bob-repo "$DEMO/src" -m "owner 首次导入"
 
           # PAT：只读令牌能读不能写，撤销后立即失效
           pat_out=$("$BIN/vcs" pat-create --store "$DEMO/store" --name ci-read --scopes read --days 30)
-          echo "$pat_out"
-          pat=$(echo "$pat_out" | grep -o 'vcs_pat_[A-Za-z0-9_-]*' | head -1)
-          pat_id=$(echo "$pat_out" | grep -o 'pat_[A-Za-z0-9]*' | head -1)
-          "$BIN/vcs" login --store "$DEMO/store" --username bob --pat "$pat" | grep -q "scope read"
-          "$BIN/vcs" log --store "$DEMO/store" bob-repo | grep -q "r1"
-          if "$BIN/vcs" import --store "$DEMO/store" bob-repo "$DEMO/src" -m "越权提交"; then
-            echo "只读令牌竟然能提交"; exit 1
-          fi
-          "$BIN/vcs" pat-revoke --store "$DEMO/store" "$pat_id" | grep -q "已撤销"
-          if "$BIN/vcs" login --store "$DEMO/store" --username bob --pat "$pat"; then
-            echo "已撤销令牌仍可用"; exit 1
-          fi
+          printf '%s\n' "$pat_out"
+          pat=$(printf '%s\n' "$pat_out" | sed -n 's/^ *\(vcs_pat_[A-Za-z0-9_-]*\)$/\1/p')
+          pat_id=$(printf '%s\n' "$pat_out" | sed -n 's/^已创建访问令牌 \(pat_[A-Za-z0-9]*\)$/\1/p')
+          [ -n "$pat" ] && [ -n "$pat_id" ] || { echo "没解析到令牌明文或编号"; exit 1; }
+          must "scope read" "$BIN/vcs" login --store "$DEMO/store" --username bob --pat "$pat"
+          must "r1" "$BIN/vcs" log --store "$DEMO/store" bob-repo
+          must_fail "PermissionDenied" "$BIN/vcs" import --store "$DEMO/store" bob-repo "$DEMO/src" -m "越权提交"
+          must "已撤销" "$BIN/vcs" pat-revoke --store "$DEMO/store" "$pat_id"
+          must_fail "PatRevoked" "$BIN/vcs" login --store "$DEMO/store" --username bob --pat "$pat"
 
           # ---------------- M3：成员 / 配额 / 仓库状态 ----------------
           # 上一步撤销了 PAT，缓存里的凭证已失效，重新用密码登录 bob（bob-repo 的 owner）
           "$BIN/vcs" login --store "$DEMO/store" --username bob --password 'Bobpass1!' >/dev/null
-          "$BIN/vcs" repo-list --store "$DEMO/store" | grep -q "bob-repo"
+          must "bob-repo" "$BIN/vcs" repo-list --store "$DEMO/store"
           "$BIN/vcs" member-add --store "$DEMO/store" bob-repo --username alice --role reader
-          "$BIN/vcs" member-set-role --store "$DEMO/store" bob-repo --username alice --role writer \
-            | grep -q "已把 alice 的角色改为 writer"
-          "$BIN/vcs" member-remove --store "$DEMO/store" bob-repo --username alice \
-            | grep -q "已把 alice 移出"
+          must "已把 alice 的角色改为 writer" "$BIN/vcs" member-set-role --store "$DEMO/store" bob-repo --username alice --role writer
+          must "已把 alice 移出" "$BIN/vcs" member-remove --store "$DEMO/store" bob-repo --username alice
 
           # 扩容：成员申请固定 +10 GiB（不填容量），管理员按磁盘余量审批
-          "$BIN/vcs" repo-expand --store "$DEMO/store" bob-repo --reason "素材变多" \
-            | grep -q "10.0 GiB → 20.0 GiB"
+          must "10.0 GiB → 20.0 GiB" "$BIN/vcs" repo-expand --store "$DEMO/store" bob-repo --reason "素材变多"
           expand=$("$BIN/vcs" repo-expand-list --store "$DEMO/store" --state pending | awk '/bob-repo/{print $1}')
+          [ -n "$expand" ] || { echo "没找到 bob-repo 的扩容申请号"; exit 1; }
           "$BIN/vcs" login --store "$DEMO/store" --username alice --password 'Abcdef1!'
-          "$BIN/vcs" repo-expand-approve --store "$DEMO/store" "$expand" --note "同意" \
-            | grep -q "20.0 GiB"
+          must "20.0 GiB" "$BIN/vcs" repo-expand-approve --store "$DEMO/store" "$expand" --note "同意"
 
           # 管理员核定 1 MiB 上限，再恢复继承
-          "$BIN/vcs" repo-quota --store "$DEMO/store" bob-repo --quota 1048576 | grep -q "单仓库覆盖"
-          "$BIN/vcs" repo-quota --store "$DEMO/store" bob-repo --inherit | grep -q "系统兜底"
+          must "单仓库覆盖" "$BIN/vcs" repo-quota --store "$DEMO/store" bob-repo --quota 1048576
+          must "系统兜底" "$BIN/vcs" repo-quota --store "$DEMO/store" bob-repo --inherit
 
           # 禁用后读写全拒，恢复后立即可用
-          "$BIN/vcs" repo-status --store "$DEMO/store" bob-repo --status disabled | grep -q "disabled"
-          if "$BIN/vcs" log --store "$DEMO/store" bob-repo; then
-            echo "禁用仓库仍可读"; exit 1
-          fi
-          "$BIN/vcs" repo-status --store "$DEMO/store" bob-repo --status active | grep -q "active"
+          must "disabled" "$BIN/vcs" repo-status --store "$DEMO/store" bob-repo --status disabled
+          must_fail "RepoDisabled" "$BIN/vcs" log --store "$DEMO/store" bob-repo
+          must "active" "$BIN/vcs" repo-status --store "$DEMO/store" bob-repo --status active
 
           # ---------------- 仓库注销回收站 ----------------
-          # 没有自动清理：仓库注销进回收站，保留期内管理员可恢复，到期（或手动 purge）才真删。
+          # 没有自动清理：注销进回收站，保留期内管理员可恢复，到期（或手动 purge）才真删。
           "$BIN/vcs" repo-create --store "$DEMO/store" monthly >/dev/null
           mkdir -p "$DEMO/monthly/202610" && echo "月度归档" > "$DEMO/monthly/202610/report.txt"
           "$BIN/vcs" import --store "$DEMO/store" monthly "$DEMO/monthly" -m "归档" >/dev/null
-          "$BIN/vcs" repo-delete --store "$DEMO/store" monthly --reason "归档结束" | grep -q "进入回收站"
-          "$BIN/vcs" repo-deleted --store "$DEMO/store" | grep -q "monthly"
-          if "$BIN/vcs" log --store "$DEMO/store" monthly; then
-            echo "回收站里的仓库仍可读"; exit 1
-          fi
-          "$BIN/vcs" repo-restore --store "$DEMO/store" monthly | grep -q "已从回收站恢复"
+          must "进入回收站" "$BIN/vcs" repo-delete --store "$DEMO/store" monthly --reason "归档结束"
+          must "monthly" "$BIN/vcs" repo-deleted --store "$DEMO/store"
+          must_fail "RepoDeleted" "$BIN/vcs" log --store "$DEMO/store" monthly
+          must "已从回收站恢复" "$BIN/vcs" repo-restore --store "$DEMO/store" monthly
           "$BIN/vcs" repo-delete --store "$DEMO/store" monthly --reason "再次注销" >/dev/null
-          "$BIN/vcs" repo-purge --store "$DEMO/store" monthly | grep -q "已彻底删除"
-          if "$BIN/vcs" repo-deleted --store "$DEMO/store" | grep -q "monthly"; then
+          must "已彻底删除" "$BIN/vcs" repo-purge --store "$DEMO/store" monthly
+          deleted=$("$BIN/vcs" repo-deleted --store "$DEMO/store")
+          printf '%s\n' "$deleted"
+          if printf '%s\n' "$deleted" | grep -q "monthly"; then
             echo "彻底删除后仍留在回收站"; exit 1
           fi
 
           # 后台维护：回收站到期删除 + 全库 GC（vcs serve 的定时任务调的就是这个入口）
-          out=$("$BIN/vcs" maintenance --store "$DEMO/store"); echo "$out"
-          echo "$out" | grep -q "维护完成"
+          must "维护完成" "$BIN/vcs" maintenance --store "$DEMO/store"
 
           echo "CLI 冒烟通过"
-
   desktop:
     # 类型检查之外，还要真跑一遍「单人提交闭环」：起真实的 vcs serve、真连网、真写文件。
     # 只 typecheck 无法证明 gRPC 流式调用与 proto-loader 的字段映射是对的。

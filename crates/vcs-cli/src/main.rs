@@ -473,6 +473,14 @@ fn store_info(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> ExitCode {
+    // Rust 运行时会忽略 SIGPIPE，写已关闭的管道只会得到 EPIPE，而 println! 遇到写失败
+    // 直接 panic（`vcs log | head` 就是典型触发场景）。恢复成系统默认行为：
+    // 下游先关上管道时安静地按信号结束，与 git / cat 等命令行工具一致。
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
