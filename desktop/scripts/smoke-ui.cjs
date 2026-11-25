@@ -1163,7 +1163,7 @@ function verify({ app, BrowserWindow, ipcMain }) {
           String(sparse.applyBanner || '').includes('docs') &&
           String(sparse.applyBanner || '').includes('未纳入版本控制'),
         清理空间可勾选目录与文件并彻底删除:
-          cleanup.roots?.join(',') === 'docs/,src/,README.md' &&
+          cleanup.roots?.join(',') === 'docs/,old/,src/,README.md' &&
           cleanup.summary === '已选 2 项' &&
           cleanup.purges?.length === 1 &&
           cleanup.purges[0][1].join(',') === 'README.md,docs' &&

@@ -130,7 +130,8 @@ const state = {
     headPaths: [],
     /** 历史里删掉、HEAD 里已经看不到的路径。 */
     deleted: new Set(),
-    history: false,
+    /** 默认就带上历史：只删 HEAD 是「看起来删了、磁盘没腾」的主要来源。 */
+    history: true,
     checked: new Set(),
     expanded: new Set(),
     repoId: null,
@@ -571,12 +572,12 @@ async function selectRepo(repoId) {
   state.cleanup.paths = [];
   state.cleanup.headPaths = [];
   state.cleanup.deleted = new Set();
-  state.cleanup.history = false;
+  state.cleanup.history = true;
   state.cleanup.checked = new Set();
   state.cleanup.expanded = new Set();
   state.cleanup.repoId = null;
   state.cleanup.busy = false;
-  el('cleanup-history').checked = false;
+  el('cleanup-history').checked = true;
   el('cleanup-picker').classList.add('hidden');
   el('cleanup-open').textContent = '选择目录或文件';
   el('cleanup-result').textContent = '';
