@@ -2293,9 +2293,84 @@ fn deleted_paths_are_listed_and_can_be_released_from_history() {
         "清理历史后容量必须回落：{before} → {after}"
     );
 
+    // 已经彻底删除的路径不该再出现在「待清理」清单里：它已经没有内容可清了。
+    let remaining = store.list_deleted_paths(&alice, &repo.repo_id).unwrap();
+    assert!(
+        remaining.is_empty(),
+        "彻底删除后列表应为空，实际：{remaining:?}"
+    );
+
     // HEAD 与历史里都不存在的路径：拒绝，避免写下永久跳过的黑洞前缀。
     let err = store
         .purge(&alice, &repo.repo_id, &[String::from("nope")], "误操作")
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::PathConflict);
+}
+
+/// 彻底删除一个路径后，用户又在这个路径上提交了新内容：
+/// 旧的清理标记不能继续生效，否则新内容会被 GC 当成「已清理」直接删掉。
+#[test]
+fn reusing_a_purged_path_does_not_get_its_content_swept() {
+    let sb = Sandbox::new("purge-reuse");
+    let store = sb.store();
+    let alice = admin(&store);
+    let repo = store.create_repo_direct(&alice, "reuse", 0).unwrap();
+    let src = sb.dir("reuse-src");
+
+    write_file(&src, "note.txt", b"first version\n");
+    store
+        .import_dir(&alice, &repo.repo_id, &src, "第一版")
+        .unwrap();
+    store
+        .purge(&alice, &repo.repo_id, &[String::from("note.txt")], "清理")
+        .unwrap();
+
+    // 同一个路径重新提交——这是完全正常的操作，不能被旧的裁剪标记连坐。
+    write_file(&src, "note.txt", b"second version\n");
+    store
+        .import_dir(&alice, &repo.repo_id, &src, "重新上传")
+        .unwrap();
+    let fresh = vcs_core::hash_bytes(b"second version\n");
+    store.run_gc(&alice, &repo.repo_id).unwrap();
+
+    assert!(
+        store.objects().exists(&fresh),
+        "新提交的内容被旧的清理标记误删了"
+    );
+    let data = store
+        .read_file(&alice, &repo.repo_id, None, "note.txt")
+        .unwrap();
+    assert_eq!(data, b"second version\n");
+    let used = store.usage(&repo.repo_id).unwrap().used_bytes;
+    assert!(used > 0, "新内容也要计入容量");
+}
+
+/// 同一个路径连续删两次不该堆出两条一样的记录（界面上连点几下就会这样）。
+#[test]
+fn repeated_purge_of_the_same_path_does_not_duplicate_markers() {
+    let sb = Sandbox::new("purge-twice");
+    let store = sb.store();
+    let alice = admin(&store);
+    let repo = store.create_repo_direct(&alice, "twice", 0).unwrap();
+    let src = sb.dir("twice-src");
+    write_file(&src, "a.txt", b"a\n");
+    store
+        .import_dir(&alice, &repo.repo_id, &src, "第一版")
+        .unwrap();
+
+    store
+        .purge(&alice, &repo.repo_id, &[String::from("a.txt")], "第一次")
+        .unwrap();
+    // 第二次：HEAD 里已经没有了，走「仅历史」分支，但标记已存在。
+    let second = store
+        .purge(&alice, &repo.repo_id, &[String::from("a.txt")], "第二次")
+        .unwrap();
+    assert_eq!(second.deleted, 0);
+
+    let records = store.list_purged_paths(&alice, &repo.repo_id).unwrap();
+    assert_eq!(records.len(), 1, "重复清理不该堆记录：{records:?}");
+    assert!(store
+        .list_deleted_paths(&alice, &repo.repo_id)
+        .unwrap()
+        .is_empty());
 }

@@ -459,7 +459,12 @@ CAS 去重下，「目录有多大」与「删掉它能释放多少」是两回�
 `Purge` 也接受 **HEAD 里已经不存在、只留在历史里的路径**：普通删除只是新增一个不含该路径的版本，
 旧版本仍引用着内容，这类路径在检出树里根本看不到，却是「删了文件容量不降」最常见的来源。
 这种调用不产生删除提交（HEAD 没变化），只写标记并跑 GC；路径在 HEAD 和历史里都不存在时直接拒绝，
-避免写下一个永久跳过的黑洞前缀。
+避免写下一个永久跳过的黑洞前缀。已经被标记覆盖的路径不会重复写行，列表里也不再出现——
+删完还显示会让人以为没生效，进而反复点同一次删除。
+
+标记是永久的路径前缀，因此还有一条必须守住的边界：**同一个路径被重新提交时，旧标记要在同一个事务里作废**
+（`commit.finalize` 里顺手删掉，并记一条 `purge.superseded` 审计）。否则新内容会被当成「已清理」，
+下一轮 GC 直接把新 blob 删掉——这是数据丢失，不是空间治理。
 
 `purged_paths` 仍然保留，作用变成审计与标记：GC 标记阶段靠它跳过已裁剪的路径，`ListPurgedPaths` 让人能查到「谁在什么时候删了什么」。老库里 `pending` / `reverted` 的历史行按原样留着（迁移只把 `pending` 收口成 `active`，否则这些路径会永远被 GC 跳过）。
 
@@ -2219,7 +2224,10 @@ deleted --(到期后台维护 / PurgeRepo: 仅 admin)--> 物理删除（行不�
 - `smoke-single-user.cjs`：预估 → 彻底删除 → GC 完成 → 配额回落（不再有回收站与撤销段）；
 - `lifecycle.rs::deleted_paths_are_listed_and_can_be_released_from_history`：普通删除后 GC 不回收、
   容量仍计；`list_deleted_paths` 列出 `old`；从历史彻底删除不产生新版本、内容被回收、容量回落；
-  HEAD 与历史都没有的路径被拒绝；
+  删除后列表必须为空；HEAD 与历史都没有的路径被拒绝；
+- `lifecycle.rs::reusing_a_purged_path_does_not_get_its_content_swept`：清理过的路径重新提交后，
+  新内容不能被旧标记连坐（否则 GC 会删掉刚提交的 blob）；
+- `lifecycle.rs::repeated_purge_of_the_same_path_does_not_duplicate_markers`：连点两次只留一条标记；
 - `smoke-single-user.cjs`：写入 3 MiB → 提交 → 普通删除后容量不变 → 从历史彻底删除后降到几百字节；
 - `smoke-ui.cjs`：设置页勾选 `docs/` + `README.md` → 摘要「已选 2 项」→ 直接删除 → 提交的路径被规范化成
   `README.md,docs` → 结果里带实际释放量、摘要清空；勾「含历史中已删除」后历史路径带删除线出现。

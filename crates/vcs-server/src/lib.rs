@@ -2142,6 +2142,37 @@ impl ServerStore {
             ));
         }
 
+        // 同一个路径被重新写入 = 那次「彻底删除」已经过期。清理标记是永久的路径前缀，
+        // 留着会把新提交的内容也当成「已清理」——下一轮 GC 会直接删掉新 blob。
+        // 这里必须在同一个事务里作废，否则崩溃窗口期内可能出现「新内容已提交、旧标记还在」。
+        let active_markers: Vec<(String, String)> = {
+            let mut stmt = tx
+                .prepare("SELECT purge_id, path_pattern FROM purged_paths WHERE repo_id = ?1 AND state = 'active'")
+                .map_err(db("读取清理标记失败"))?;
+            let rows = stmt
+                .query_map(params![repo.repo_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(db("读取清理标记失败"))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(db("读取清理标记失败"))?
+        };
+        let mut cleared_markers = 0usize;
+        for change in changes.iter().filter(|c| c.hash.is_some()) {
+            for (purge_id, pattern) in &active_markers {
+                let covered =
+                    change.path == *pattern || change.path.starts_with(&format!("{pattern}/"));
+                if covered {
+                    cleared_markers += tx
+                        .execute(
+                            "DELETE FROM purged_paths WHERE purge_id = ?1",
+                            params![purge_id],
+                        )
+                        .map_err(db("作废清理标记失败"))?;
+                }
+            }
+        }
+
         let next_rev = row.base_rev + 1;
         for (seq, change) in changes.iter().enumerate() {
             tx.execute(
@@ -2217,6 +2248,17 @@ impl ServerStore {
         )
         .map_err(db("更新会话状态失败"))?;
 
+        if cleared_markers > 0 {
+            write_audit(
+                &tx,
+                &repo.repo_id,
+                &session.user_id,
+                "purge.superseded",
+                &format!("r{next_rev}"),
+                Some(&format!("{{\"cleared\":{cleared_markers}}}")),
+                now,
+            )?;
+        }
         write_audit(
             &tx,
             &repo.repo_id,
@@ -2901,8 +2943,15 @@ impl ServerStore {
         self.member_role(&repo.repo_id, &session.user_id)?;
         let head = self.flatten_paths(&repo.repo_id, repo.head_rev)?;
         let history = self.historical_paths(&repo.repo_id)?;
-        let deleted: BTreeSet<String> = history.difference(&head).cloned().collect();
-        Ok(collapse_deleted_paths(&deleted, &head))
+        // 已经写进清理标记的路径不再列出来：它们没有内容可清了，
+        // 留着只会让「删完还在」看起来像没生效。
+        let purged = self.active_purge_prefixes(&repo.repo_id)?;
+        let deleted: BTreeSet<String> = history
+            .difference(&head)
+            .filter(|path| !path_under_any(path, &purged))
+            .cloned()
+            .collect();
+        Ok(collapse_deleted_paths(&deleted, &head, &purged))
     }
 
     /// 该仓库所有版本里出现过的文件路径（去重）。
@@ -5041,9 +5090,16 @@ impl ServerStore {
         };
 
         // 没有宽限期：删完就写 active，GC 当场回收。彻底删除是终态，没有撤销入口。
+        // 已经被更宽的标记覆盖过的路径不再重复写行：界面上连点几次只会多出一堆
+        // 一模一样的记录，对 GC 没有任何帮助。
+        let active = self.active_purge_prefixes(&repo.repo_id)?;
         let now = now_secs();
         let mut purge_id = String::new();
-        for path in &estimate.paths {
+        for path in estimate
+            .paths
+            .iter()
+            .filter(|path| !path_under_any(path, &active))
+        {
             let id = new_id("pg");
             if purge_id.is_empty() {
                 purge_id = id.clone();
@@ -5066,6 +5122,18 @@ impl ServerStore {
                 .map_err(db("写入清理标记失败"))?;
         }
 
+        if purge_id.is_empty() {
+            // 全部路径都已经有标记：沿用最近一条记录，保持任务行的 purge_id 可回溯。
+            purge_id = self
+                .conn
+                .query_row(
+                    "SELECT purge_id FROM purged_paths WHERE repo_id = ?1
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![repo.repo_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_default();
+        }
         let gc_job_id = new_id("gc");
         self.conn
             .execute(
@@ -6079,7 +6147,11 @@ fn load_or_create_secret(root: &Path) -> Result<Vec<u8>> {
 ///
 /// 只折叠顶层是为了保守：再深的目录可能与 HEAD 里仍存在的同级文件混在一起，
 /// 折叠成前缀会把还在用的内容一起标记成「已删除」。
-fn collapse_deleted_paths(deleted: &BTreeSet<String>, head: &BTreeSet<String>) -> Vec<String> {
+fn collapse_deleted_paths(
+    deleted: &BTreeSet<String>,
+    head: &BTreeSet<String>,
+    purged: &[String],
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut emitted: BTreeSet<String> = BTreeSet::new();
     for path in deleted {
@@ -6087,7 +6159,12 @@ fn collapse_deleted_paths(deleted: &BTreeSet<String>, head: &BTreeSet<String>) -
         let live_under_top = head
             .iter()
             .any(|live| live == top || live.starts_with(&format!("{top}/")));
-        let candidate = if live_under_top {
+        // 这个顶层目录里已经有路径被彻底删除过：不能再折叠成目录，
+        // 否则会把「删除标记」重新变成一个更宽的待清理项。
+        let partly_purged = purged.iter().any(|p| {
+            p == top || p.starts_with(&format!("{top}/")) || top.starts_with(&format!("{p}/"))
+        });
+        let candidate = if live_under_top || partly_purged {
             path.clone()
         } else {
             top.to_string()
